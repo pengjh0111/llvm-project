@@ -18,6 +18,10 @@
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
 
+#include "MemRefBuilder.h"
+#include "MemRefDescriptor.h"
+
+
 namespace mlir {
 #define GEN_PASS_DEF_CONVERTMEMREFTOEMITC
 #include "mlir/Conversion/Passes.h.inc"
@@ -37,6 +41,45 @@ struct ConvertMemRefToEmitCPass
         return {};
       return type;
     });
+
+    //Materialization Callback
+    converter.addArgumentMaterialization(
+      [&](OpBuilder &builder, UnrankedMemRefType resultType, ValueRange inputs,
+          Location loc) -> std::optional<Value> {
+        if (inputs.size() == 1)
+          return std::nullopt;
+        return UnrankedMemRefDescriptortest::createpack(builder, loc, converter, resultType,
+                                              inputs);
+      });
+    converter.addArgumentMaterialization([&](OpBuilder &builder, MemRefType resultType,
+                                 ValueRange inputs,
+                                 Location loc) -> std::optional<Value> {
+    // TODO: bare ptr conversion could be handled here but we would need a way
+    // to distinguish between FuncOp and other regions.
+    if (inputs.size() == 1)
+      return std::nullopt;
+    return MemRefDescriptortest::createpack(builder, loc, converter, resultType, inputs);
+  });
+    converter.addSourceMaterialization([&](OpBuilder &builder, Type resultType,
+                               ValueRange inputs,
+                               Location loc) -> std::optional<Value> {
+    if (inputs.size() != 1)
+      return std::nullopt;
+
+    return builder.create<UnrealizedConversionCastOp>(loc, resultType, inputs)
+        .getResult(0);
+  });
+    converter.addTargetMaterialization([&](OpBuilder &builder, Type resultType,
+                               ValueRange inputs,
+                               Location loc) -> std::optional<Value> {
+    if (inputs.size() != 1)
+      return std::nullopt;
+
+    return builder.create<UnrealizedConversionCastOp>(loc, resultType, inputs)
+        .getResult(0);
+  });
+
+
 
     populateMemRefToEmitCTypeConversion(converter);
 
