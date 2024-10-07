@@ -33,12 +33,12 @@ struct ConvertAlloca final : public OpConversionPattern<memref::AllocaOp> {
           op.getLoc(), "cannot transform alloca with dynamic shape");
     }
 
-    if (op.getAlignment().value_or(1) > 1) {
-      // TODO: Allow alignment if it is not more than the natural alignment
-      // of the C array.
-      return rewriter.notifyMatchFailure(
-          op.getLoc(), "cannot transform alloca with alignment requirement");
-    }
+    // if (op.getAlignment().value_or(1) > 1) {
+    //   // TODO: Allow alignment if it is not more than the natural alignment
+    //   // of the C array.
+    //   return rewriter.notifyMatchFailure(
+    //       op.getLoc(), "cannot transform alloca with alignment requirement");
+    // }
 
     auto resultTy = getTypeConverter()->convertType(op.getType());
     if (!resultTy) {
@@ -62,12 +62,12 @@ struct ConvertGlobal final : public OpConversionPattern<memref::GlobalOp> {
           op.getLoc(), "cannot transform global with dynamic shape");
     }
 
-    if (op.getAlignment().value_or(1) > 1) {
-      // TODO: Extend GlobalOp to specify alignment via the `alignas` specifier.
-      return rewriter.notifyMatchFailure(
-          op.getLoc(), "global variable with alignment requirement is "
-                       "currently not supported");
-    }
+    // if (op.getAlignment().value_or(1) > 1) {
+    //   // TODO: Extend GlobalOp to specify alignment via the `alignas` specifier.
+    //   return rewriter.notifyMatchFailure(
+    //       op.getLoc(), "global variable with alignment requirement is "
+    //                    "currently not supported");
+    // }
     auto resultTy = getTypeConverter()->convertType(op.getType());
     if (!resultTy) {
       return rewriter.notifyMatchFailure(op.getLoc(),

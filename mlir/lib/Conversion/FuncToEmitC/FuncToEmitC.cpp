@@ -201,8 +201,8 @@ public:
 // Pattern population
 //===----------------------------------------------------------------------===//
 
-void mlir::populateFuncToEmitCPatterns(RewritePatternSet &patterns) {
+void mlir::populateFuncToEmitCPatterns(RewritePatternSet &patterns, TypeConverter &converter) {
   MLIRContext *ctx = patterns.getContext();
 
-  patterns.add<CallOpConversion, FuncOpConversion, ReturnOpConversion>(ctx);
+  patterns.add<CallOpConversion, FuncOpConversion, ReturnOpConversion>(converter, ctx);
 }
