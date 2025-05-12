@@ -60,12 +60,12 @@ mlir::scf::tileParallelLoop(ParallelOp op, ArrayRef<int64_t> tileSizes,
   OpBuilder b(op);
   auto zero = b.create<arith::ConstantIndexOp>(op.getLoc(), 0);
   SmallVector<Value, 2> tileSizeConstants;
-  tileSizeConstants.reserve(op.getUpperBound().size());
-  for (size_t i = 0, end = op.getUpperBound().size(); i != end; ++i) {
+  tileSizeConstants.reserve(op.getUpperBound().size()); //调用reserve方法为tileSizeConstants预分配足够的存储空间，空间大小与op的上界维度数量（op.getUpperBound().size()）相同。
+  for (size_t i = 0, end = op.getUpperBound().size(); i != end; ++i) { //遍历从0到op.getUpperBound().size()-1的所有维度。每个维度都需要为tile操作设置一个尺寸常量
     if (i < tileSizes.size())
       tileSizeConstants.push_back(
           b.create<arith::ConstantIndexOp>(op.getLoc(), tileSizes[i]));
-    else
+    else //如果当前维度在tileSizes数组中没有对应的tile尺寸（即i超出了tileSizes的范围），则默认创建一个值为1的常数索引
       // Just pick 1 for the remaining dimensions.
       tileSizeConstants.push_back(
           b.create<arith::ConstantIndexOp>(op.getLoc(), 1));

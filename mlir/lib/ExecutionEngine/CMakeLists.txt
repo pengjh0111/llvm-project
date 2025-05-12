@@ -232,6 +232,7 @@ if(LLVM_ENABLE_PIC)
     add_mlir_library(mlir_cuda_runtime
       SHARED
       CudaRuntimeWrappers.cpp
+      SNN_kernel.cu  # Your CUDA kernel file
 
       EXCLUDE_FROM_LIBMLIR
     )
@@ -245,6 +246,29 @@ if(LLVM_ENABLE_PIC)
       PRIVATE
       ${CUDA_RUNTIME_LIBRARY}
     )
+
+
+    # 添加对cuDNN的支持
+    find_library(CUDA_CUDNN_LIBRARY cudnn 
+      HINTS 
+      ${CMAKE_CUDA_IMPLICIT_LINK_DIRECTORIES}
+      /usr/lib/x86_64-linux-gnu
+      REQUIRED)
+
+    if(CUDA_CUDNN_LIBRARY)
+      message(STATUS "Found cuDNN library: ${CUDA_CUDNN_LIBRARY}")
+      target_link_libraries(mlir_cuda_runtime
+        PRIVATE
+        ${CUDA_CUDNN_LIBRARY}
+      )
+      target_compile_definitions(mlir_cuda_runtime
+        PRIVATE
+        MLIR_ENABLE_CUDA_CUDNN=1
+      )
+    else()
+      message(WARNING "cuDNN library not found, cuDNN wrappers will not be available")
+    endif()
+
 
     if(MLIR_ENABLE_CUDA_CUSPARSE)
       # Find the libcusparse.so library if CUSPARSE build is requested.
