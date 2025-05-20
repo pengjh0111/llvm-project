@@ -269,6 +269,26 @@ if(LLVM_ENABLE_PIC)
       message(WARNING "cuDNN library not found, cuDNN wrappers will not be available")
     endif()
 
+    # 添加对cuBLAS的支持
+    find_library(CUDA_CUBLAS_LIBRARY cublas 
+      HINTS 
+      ${CMAKE_CUDA_IMPLICIT_LINK_DIRECTORIES}
+      /usr/lib/x86_64-linux-gnu
+      REQUIRED)
+
+    if(CUDA_CUBLAS_LIBRARY)
+      message(STATUS "Found cuBLAS library: ${CUDA_CUBLAS_LIBRARY}")
+      target_link_libraries(mlir_cuda_runtime
+        PRIVATE
+        ${CUDA_CUBLAS_LIBRARY}
+      )
+      target_compile_definitions(mlir_cuda_runtime
+        PRIVATE
+        MLIR_ENABLE_CUDA_CUBLAS=1
+      )
+    else()
+      message(WARNING "cuBLAS library not found, cuBLAS wrappers will not be available")
+    endif()
 
     if(MLIR_ENABLE_CUDA_CUSPARSE)
       # Find the libcusparse.so library if CUSPARSE build is requested.
