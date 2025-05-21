@@ -582,8 +582,8 @@ extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuCudnnConv2dForward(
   CUDNN_REPORT_IF_ERROR(cudnnGetConvolution2dForwardOutputDim(
       convDesc, xDesc, wDesc, &out_n, &out_c, &out_h, &out_w));
 
-  fprintf(stderr, "Output dimensions: n=%d, c=%d, h=%d, w=%d\n", 
-        out_n, out_c, out_h, out_w);
+  // fprintf(stderr, "Output dimensions: n=%d, c=%d, h=%d, w=%d\n", 
+  //       out_n, out_c, out_h, out_w);
   
   CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
       yDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, out_n, out_c, out_h, out_w));
@@ -678,6 +678,76 @@ extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuCudnnConv2dForward(
   CUDNN_REPORT_IF_ERROR(cudnnDestroyConvolutionDescriptor(convDesc));
 
   // fprintf(stderr, "[END] mgpuCudnnConv2dForward\n");
+}
+
+// MaxPool implementation using cuDNN
+extern "C" MLIR_CUDA_WRAPPERS_EXPORT void
+mgpuCudnnMaxPoolForward(
+    int n, int c, int h, int w,           // 输入维度 (NCHW)
+    int kernel_h, int kernel_w,           // 核维度
+    int pad_h_begin, int pad_w_begin,     // 填充 (开始)
+    int pad_h_end, int pad_w_end,         // 填充 (结束)
+    int stride_h, int stride_w,           // 步长
+    int dilation_h, int dilation_w,       // 膨胀
+    void* input_data,                     // 输入张量
+    void* output_data,                    // 输出张量
+    CUstream stream                       // CUDA流
+) {
+  // 确保使用全局上下文
+  mgpuEnsureContext();
+  
+  // 获取此流的cuDNN句柄
+  cudnnHandle_t handle = mgpuCudnnGetHandle(stream);
+  
+  // 创建描述符
+  cudnnTensorDescriptor_t inputDesc, outputDesc;
+  cudnnPoolingDescriptor_t poolDesc;
+  
+  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&inputDesc));
+  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&outputDesc));
+  CUDNN_REPORT_IF_ERROR(cudnnCreatePoolingDescriptor(&poolDesc));
+  
+  // 设置输入描述符
+  CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
+      inputDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, n, c, h, w));
+  
+  // 检查是否为非对称填充
+  bool asymmetricPadding = (pad_h_begin != pad_h_end) || (pad_w_begin != pad_w_end);
+  
+  if (asymmetricPadding) {
+    // 对于非对称填充，使用最大填充值
+    fprintf(stderr, "Warning: Asymmetric padding in MaxPool (%d,%d,%d,%d) may not produce exact results\n",
+            pad_h_begin, pad_w_begin, pad_h_end, pad_w_end);
+  }
+  
+  // cuDNN的pooling API要求对称填充，因此我们使用最大值
+  int pad_h = std::max(pad_h_begin, pad_h_end);
+  int pad_w = std::max(pad_w_begin, pad_w_end);
+  
+  // 设置池化描述符
+  CUDNN_REPORT_IF_ERROR(cudnnSetPooling2dDescriptor(
+      poolDesc, CUDNN_POOLING_MAX, CUDNN_NOT_PROPAGATE_NAN,
+      kernel_h, kernel_w, pad_h, pad_w, stride_h, stride_w));
+  
+  // 计算输出维度
+  int out_n, out_c, out_h, out_w;
+  CUDNN_REPORT_IF_ERROR(cudnnGetPooling2dForwardOutputDim(
+      poolDesc, inputDesc, &out_n, &out_c, &out_h, &out_w));
+  
+  // 设置输出描述符
+  CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
+      outputDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, out_n, out_c, out_h, out_w));
+  
+  // 执行最大池化
+  const float alpha = 1.0f;
+  const float beta = 0.0f;
+  CUDNN_REPORT_IF_ERROR(cudnnPoolingForward(
+      handle, poolDesc, &alpha, inputDesc, input_data, &beta, outputDesc, output_data));
+  
+  // 清理描述符
+  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(inputDesc));
+  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(outputDesc));
+  CUDNN_REPORT_IF_ERROR(cudnnDestroyPoolingDescriptor(poolDesc));
 }
 
 // 下面是兼容旧API的函数，使用新实现
