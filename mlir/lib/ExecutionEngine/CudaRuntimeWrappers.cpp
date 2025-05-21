@@ -432,6 +432,87 @@ mgpuCulibsFullyConnectedForward(
   // 注意：不需要清理cuBLAS和cuDNN句柄，因为它们会被缓存以便重用
 }
 
+// Fully connected layer implementation with flattening, using cuBLAS for matrix multiplication
+extern "C" MLIR_CUDA_WRAPPERS_EXPORT void
+mgpuCulibsFlattenFullyConnectedForward(
+    int batch_size, int input_channels, int input_height, int input_width,  // Original NCHW dimensions
+    int output_features,                                                    // Output features
+    void* input_data, void* weight_data,                                   // Input and weight pointers
+    void* bias_data,                                                       // Bias pointer (can be NULL)
+    void* output_data,                                                     // Output pointer
+    CUstream stream                                                        // CUDA stream
+) {
+  // Ensure we're using the global context
+  mgpuEnsureContext();
+  
+  // Calculate the flattened features dimension
+  int flattened_features = input_channels * input_height * input_width;
+  
+  // Get cuBLAS handle for this stream
+  cublasHandle_t handle = mgpuCublasGetHandle(stream);
+  
+  // Set matrix multiplication parameters
+  // C = alpha * op(A) * op(B) + beta * C
+  // For FC with flattening: output = input * weight^T + bias
+  const float alpha = 1.0f;
+  const float beta = 0.0f;
+  
+  // Compute matrix multiplication: output = input * weight^T
+  // cuBLAS uses column-major order, while our tensors are row-major
+  // So we compute (output)^T = (weight)^T * (input)^T
+  
+  // Use CUBLAS_OP_T to indicate that the weight matrix should be transposed
+  CUBLAS_REPORT_IF_ERROR(cublasSgemm(
+      handle,
+      CUBLAS_OP_T,                    // op(B): transpose weight matrix
+      CUBLAS_OP_N,                    // op(A): don't transpose input
+      output_features,                // output features (m: B's rows)
+      batch_size,                     // batch size (n: A's columns)
+      flattened_features,             // flattened input features (k: A's rows, B's columns)
+      &alpha,                         // alpha scalar
+      (const float*)weight_data,      // B matrix (weights)
+      flattened_features,             // B's leading dimension
+      (const float*)input_data,       // A matrix (input)
+      flattened_features,             // A's leading dimension
+      &beta,                          // beta scalar
+      (float*)output_data,            // C matrix (output)
+      output_features                 // C's leading dimension
+  ));
+  
+  // Add bias if provided
+  if (bias_data != nullptr) {
+    // Get cuDNN handle
+    cudnnHandle_t cudnnHandle = mgpuCudnnGetHandle(stream);
+    
+    // Create tensor descriptors
+    cudnnTensorDescriptor_t outputDesc, biasDesc;
+    CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&outputDesc));
+    CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&biasDesc));
+    
+    // Set output descriptor as a 4D tensor with H=W=1
+    CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
+        outputDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, 
+        batch_size, output_features, 1, 1));
+    
+    // Set bias descriptor as 1D vector (1xCx1x1)
+    CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
+        biasDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, 
+        1, output_features, 1, 1));
+    
+    // Add bias to output
+    const float alpha_bias = 1.0f;
+    const float beta_bias = 1.0f;  // Use 1.0f to add to existing output
+    
+    CUDNN_REPORT_IF_ERROR(cudnnAddTensor(
+        cudnnHandle, &alpha_bias, biasDesc, bias_data, 
+        &beta_bias, outputDesc, output_data));
+    
+    // Clean up descriptors
+    CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(outputDesc));
+    CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(biasDesc));
+  }
+}
+
 // 修改后的卷积函数，每个流使用独立的句柄
 extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuCudnnConv2dForward(
     int n, int c, int h, int w_in,              // 输入尺寸
