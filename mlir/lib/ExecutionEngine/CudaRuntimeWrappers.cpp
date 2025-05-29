@@ -19,6 +19,10 @@
 #include <unordered_map>
 #include <stdio.h>
 #include <memory>
+#include <queue>
+#include <vector>
+#include <atomic>
+#include <unordered_set>
 
 #include <cudnn.h>
 #include <cublas_v2.h>
@@ -167,26 +171,26 @@ extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuEnsureContext() {
     if (g_global_context == nullptr) {
       // 创建新的上下文
       CUDA_REPORT_IF_ERROR(cuCtxCreate(&g_global_context, 0, 0));
-      fprintf(stderr, "[CONTEXT] Created new global context: %p\n", g_global_context);
+      // fprintf(stderr, "[CONTEXT] Created new global context: %p\n", g_global_context);
     }
     // 设置为当前上下文
     CUDA_REPORT_IF_ERROR(cuCtxSetCurrent(g_global_context));
-    fprintf(stderr, "[CONTEXT] Set global context as current: %p\n", g_global_context);
+    // fprintf(stderr, "[CONTEXT] Set global context as current: %p\n", g_global_context);
   } else if (g_global_context == nullptr) {
     // 如果有当前上下文但全局上下文为空，则使用当前上下文作为全局上下文
     g_global_context = current;
-    fprintf(stderr, "[CONTEXT] Adopted current context as global: %p\n", g_global_context);
+    // fprintf(stderr, "[CONTEXT] Adopted current context as global: %p\n", g_global_context);
   } else if (current != g_global_context) {
     // 如果当前上下文与全局上下文不同，则设置全局上下文为当前上下文
     CUDA_REPORT_IF_ERROR(cuCtxSetCurrent(g_global_context));
-    fprintf(stderr, "[CONTEXT] Switched from context %p to global context: %p\n", 
-            current, g_global_context);
+    // fprintf(stderr, "[CONTEXT] Switched from context %p to global context: %p\n", 
+    //         current, g_global_context);
   }
 
   // 最后打印当前上下文
   CUcontext final_context = nullptr;
   cuCtxGetCurrent(&final_context);
-  fprintf(stderr, "[CONTEXT-FINAL] Current context: %p\n", final_context);
+  // fprintf(stderr, "[CONTEXT-FINAL] Current context: %p\n", final_context);
 }
 
 // 获取全局上下文
@@ -202,11 +206,9 @@ extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuCleanupContext() {
   if (g_global_context != nullptr) {
     CUDA_REPORT_IF_ERROR(cuCtxDestroy(g_global_context));
     g_global_context = nullptr;
-    fprintf(stderr, "[CONTEXT] Destroyed global context\n");
+    // fprintf(stderr, "[CONTEXT] Destroyed global context\n");
   }
 }
-
-
 
 // 添加到错误报告宏部分
 #define CUDNN_REPORT_IF_ERROR(expr)                                         \
@@ -226,6 +228,103 @@ extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuCleanupContext() {
               status);                                                       \
     }                                                                        \
   }
+
+//===----------------------------------------------------------------------===//
+// 优化的Handle管理 - 分离创建与使用
+//===----------------------------------------------------------------------===//
+
+// Handle组结构体
+struct StreamHandles {
+  cudnnHandle_t cudnn_handle;
+  cublasHandle_t cublas_handle;
+  bool valid;
+  
+  StreamHandles() : cudnn_handle(nullptr), cublas_handle(nullptr), valid(false) {}
+};
+
+// 全局handle映射表 - 使用更具体的名字避免冲突
+static std::mutex g_mgpu_handle_registry_mutex;
+static std::unordered_map<CUstream, StreamHandles> g_mgpu_stream_handle_registry;
+
+// 为指定stream创建并绑定handle组
+extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuCreateHandlesForStream(CUstream stream) {
+  mgpuEnsureContext();
+  
+  std::lock_guard<std::mutex> lock(g_mgpu_handle_registry_mutex);
+  
+  // 检查是否已经存在
+  if (g_mgpu_stream_handle_registry.find(stream) != g_mgpu_stream_handle_registry.end()) {
+    fprintf(stderr, "[HANDLE] Handles already exist for stream %p\n", stream);
+    // return true; // 已存在，直接返回成功
+  }
+  
+  StreamHandles handles;
+  
+  // 创建cuDNN句柄
+  cudnnStatus_t cudnn_status = cudnnCreate(&handles.cudnn_handle);
+  if (cudnn_status != CUDNN_STATUS_SUCCESS) {
+    fprintf(stderr, "[HANDLE] Failed to create cuDNN handle: %s\n", 
+            cudnnGetErrorString(cudnn_status));
+    // return false;
+  }
+  
+  // 创建cuBLAS句柄
+  cublasStatus_t cublas_status = cublasCreate(&handles.cublas_handle);
+  if (cublas_status != CUBLAS_STATUS_SUCCESS) {
+    fprintf(stderr, "[HANDLE] Failed to create cuBLAS handle: %d\n", cublas_status);
+    cudnnDestroy(handles.cudnn_handle);
+    // return false;
+  }
+  
+  // 绑定到指定的stream
+  CUDNN_REPORT_IF_ERROR(cudnnSetStream(handles.cudnn_handle, stream));
+  CUBLAS_REPORT_IF_ERROR(cublasSetStream(handles.cublas_handle, stream));
+  
+  handles.valid = true;
+  
+  // 存储到映射表
+  g_mgpu_stream_handle_registry[stream] = handles;
+  
+  // fprintf(stderr, "[HANDLE] Created handle group for stream %p: cuDNN=%p, cuBLAS=%p\n", 
+  //         stream, handles.cudnn_handle, handles.cublas_handle);
+  
+  // return true;
+}
+
+extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuDestroyHandlesForStream(CUstream stream) {
+  mgpuEnsureContext();
+  
+  std::lock_guard<std::mutex> lock(g_mgpu_handle_registry_mutex);
+  
+  auto it = g_mgpu_stream_handle_registry.find(stream);
+  if (it != g_mgpu_stream_handle_registry.end()) {
+    if (it->second.valid) {
+      if (it->second.cudnn_handle != nullptr) {
+        CUDNN_REPORT_IF_ERROR(cudnnDestroy(it->second.cudnn_handle));
+      }
+      if (it->second.cublas_handle != nullptr) {
+        CUBLAS_REPORT_IF_ERROR(cublasDestroy(it->second.cublas_handle));
+      }
+      
+      // fprintf(stderr, "[HANDLE] Destroyed handle group for stream %p\n", stream);
+    }
+    g_mgpu_stream_handle_registry.erase(it);
+  }
+}
+
+// static bool getHandlesForStream(CUstream stream, StreamHandles& handles) {
+//   std::lock_guard<std::mutex> lock(g_mgpu_handle_registry_mutex);
+  
+//   auto it = g_mgpu_stream_handle_registry.find(stream);
+//   if (it != g_mgpu_stream_handle_registry.end() && it->second.valid) {
+//     handles = it->second;
+//     return true;
+//   }
+  
+//   fprintf(stderr, "[HANDLE] ERROR: No handles found for stream %p. "
+//                   "Call mgpuCreateHandlesForStream() first!\n", stream);
+//   return false;
+// }
 
 // 流到cuBLAS句柄的映射
 static std::mutex g_cublas_handles_mutex;
@@ -252,8 +351,8 @@ extern "C" MLIR_CUDA_WRAPPERS_EXPORT cublasHandle_t mgpuCublasGetHandle(CUstream
   
   // 存储并返回新句柄
   g_stream_cublas_handles[stream] = handle;
-  fprintf(stderr, "[HANDLE] Created new cuBLAS handle: %p for stream: %p\n", 
-    handle, stream);
+  // fprintf(stderr, "[HANDLE] Created new cuBLAS handle: %p for stream: %p\n", 
+  //   handle, stream);
 
   return handle;
 }
@@ -270,7 +369,7 @@ extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuCublasDestroyHandle(CUstream strea
   if (it != g_stream_cublas_handles.end()) {
     CUBLAS_REPORT_IF_ERROR(cublasDestroy(it->second));
     g_stream_cublas_handles.erase(it);
-    fprintf(stderr, "[HANDLE] Destroyed cuBLAS handle for stream: %p\n", stream);
+    // fprintf(stderr, "[HANDLE] Destroyed cuBLAS handle for stream: %p\n", stream);
   }
 }
 
@@ -314,8 +413,8 @@ extern "C" MLIR_CUDA_WRAPPERS_EXPORT cudnnHandle_t mgpuCudnnGetHandle(CUstream s
   
   // 存储并返回新句柄
   g_stream_handles[stream] = handle;
-  fprintf(stderr, "[HANDLE] Created new cuDNN handle: %p for stream: %p\n", 
-    handle, stream);
+  // fprintf(stderr, "[HANDLE] Created new cuDNN handle: %p for stream: %p\n", 
+  //   handle, stream);
 
   return handle;
 }
@@ -332,7 +431,7 @@ extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuCudnnDestroyHandle(CUstream stream
   if (it != g_stream_handles.end()) {
     CUDNN_REPORT_IF_ERROR(cudnnDestroy(it->second));
     g_stream_handles.erase(it);
-    fprintf(stderr, "[HANDLE] Destroyed cuDNN handle for stream: %p\n", stream);
+    // fprintf(stderr, "[HANDLE] Destroyed cuDNN handle for stream: %p\n", stream);
   }
 }
 
@@ -350,6 +449,356 @@ extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuCudnnCleanup() {
   g_stream_handles.clear();
 }
 
+//===----------------------------------------------------------------------===//
+// 1. Handle池数据结构定义
+//===----------------------------------------------------------------------===//
+
+struct PooledHandle {
+  cudnnHandle_t cudnn_handle;
+  cublasHandle_t cublas_handle;
+  bool in_use;
+  int pool_index;
+  
+  PooledHandle() : cudnn_handle(nullptr), cublas_handle(nullptr), 
+                  in_use(false), pool_index(-1) {}
+};
+
+// 全局Handle池状态
+static std::vector<PooledHandle> g_handle_pool;                     // 所有handle的存储
+static std::queue<int> g_available_handle_indices;                  // 可用handle索引队列
+static std::unordered_map<CUstream, int> g_stream_to_handle_index;  // stream到handle的映射
+static std::mutex g_handle_pool_mutex;                              // 线程安全锁
+static bool g_handle_pool_initialized = false;                      // 初始化标志
+static std::atomic<int> g_active_handle_count{0}; 
+
+//===----------------------------------------------------------------------===//
+// 2. Handle池初始化和销毁
+//===----------------------------------------------------------------------===//
+
+/**
+ * 初始化Handle池
+ * @param pool_size 池中handle的数量
+ */
+extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuInitHandlePool(int pool_size) {
+  mgpuEnsureContext();
+  
+  std::lock_guard<std::mutex> lock(g_handle_pool_mutex);
+  
+  if (g_handle_pool_initialized) {
+    fprintf(stderr, "[HANDLE POOL] Already initialized with %d handles\n", 
+            (int)g_handle_pool.size());
+    return;
+  }
+  
+  if (pool_size <= 0) {
+    fprintf(stderr, "[HANDLE POOL] ERROR: Invalid pool size: %d\n", pool_size);
+    return;
+  }
+  
+  fprintf(stderr, "[HANDLE POOL] Initializing pool with %d handles...\n", pool_size);
+  
+  // 预分配存储空间
+  g_handle_pool.reserve(pool_size);
+  g_handle_pool.resize(pool_size);
+  
+  // 创建所有handles
+  for (int i = 0; i < pool_size; i++) {
+    PooledHandle& handle = g_handle_pool[i];
+    handle.pool_index = i;
+    
+    // 创建cuDNN handle
+    cudnnStatus_t cudnn_status = cudnnCreate(&handle.cudnn_handle);
+    if (cudnn_status != CUDNN_STATUS_SUCCESS) {
+      fprintf(stderr, "[HANDLE POOL] FATAL: Failed to create cuDNN handle %d: %s\n", 
+              i, cudnnGetErrorString(cudnn_status));
+      
+      // 清理已创建的handles
+      for (int j = 0; j < i; j++) {
+        if (g_handle_pool[j].cudnn_handle) {
+          cudnnDestroy(g_handle_pool[j].cudnn_handle);
+        }
+        if (g_handle_pool[j].cublas_handle) {
+          cublasDestroy(g_handle_pool[j].cublas_handle);
+        }
+      }
+      g_handle_pool.clear();
+      return;
+    }
+    
+    // 创建cuBLAS handle
+    cublasStatus_t cublas_status = cublasCreate(&handle.cublas_handle);
+    if (cublas_status != CUBLAS_STATUS_SUCCESS) {
+      fprintf(stderr, "[HANDLE POOL] FATAL: Failed to create cuBLAS handle %d: status=%d\n", 
+              i, cublas_status);
+      
+      // 清理当前handle的cuDNN部分
+      cudnnDestroy(handle.cudnn_handle);
+      
+      // 清理已创建的handles
+      for (int j = 0; j < i; j++) {
+        if (g_handle_pool[j].cudnn_handle) {
+          cudnnDestroy(g_handle_pool[j].cudnn_handle);
+        }
+        if (g_handle_pool[j].cublas_handle) {
+          cublasDestroy(g_handle_pool[j].cublas_handle);
+        }
+      }
+      g_handle_pool.clear();
+      return;
+    }
+    
+    // 将索引加入可用队列
+    g_available_handle_indices.push(i);
+    
+    // fprintf(stderr, "[HANDLE POOL] Created handle %d: cuDNN=%p, cuBLAS=%p\n", 
+    //         i, handle.cudnn_handle, handle.cublas_handle);
+  }
+  
+  g_handle_pool_initialized = true;
+  g_active_handle_count = 0;
+  
+  fprintf(stderr, "[HANDLE POOL] Successfully initialized %d handles\n", pool_size);
+}
+
+/**
+ * 销毁Handle池
+ */
+extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuDestroyHandlePool() {
+  mgpuEnsureContext();
+  
+  std::lock_guard<std::mutex> lock(g_handle_pool_mutex);
+  
+  if (!g_handle_pool_initialized) {
+    fprintf(stderr, "[HANDLE POOL] Pool not initialized, nothing to destroy\n");
+    return;
+  }
+  
+  fprintf(stderr, "[HANDLE POOL] Destroying pool with %d handles...\n", 
+          (int)g_handle_pool.size());
+  
+  // 检查是否还有活跃的handles
+  if (g_active_handle_count > 0) {
+    fprintf(stderr, "[HANDLE POOL] WARNING: %d handles still in use during destruction\n", 
+            g_active_handle_count.load());
+  }
+  
+  // 销毁所有handles
+  int destroyed_count = 0;
+  for (size_t i = 0; i < g_handle_pool.size(); i++) {
+    PooledHandle& handle = g_handle_pool[i];
+    
+    if (handle.cublas_handle) {
+      cublasStatus_t status = cublasDestroy(handle.cublas_handle);
+      if (status != CUBLAS_STATUS_SUCCESS) {
+        fprintf(stderr, "[HANDLE POOL] Error destroying cuBLAS handle %d: %d\n", 
+                (int)i, status);
+      }
+      handle.cublas_handle = nullptr;
+    }
+    
+    if (handle.cudnn_handle) {
+      cudnnStatus_t status = cudnnDestroy(handle.cudnn_handle);
+      if (status != CUDNN_STATUS_SUCCESS) {
+        fprintf(stderr, "[HANDLE POOL] Error destroying cuDNN handle %d: %s\n", 
+                (int)i, cudnnGetErrorString(status));
+      }
+      handle.cudnn_handle = nullptr;
+    }
+    
+    destroyed_count++;
+  }
+  
+  // 清理所有数据结构
+  g_handle_pool.clear();
+  while (!g_available_handle_indices.empty()) {
+    g_available_handle_indices.pop();
+  }
+  g_stream_to_handle_index.clear();
+  g_active_handle_count = 0;
+  g_handle_pool_initialized = false;
+  
+  fprintf(stderr, "[HANDLE POOL] Destroyed %d handles, pool cleanup complete\n", 
+          destroyed_count);
+}
+
+//===----------------------------------------------------------------------===//
+// 3. Handle获取函数 (替代mgpuCreateHandlesForStream)
+//===----------------------------------------------------------------------===//
+
+/**
+ * 从池中获取handle并绑定到stream
+ * 这个函数替代原来的mgpuCreateHandlesForStream
+ * @param stream CUDA stream
+ */
+extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuAcquirePooledHandles(CUstream stream) {
+  mgpuEnsureContext();
+  
+  std::lock_guard<std::mutex> lock(g_handle_pool_mutex);
+  
+  if (!g_handle_pool_initialized) {
+    fprintf(stderr, "[HANDLE POOL] FATAL: Pool not initialized. Call mgpuInitHandlePool() first!\n");
+    return;
+  }
+  
+  // 检查stream是否已经有handle分配
+  if (g_stream_to_handle_index.find(stream) != g_stream_to_handle_index.end()) {
+    fprintf(stderr, "[HANDLE POOL] WARNING: Stream %p already has handle assigned\n", stream);
+    return;
+  }
+  
+  // 检查是否有可用的handle
+  if (g_available_handle_indices.empty()) {
+    fprintf(stderr, "[HANDLE POOL] FATAL: No available handles! Active: %d, Total: %d\n", 
+            g_active_handle_count.load(), (int)g_handle_pool.size());
+    return;
+  }
+  
+  // 获取一个可用的handle
+  int handle_index = g_available_handle_indices.front();
+  g_available_handle_indices.pop();
+  
+  PooledHandle& handle = g_handle_pool[handle_index];
+  
+  // 绑定handle到stream
+  cudnnStatus_t cudnn_status = cudnnSetStream(handle.cudnn_handle, stream);
+  if (cudnn_status != CUDNN_STATUS_SUCCESS) {
+    fprintf(stderr, "[HANDLE POOL] ERROR: Failed to set cuDNN stream for handle %d: %s\n", 
+            handle_index, cudnnGetErrorString(cudnn_status));
+    // 将handle放回可用队列
+    g_available_handle_indices.push(handle_index);
+    return;
+  }
+  
+  cublasStatus_t cublas_status = cublasSetStream(handle.cublas_handle, stream);
+  if (cublas_status != CUBLAS_STATUS_SUCCESS) {
+    fprintf(stderr, "[HANDLE POOL] ERROR: Failed to set cuBLAS stream for handle %d: %d\n", 
+            handle_index, cublas_status);
+    // 重置cuDNN stream并将handle放回可用队列
+    cudnnSetStream(handle.cudnn_handle, nullptr);
+    g_available_handle_indices.push(handle_index);
+    return;
+  }
+  
+  // 更新状态
+  handle.in_use = true;
+  g_stream_to_handle_index[stream] = handle_index;
+  g_active_handle_count++;
+  
+  // fprintf(stderr, "[HANDLE POOL] Acquired handle %d for stream %p (Active: %d/%d)\n", 
+  //         handle_index, stream, g_active_handle_count.load(), (int)g_handle_pool.size());
+}
+
+//===----------------------------------------------------------------------===//
+// 4. Handle退还函数 (替代mgpuDestroyHandlesForStream)
+//===----------------------------------------------------------------------===//
+
+/**
+ * 将handle退还到池中
+ * 这个函数替代原来的mgpuDestroyHandlesForStream
+ * @param stream CUDA stream
+ */
+extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuReleasePooledHandles(CUstream stream) {
+  mgpuEnsureContext();
+  
+  std::lock_guard<std::mutex> lock(g_handle_pool_mutex);
+  
+  if (!g_handle_pool_initialized) {
+    fprintf(stderr, "[HANDLE POOL] WARNING: Pool not initialized\n");
+    return;
+  }
+  
+  // 查找stream对应的handle
+  auto it = g_stream_to_handle_index.find(stream);
+  if (it == g_stream_to_handle_index.end()) {
+    fprintf(stderr, "[HANDLE POOL] WARNING: No handle found for stream %p\n", stream);
+    return;
+  }
+  
+  int handle_index = it->second;
+  PooledHandle& handle = g_handle_pool[handle_index];
+  
+  if (!handle.in_use) {
+    fprintf(stderr, "[HANDLE POOL] WARNING: Handle %d is not marked as in use\n", handle_index);
+    return;
+  }
+  
+  // 解除stream绑定
+  cudnnStatus_t cudnn_status = cudnnSetStream(handle.cudnn_handle, nullptr);
+  if (cudnn_status != CUDNN_STATUS_SUCCESS) {
+    fprintf(stderr, "[HANDLE POOL] WARNING: Failed to reset cuDNN stream for handle %d: %s\n", 
+            handle_index, cudnnGetErrorString(cudnn_status));
+  }
+  
+  cublasStatus_t cublas_status = cublasSetStream(handle.cublas_handle, nullptr);
+  if (cublas_status != CUBLAS_STATUS_SUCCESS) {
+    fprintf(stderr, "[HANDLE POOL] WARNING: Failed to reset cuBLAS stream for handle %d: %d\n", 
+            handle_index, cublas_status);
+  }
+  
+  // 更新状态
+  handle.in_use = false;
+  g_available_handle_indices.push(handle_index);
+  g_stream_to_handle_index.erase(it);
+  g_active_handle_count--;
+  
+  // fprintf(stderr, "[HANDLE POOL] Released handle %d from stream %p (Active: %d/%d)\n", 
+  //         handle_index, stream, g_active_handle_count.load(), (int)g_handle_pool.size());
+}
+
+//===----------------------------------------------------------------------===//
+// 5. 获取Handle用于计算 (修改原有的getHandlesForStream函数)
+//===----------------------------------------------------------------------===//
+
+// 从池中获取handle用于计算操作
+static bool getPooledHandlesForStream(CUstream stream, StreamHandles& result_handles) {
+  std::lock_guard<std::mutex> lock(g_handle_pool_mutex);
+  
+  auto it = g_stream_to_handle_index.find(stream);
+  if (it == g_stream_to_handle_index.end()) {
+    fprintf(stderr, "[HANDLE POOL] ERROR: No handle assigned to stream %p. "
+                    "Call mgpuAcquirePooledHandles() first!\n", stream);
+    return false;
+  }
+  
+  int handle_index = it->second;
+  PooledHandle& handle = g_handle_pool[handle_index];
+  
+  if (!handle.in_use) {
+    fprintf(stderr, "[HANDLE POOL] ERROR: Handle %d is not marked as in use\n", handle_index);
+    return false;
+  }
+  
+  // 填充返回结果
+  result_handles.cudnn_handle = handle.cudnn_handle;
+  result_handles.cublas_handle = handle.cublas_handle;
+  result_handles.valid = true;
+  
+  return true;
+}
+
+// 修改原有的getHandlesForStream函数以支持池
+static bool getHandlesForStream(CUstream stream, StreamHandles& handles) {
+  // 优先从池中获取
+  if (g_handle_pool_initialized) {
+    return getPooledHandlesForStream(stream, handles);
+  }
+  
+  // 如果池未初始化，回退到原有方式
+  std::lock_guard<std::mutex> lock(g_mgpu_handle_registry_mutex);
+  
+  auto it = g_mgpu_stream_handle_registry.find(stream);
+  if (it != g_mgpu_stream_handle_registry.end() && it->second.valid) {
+    handles = it->second;
+    return true;
+  }
+  
+  fprintf(stderr, "[HANDLE] ERROR: No handles found for stream %p. "
+                  "Use handle pool or call mgpuCreateHandlesForStream() first!\n", stream);
+  return false;
+}
+
+
+
 // 全连接层的实现，使用cuBLAS执行矩阵乘法
 extern "C" MLIR_CUDA_WRAPPERS_EXPORT void
 mgpuCulibsFullyConnectedForward(
@@ -363,8 +812,14 @@ mgpuCulibsFullyConnectedForward(
   // 确保使用全局上下文
   mgpuEnsureContext();
   
+  StreamHandles handles;
+  if (!getHandlesForStream(stream, handles)) {
+    return; // 错误信息已在getHandlesForStream中打印
+  }
+  cublasHandle_t handle = handles.cublas_handle;
+
   // 获取此流的cuBLAS句柄
-  cublasHandle_t handle = mgpuCublasGetHandle(stream);
+  // cublasHandle_t handle = mgpuCublasGetHandle(stream);
   
   // 设置矩阵乘法参数
   // C = alpha * op(A) * op(B) + beta * C
@@ -399,7 +854,8 @@ mgpuCulibsFullyConnectedForward(
   // 如果提供了偏置，使用cuDNN的AddTensor添加偏置
   if (bias_data != nullptr) {
     // 获取cuDNN句柄
-    cudnnHandle_t cudnnHandle = mgpuCudnnGetHandle(stream);
+    // cudnnHandle_t cudnnHandle = mgpuCudnnGetHandle(stream);
+    cudnnHandle_t cudnnHandle = handles.cudnn_handle;
     
     // 创建张量描述符
     cudnnTensorDescriptor_t outputDesc, biasDesc;
@@ -448,8 +904,14 @@ mgpuCulibsFlattenFullyConnectedForward(
   // Calculate the flattened features dimension
   int flattened_features = input_channels * input_height * input_width;
   
+  StreamHandles handles;
+  if (!getHandlesForStream(stream, handles)) {
+    return; // 错误信息已在getHandlesForStream中打印
+  }
+  cublasHandle_t handle = handles.cublas_handle;
+
   // Get cuBLAS handle for this stream
-  cublasHandle_t handle = mgpuCublasGetHandle(stream);
+  // cublasHandle_t handle = mgpuCublasGetHandle(stream);
   
   // Set matrix multiplication parameters
   // C = alpha * op(A) * op(B) + beta * C
@@ -482,7 +944,8 @@ mgpuCulibsFlattenFullyConnectedForward(
   // Add bias if provided
   if (bias_data != nullptr) {
     // Get cuDNN handle
-    cudnnHandle_t cudnnHandle = mgpuCudnnGetHandle(stream);
+    // cudnnHandle_t cudnnHandle = mgpuCudnnGetHandle(stream);
+    cudnnHandle_t cudnnHandle = handles.cudnn_handle;
     
     // Create tensor descriptors
     cudnnTensorDescriptor_t outputDesc, biasDesc;
@@ -543,7 +1006,15 @@ extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuCudnnConv2dForward(
 
   // 获取此流的cuDNN句柄
   // fprintf(stderr, "[HANDLE] Before getting handle\n");
-  cudnnHandle_t handle = mgpuCudnnGetHandle(stream);
+  // 获取预创建的handle组
+  StreamHandles handles;
+  if (!getHandlesForStream(stream, handles)) {
+    return; // 错误信息已在getHandlesForStream中打印
+  }
+  cudnnHandle_t handle = handles.cudnn_handle;
+
+  // cudnnHandle_t handle = mgpuCudnnGetHandle(stream);
+
   // fprintf(stderr, "[HANDLE] Got handle: %p\n", handle);
   
   // 创建描述符
@@ -592,18 +1063,18 @@ extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuCudnnConv2dForward(
   CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
       biasDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, 1, k, 1, 1));
   
-  // 自动选择最佳算法
-  int requestedAlgoCount = 10;
-  int returnedAlgoCount;
-  cudnnConvolutionFwdAlgoPerf_t perfResults[10];
-  CUDNN_REPORT_IF_ERROR(cudnnGetConvolutionForwardAlgorithm_v7(
-      handle, xDesc, wDesc, convDesc, yDesc,
-      requestedAlgoCount, &returnedAlgoCount, perfResults));
+  // // 自动选择最佳算法
+  // int requestedAlgoCount = 10;
+  // int returnedAlgoCount;
+  // cudnnConvolutionFwdAlgoPerf_t perfResults[10];
+  // CUDNN_REPORT_IF_ERROR(cudnnGetConvolutionForwardAlgorithm_v7(
+  //     handle, xDesc, wDesc, convDesc, yDesc,
+  //     requestedAlgoCount, &returnedAlgoCount, perfResults));
   
-  // 选择最快的且可用的算法
-  cudnnConvolutionFwdAlgo_t algo = perfResults[0].algo;
+  // // 选择最快的且可用的算法
+  // cudnnConvolutionFwdAlgo_t algo = perfResults[0].algo;
   
-  // cudnnConvolutionFwdAlgo_t algo = CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_GEMM; // 或其他适合你计算的预定义算法
+  cudnnConvolutionFwdAlgo_t algo = CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_GEMM; // 或其他适合你计算的预定义算法
   // cudnnConvolutionFwdAlgo_t algo = CUDNN_CONVOLUTION_FWD_ALGO_WINOGRAD;
   // cudnnConvolutionFwdAlgo_t algo = CUDNN_CONVOLUTION_FWD_ALGO_WINOGRAD_NONFUSED;
 
@@ -696,8 +1167,14 @@ mgpuCudnnMaxPoolForward(
   // 确保使用全局上下文
   mgpuEnsureContext();
   
+  StreamHandles handles;
+  if (!getHandlesForStream(stream, handles)) {
+    return; // 错误信息已在getHandlesForStream中打印
+  }
+  cudnnHandle_t handle = handles.cudnn_handle;
+
   // 获取此流的cuDNN句柄
-  cudnnHandle_t handle = mgpuCudnnGetHandle(stream);
+  // cudnnHandle_t handle = mgpuCudnnGetHandle(stream);
   
   // 创建描述符
   cudnnTensorDescriptor_t inputDesc, outputDesc;
@@ -774,8 +1251,14 @@ mgpuCudnnMul(void* inputA, void* inputB, void* output,
   mgpuEnsureContext();
   // ScopedContext scopedContext;
   
+  StreamHandles handles;
+  if (!getHandlesForStream(stream, handles)) {
+    return; // 错误信息已在getHandlesForStream中打印
+  }
+  cudnnHandle_t handle = handles.cudnn_handle;
+
   // 获取此流的cuDNN句柄
-  cudnnHandle_t handle = mgpuCudnnGetHandle(stream);
+  // cudnnHandle_t handle = mgpuCudnnGetHandle(stream);
   
   // 创建张量描述符
   cudnnTensorDescriptor_t aDesc, bDesc, cDesc;
@@ -826,8 +1309,16 @@ mgpuCudnnAdd(void* inputA, void* inputB, void* output,
   mgpuEnsureContext();
   // ScopedContext scopedContext;
   
+
+  // 获取预创建的handle组
+  StreamHandles handles;
+  if (!getHandlesForStream(stream, handles)) {
+    return; // 错误信息已在getHandlesForStream中打印
+  }
+  
+  cudnnHandle_t handle = handles.cudnn_handle;
   // 获取此流的cuDNN句柄
-  cudnnHandle_t handle = mgpuCudnnGetHandle(stream);
+  // cudnnHandle_t handle = mgpuCudnnGetHandle(stream);
   
   // 创建张量描述符
   cudnnTensorDescriptor_t aDesc, bDesc, cDesc;
@@ -877,8 +1368,14 @@ mgpuCudnnSub(void* inputA, void* inputB, void* output,
   mgpuEnsureContext();
   // ScopedContext scopedContext;
   
+  StreamHandles handles;
+  if (!getHandlesForStream(stream, handles)) {
+    return; // 错误信息已在getHandlesForStream中打印
+  }
+  cudnnHandle_t handle = handles.cudnn_handle;
+
   // 获取此流的cuDNN句柄
-  cudnnHandle_t handle = mgpuCudnnGetHandle(stream);
+  // cudnnHandle_t handle = mgpuCudnnGetHandle(stream);
   
   // 创建张量描述符
   cudnnTensorDescriptor_t aDesc, bDesc, cDesc;
@@ -1016,8 +1513,14 @@ mgpuCudnnNeg(void* input, void* output,
   mgpuEnsureContext();
   // ScopedContext scopedContext;
   
+  StreamHandles handles;
+  if (!getHandlesForStream(stream, handles)) {
+    return; // 错误信息已在getHandlesForStream中打印
+  }
+  cudnnHandle_t handle = handles.cudnn_handle;
+
   // 获取此流的cuDNN句柄
-  cudnnHandle_t handle = mgpuCudnnGetHandle(stream);
+  // cudnnHandle_t handle = mgpuCudnnGetHandle(stream);
   
   // 创建张量描述符
   cudnnTensorDescriptor_t aDesc, cDesc;
@@ -1073,8 +1576,14 @@ mgpuCudnnMulScalar(void* input, void* scalar, void* output,
                   CUstream stream) {
   mgpuEnsureContext();
   
+  StreamHandles handles;
+  if (!getHandlesForStream(stream, handles)) {
+    return; // 错误信息已在getHandlesForStream中打印
+  }
+  cudnnHandle_t handle = handles.cudnn_handle;
+
   // 获取此流的cuDNN句柄
-  cudnnHandle_t handle = mgpuCudnnGetHandle(stream);
+  // cudnnHandle_t handle = mgpuCudnnGetHandle(stream);
   
   // 创建张量描述符
   cudnnTensorDescriptor_t xDesc, yDesc;
@@ -1109,8 +1618,14 @@ mgpuCudnnSubScalar(void* input, void* scalar, void* output,
                   CUstream stream) {
   mgpuEnsureContext();
   
+  StreamHandles handles;
+  if (!getHandlesForStream(stream, handles)) {
+    return; // 错误信息已在getHandlesForStream中打印
+  }
+  cudnnHandle_t handle = handles.cudnn_handle;
+
   // 获取此流的cuDNN句柄
-  cudnnHandle_t handle = mgpuCudnnGetHandle(stream);
+  // cudnnHandle_t handle = mgpuCudnnGetHandle(stream);
   
   // 创建张量描述符
   cudnnTensorDescriptor_t xDesc, yDesc;
@@ -1168,8 +1683,14 @@ mgpuCudnnRSubScalar(void* input, void* scalar, void* output,
                    CUstream stream) {
   mgpuEnsureContext();
   
+  StreamHandles handles;
+  if (!getHandlesForStream(stream, handles)) {
+    return; // 错误信息已在getHandlesForStream中打印
+  }
+  cudnnHandle_t handle = handles.cudnn_handle;
+
   // 获取此流的cuDNN句柄
-  cudnnHandle_t handle = mgpuCudnnGetHandle(stream);
+  // cudnnHandle_t handle = mgpuCudnnGetHandle(stream);
   
   // 创建张量描述符
   cudnnTensorDescriptor_t xDesc, yDesc;
@@ -1228,8 +1749,14 @@ mgpuCudnnAddScalar(void* input, void* scalar, void* output,
                   CUstream stream) {
   mgpuEnsureContext();
   
+  StreamHandles handles;
+  if (!getHandlesForStream(stream, handles)) {
+    return; // 错误信息已在getHandlesForStream中打印
+  }
+  cudnnHandle_t handle = handles.cudnn_handle;
+
   // 获取此流的cuDNN句柄
-  cudnnHandle_t handle = mgpuCudnnGetHandle(stream);
+  // cudnnHandle_t handle = mgpuCudnnGetHandle(stream);
   
   // 创建张量描述符
   cudnnTensorDescriptor_t xDesc, yDesc;
@@ -1441,11 +1968,31 @@ extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuStreamDestroy(CUstream stream) {
   // 确保我们在全局上下文中
   mgpuEnsureContext();
   
+  if (g_handle_pool_initialized) {
+    // 检查是否有handle需要退还
+    bool has_handle = false;
+    {
+      std::lock_guard<std::mutex> lock(g_handle_pool_mutex);
+      auto it = g_stream_to_handle_index.find(stream);
+      has_handle = (it != g_stream_to_handle_index.end());
+    }
+    
+    if (has_handle) {
+      // fprintf(stderr, "[STREAM] WARNING: Stream %p still has handle assigned, auto-releasing...\n", stream);
+      mgpuReleasePooledHandles(stream);
+    }
+  } else {
+    // 如果没有使用Handle Pool，使用原有的销毁方式
+    mgpuDestroyHandlesForStream(stream);
+  }
+
+  // mgpuDestroyHandlesForStream(stream);
+
   // 先销毁与此流关联的cuDNN句柄
-  mgpuCudnnDestroyHandle(stream);
+  // mgpuCudnnDestroyHandle(stream);
 
   // 销毁与此流关联的cuBLAS句柄
-  mgpuCublasDestroyHandle(stream);
+  // mgpuCublasDestroyHandle(stream);
 
   CUDA_REPORT_IF_ERROR(cuStreamDestroy(stream));
 }
