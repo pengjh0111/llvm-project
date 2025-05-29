@@ -648,7 +648,7 @@ extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuAcquirePooledHandles(CUstream stre
   
   // 检查是否有可用的handle
   if (g_available_handle_indices.empty()) {
-    fprintf(stderr, "[HANDLE POOL] FATAL: No available handles! Active: %d, Total: %d\n", 
+    fprintf(stderr, "[HANDLE POOL] FATAL: No available handles! Active: %d, Total: %d\n",
             g_active_handle_count.load(), (int)g_handle_pool.size());
     return;
   }
@@ -797,7 +797,281 @@ static bool getHandlesForStream(CUstream stream, StreamHandles& handles) {
   return false;
 }
 
+//===----------------------------------------------------------------------===//
+// Stream池数据结构定义
+//===----------------------------------------------------------------------===//
 
+struct PooledStream {
+  CUstream stream;
+  bool in_use;
+  int pool_index;
+  
+  PooledStream() : stream(nullptr), in_use(false), pool_index(-1) {}
+};
+
+// 全局Stream池状态
+static std::vector<PooledStream> g_stream_pool;                     // 所有stream的存储
+static std::queue<int> g_available_stream_indices;                  // 可用stream索引队列
+static std::mutex g_stream_pool_mutex;                              // 线程安全锁
+static bool g_stream_pool_initialized = false;                      // 初始化标志
+static std::atomic<int> g_active_stream_count{0};  
+
+//===----------------------------------------------------------------------===//
+// Stream池初始化和销毁
+//===----------------------------------------------------------------------===//
+
+/**
+ * 初始化Stream池
+ * @param pool_size 池中stream的数量
+ */
+extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuInitStreamPool(int pool_size) {
+  mgpuEnsureContext();
+  
+  std::lock_guard<std::mutex> lock(g_stream_pool_mutex);
+  
+  if (g_stream_pool_initialized) {
+    fprintf(stderr, "[STREAM POOL] Already initialized with %d streams\n", 
+            (int)g_stream_pool.size());
+    return;
+  }
+  
+  if (pool_size <= 0) {
+    fprintf(stderr, "[STREAM POOL] ERROR: Invalid pool size: %d\n", pool_size);
+    return;
+  }
+  
+  fprintf(stderr, "[STREAM POOL] Initializing pool with %d streams...\n", pool_size);
+  
+  // 预分配存储空间
+  g_stream_pool.reserve(pool_size);
+  g_stream_pool.resize(pool_size);
+  
+  // 创建所有streams
+  for (int i = 0; i < pool_size; i++) {
+    PooledStream& pooled_stream = g_stream_pool[i];
+    pooled_stream.pool_index = i;
+    
+    // 创建CUDA stream
+    CUresult result = cuStreamCreate(&pooled_stream.stream, CU_STREAM_NON_BLOCKING);
+    if (result != CUDA_SUCCESS) {
+      const char *name = nullptr;
+      cuGetErrorName(result, &name);
+      if (!name) name = "<unknown>";
+      
+      fprintf(stderr, "[STREAM POOL] FATAL: Failed to create stream %d: %s\n", 
+              i, name);
+      
+      // 清理已创建的streams
+      for (int j = 0; j < i; j++) {
+        if (g_stream_pool[j].stream) {
+          cuStreamDestroy(g_stream_pool[j].stream);
+        }
+      }
+      g_stream_pool.clear();
+      return;
+    }
+    
+    // 将索引加入可用队列
+    g_available_stream_indices.push(i);
+    
+    // fprintf(stderr, "[STREAM POOL] Created stream %d: %p\n", 
+    //         i, pooled_stream.stream);
+  }
+  
+  g_stream_pool_initialized = true;
+  g_active_stream_count = 0;
+  
+  fprintf(stderr, "[STREAM POOL] Successfully initialized %d streams\n", pool_size);
+}
+
+/**
+ * 销毁Stream池
+ */
+extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuDestroyStreamPool() {
+  mgpuEnsureContext();
+  
+  std::lock_guard<std::mutex> lock(g_stream_pool_mutex);
+  
+  if (!g_stream_pool_initialized) {
+    fprintf(stderr, "[STREAM POOL] Pool not initialized, nothing to destroy\n");
+    return;
+  }
+  
+  fprintf(stderr, "[STREAM POOL] Destroying pool with %d streams...\n", 
+          (int)g_stream_pool.size());
+  
+  // 检查是否还有活跃的streams
+  if (g_active_stream_count > 0) {
+    fprintf(stderr, "[STREAM POOL] WARNING: %d streams still in use during destruction\n", 
+            g_active_stream_count.load());
+  }
+  
+  // 销毁所有streams
+  int destroyed_count = 0;
+  for (size_t i = 0; i < g_stream_pool.size(); i++) {
+    PooledStream& pooled_stream = g_stream_pool[i];
+    
+    if (pooled_stream.stream) {
+      // 如果stream还在使用中，先处理关联的资源
+      if (pooled_stream.in_use) {
+        fprintf(stderr, "[STREAM POOL] WARNING: Stream %d still in use, cleaning up...\n", (int)i);
+        
+        // 如果使用了handle pool，释放相关的handles
+        if (g_handle_pool_initialized) {
+          mgpuReleasePooledHandles(pooled_stream.stream);
+        } else {
+          // 否则使用原有方式清理
+          mgpuDestroyHandlesForStream(pooled_stream.stream);
+        }
+      }
+      
+      CUresult result = cuStreamDestroy(pooled_stream.stream);
+      if (result != CUDA_SUCCESS) {
+        const char *name = nullptr;
+        cuGetErrorName(result, &name);
+        if (!name) name = "<unknown>";
+        fprintf(stderr, "[STREAM POOL] Error destroying stream %d: %s\n", 
+                (int)i, name);
+      }
+      pooled_stream.stream = nullptr;
+    }
+    
+    destroyed_count++;
+  }
+  
+  // 清理所有数据结构
+  g_stream_pool.clear();
+  while (!g_available_stream_indices.empty()) {
+    g_available_stream_indices.pop();
+  }
+  g_active_stream_count = 0;
+  g_stream_pool_initialized = false;
+  
+  fprintf(stderr, "[STREAM POOL] Destroyed %d streams, pool cleanup complete\n", 
+          destroyed_count);
+}
+
+//===----------------------------------------------------------------------===//
+// Stream获取和释放函数 (替代mgpuStreamCreate和mgpuStreamDestroy)
+//===----------------------------------------------------------------------===//
+
+/**
+ * 从池中获取stream
+ * 这个函数替代原来的mgpuStreamCreate
+ * @return 获取的CUDA stream，如果失败返回nullptr
+ */
+extern "C" MLIR_CUDA_WRAPPERS_EXPORT CUstream mgpuAcquirePooledStream() {
+  mgpuEnsureContext();
+  
+  std::lock_guard<std::mutex> lock(g_stream_pool_mutex);
+  
+  if (!g_stream_pool_initialized) {
+    fprintf(stderr, "[STREAM POOL] FATAL: Pool not initialized. Call mgpuInitStreamPool() first!\n");
+    return nullptr;
+  }
+  
+  // 检查是否有可用的stream
+  if (g_available_stream_indices.empty()) {
+    fprintf(stderr, "[STREAM POOL] FATAL: No available streams! Active: %d, Total: %d\n", 
+            g_active_stream_count.load(), (int)g_stream_pool.size());
+    return nullptr;
+  }
+  
+  // 获取一个可用的stream
+  int stream_index = g_available_stream_indices.front();
+  g_available_stream_indices.pop();
+  
+  PooledStream& pooled_stream = g_stream_pool[stream_index];
+  
+  // 更新状态
+  pooled_stream.in_use = true;
+  g_active_stream_count++;
+  
+  // fprintf(stderr, "[STREAM POOL] Acquired stream %d: %p (Active: %d/%d)\n", 
+  //         stream_index, pooled_stream.stream, g_active_stream_count.load(), (int)g_stream_pool.size());
+  
+  return pooled_stream.stream;
+}
+
+/**
+ * 将stream退还到池中
+ * 这个函数替代原来的mgpuStreamDestroy
+ * @param stream 要释放的CUDA stream
+ */
+extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuReleasePooledStream(CUstream stream) {
+  if (stream == nullptr) {
+    fprintf(stderr, "[STREAM POOL] WARNING: Attempting to release NULL stream\n");
+    return;
+  }
+  
+  mgpuEnsureContext();
+  
+  std::lock_guard<std::mutex> lock(g_stream_pool_mutex);
+  
+  if (!g_stream_pool_initialized) {
+    fprintf(stderr, "[STREAM POOL] WARNING: Pool not initialized\n");
+    return;
+  }
+  
+  // 查找stream在池中的索引
+  int stream_index = -1;
+  for (size_t i = 0; i < g_stream_pool.size(); i++) {
+    if (g_stream_pool[i].stream == stream) {
+      stream_index = (int)i;
+      break;
+    }
+  }
+  
+  if (stream_index == -1) {
+    fprintf(stderr, "[STREAM POOL] WARNING: Stream %p not found in pool\n", stream);
+    return;
+  }
+  
+  PooledStream& pooled_stream = g_stream_pool[stream_index];
+  
+  if (!pooled_stream.in_use) {
+    fprintf(stderr, "[STREAM POOL] WARNING: Stream %d is not marked as in use\n", stream_index);
+    return;
+  }
+  
+  // 如果使用了handle pool，释放相关的handles
+  if (g_handle_pool_initialized) {
+    // 检查是否有handle需要退还
+    bool has_handle = false;
+    {
+      std::lock_guard<std::mutex> handle_lock(g_handle_pool_mutex);
+      auto it = g_stream_to_handle_index.find(stream);
+      has_handle = (it != g_stream_to_handle_index.end());
+    }
+    
+    if (has_handle) {
+      // fprintf(stderr, "[STREAM POOL] Stream %p has handle assigned, auto-releasing...\n", stream);
+      mgpuReleasePooledHandles(stream);
+    }
+  } else {
+    // 否则使用原有方式清理handles
+    mgpuDestroyHandlesForStream(stream);
+  }
+  
+  // 注意：不在这里同步stream，因为用户应该在释放前显式调用mgpuStreamSynchronize
+  // 如果需要强制同步，可以取消下面的注释
+  // CUresult sync_result = cuStreamSynchronize(stream);
+  // if (sync_result != CUDA_SUCCESS) {
+  //   const char *name = nullptr;
+  //   cuGetErrorName(sync_result, &name);
+  //   if (!name) name = "<unknown>";
+  //   fprintf(stderr, "[STREAM POOL] WARNING: Failed to synchronize stream %d: %s\n", 
+  //           stream_index, name);
+  // }
+  
+  // 更新状态
+  pooled_stream.in_use = false;
+  g_available_stream_indices.push(stream_index);
+  g_active_stream_count--;
+  
+  // fprintf(stderr, "[STREAM POOL] Released stream %d: %p (Active: %d/%d)\n", 
+  //         stream_index, stream, g_active_stream_count.load(), (int)g_stream_pool.size());
+}
 
 // 全连接层的实现，使用cuBLAS执行矩阵乘法
 extern "C" MLIR_CUDA_WRAPPERS_EXPORT void
