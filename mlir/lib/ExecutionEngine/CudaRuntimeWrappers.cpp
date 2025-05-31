@@ -1843,7 +1843,7 @@ mgpuCudnnNeg(void* input, void* output,
   CUDNN_REPORT_IF_ERROR(cudnnDestroyOpTensorDescriptor(opDesc));
 }
 
-// 标量乘法操作: B = A * scalar
+// 标量乘法操作: C = A * scalar
 extern "C" MLIR_CUDA_WRAPPERS_EXPORT void 
 mgpuCudnnMulScalar(void* input, void* scalar, void* output,
                   int n, int c, int h, int w,
@@ -1855,165 +1855,46 @@ mgpuCudnnMulScalar(void* input, void* scalar, void* output,
     return; // 错误信息已在getHandlesForStream中打印
   }
   cudnnHandle_t handle = handles.cudnn_handle;
-
-  // 获取此流的cuDNN句柄
-  // cudnnHandle_t handle = mgpuCudnnGetHandle(stream);
   
   // 创建张量描述符
-  cudnnTensorDescriptor_t xDesc, yDesc;
-  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&xDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&yDesc));
+  cudnnTensorDescriptor_t inputDesc, scalarDesc, outputDesc;
+  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&inputDesc));
+  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&scalarDesc));
+  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&outputDesc));
   
   // 设置张量描述符
   CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
-      xDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, n, c, h, w));
+      inputDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, n, c, h, w));
   CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
-      yDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, n, c, h, w));
+      scalarDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, 1, 1, 1, 1));
+  CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
+      outputDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, n, c, h, w));
   
-  // 获取标量值
-  float scalarValue = *(float*)scalar;
-  float beta = 0.0f;
+  // 创建操作描述符
+  cudnnOpTensorDescriptor_t opDesc;
+  CUDNN_REPORT_IF_ERROR(cudnnCreateOpTensorDescriptor(&opDesc));
   
-  // 使用cudnnTransformTensor实现标量乘法: output = scalar * input + 0 * output
-  CUDNN_REPORT_IF_ERROR(cudnnTransformTensor(
-      handle,
-      &scalarValue, xDesc, input,
-      &beta, yDesc, output));
+  // 设置为乘法操作
+  CUDNN_REPORT_IF_ERROR(cudnnSetOpTensorDescriptor(
+      opDesc, CUDNN_OP_TENSOR_MUL, CUDNN_DATA_FLOAT, CUDNN_NOT_PROPAGATE_NAN));
+  
+  // 设置缩放因子
+  float alpha1 = 1.0f;  // input的系数
+  float alpha2 = 1.0f;  // scalar的系数
+  float beta = 0.0f;    // output的系数
+  
+  // 执行操作: output = alpha1 * input * alpha2 * scalar + beta * output
+  CUDNN_REPORT_IF_ERROR(cudnnOpTensor(
+      handle, opDesc,
+      &alpha1, inputDesc, input,
+      &alpha2, scalarDesc, scalar,
+      &beta, outputDesc, output));
   
   // 清理描述符
-  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(xDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(yDesc));
-}
-
-// 标量减法操作: C = A - scalar
-extern "C" MLIR_CUDA_WRAPPERS_EXPORT void 
-mgpuCudnnSubScalar(void* input, void* scalar, void* output,
-                  int n, int c, int h, int w,
-                  CUstream stream) {
-  mgpuEnsureContext();
-  
-  StreamHandles handles;
-  if (!getHandlesForStream(stream, handles)) {
-    return; // 错误信息已在getHandlesForStream中打印
-  }
-  cudnnHandle_t handle = handles.cudnn_handle;
-
-  // 获取此流的cuDNN句柄
-  // cudnnHandle_t handle = mgpuCudnnGetHandle(stream);
-  
-  // 创建张量描述符
-  cudnnTensorDescriptor_t xDesc, yDesc;
-  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&xDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&yDesc));
-  
-  // 设置张量描述符
-  CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
-      xDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, n, c, h, w));
-  CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
-      yDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, n, c, h, w));
-  
-  // 获取标量值，并将其变为负值以实现减法
-  float scalarValue = *(float*)scalar;
-  float negScalarValue = -scalarValue;  // 输入 - 标量 相当于 1.0 * 输入 + (-标量)
-  float one = 1.0f;
-  float zero = 0.0f;
-  
-  // 首先将输入复制到输出
-  CUDNN_REPORT_IF_ERROR(cudnnTransformTensor(
-      handle,
-      &one, xDesc, input,
-      &zero, yDesc, output));
-  
-  // 然后添加负的标量值 (使用cudnnAddTensor实现)
-  // 创建一个1x1x1x1的描述符用于标量
-  cudnnTensorDescriptor_t scalarDesc;
-  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&scalarDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
-      scalarDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, 1, 1, 1, 1));
-  
-  // 在GPU上创建一个只有一个元素的缓冲区存储标量
-  float h_scalar = negScalarValue;
-  float* d_scalar;
-  cudaMalloc(&d_scalar, sizeof(float));
-  cudaMemcpy(d_scalar, &h_scalar, sizeof(float), cudaMemcpyHostToDevice);
-  
-  // 添加负的标量值到所有元素: output = output + negScalarValue
-  CUDNN_REPORT_IF_ERROR(cudnnAddTensor(
-      handle,
-      &one, scalarDesc, d_scalar,
-      &one, yDesc, output));
-  
-  // 清理
-  cudaFree(d_scalar);
-  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(xDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(yDesc));
+  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(inputDesc));
   CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(scalarDesc));
-}
-
-// 反向标量减法操作: C = scalar - A
-extern "C" MLIR_CUDA_WRAPPERS_EXPORT void 
-mgpuCudnnRSubScalar(void* input, void* scalar, void* output,
-                   int n, int c, int h, int w,
-                   CUstream stream) {
-  mgpuEnsureContext();
-  
-  StreamHandles handles;
-  if (!getHandlesForStream(stream, handles)) {
-    return; // 错误信息已在getHandlesForStream中打印
-  }
-  cudnnHandle_t handle = handles.cudnn_handle;
-
-  // 获取此流的cuDNN句柄
-  // cudnnHandle_t handle = mgpuCudnnGetHandle(stream);
-  
-  // 创建张量描述符
-  cudnnTensorDescriptor_t xDesc, yDesc;
-  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&xDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&yDesc));
-  
-  // 设置张量描述符
-  CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
-      xDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, n, c, h, w));
-  CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
-      yDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, n, c, h, w));
-  
-  // 取负的输入，然后加上标量值
-  float negOne = -1.0f;
-  float zero = 0.0f;
-  
-  // 首先计算 output = -input
-  CUDNN_REPORT_IF_ERROR(cudnnTransformTensor(
-      handle,
-      &negOne, xDesc, input,
-      &zero, yDesc, output));
-  
-  // 然后添加标量值 output = -input + scalar
-  float scalarValue = *(float*)scalar;
-  
-  // 创建一个1x1x1x1的描述符用于标量
-  cudnnTensorDescriptor_t scalarDesc;
-  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&scalarDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
-      scalarDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, 1, 1, 1, 1));
-  
-  // 在GPU上创建一个只有一个元素的缓冲区存储标量
-  float h_scalar = scalarValue;
-  float* d_scalar;
-  cudaMalloc(&d_scalar, sizeof(float));
-  cudaMemcpy(d_scalar, &h_scalar, sizeof(float), cudaMemcpyHostToDevice);
-  
-  // 添加标量值到所有元素: output = output + scalarValue
-  float one = 1.0f;
-  CUDNN_REPORT_IF_ERROR(cudnnAddTensor(
-      handle,
-      &one, scalarDesc, d_scalar,
-      &one, yDesc, output));
-  
-  // 清理
-  cudaFree(d_scalar);
-  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(xDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(yDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(scalarDesc));
+  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(outputDesc));
+  CUDNN_REPORT_IF_ERROR(cudnnDestroyOpTensorDescriptor(opDesc));
 }
 
 // 标量加法操作: C = A + scalar
@@ -2028,56 +1909,393 @@ mgpuCudnnAddScalar(void* input, void* scalar, void* output,
     return; // 错误信息已在getHandlesForStream中打印
   }
   cudnnHandle_t handle = handles.cudnn_handle;
-
-  // 获取此流的cuDNN句柄
-  // cudnnHandle_t handle = mgpuCudnnGetHandle(stream);
   
   // 创建张量描述符
-  cudnnTensorDescriptor_t xDesc, yDesc;
-  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&xDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&yDesc));
+  cudnnTensorDescriptor_t inputDesc, scalarDesc, outputDesc;
+  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&inputDesc));
+  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&scalarDesc));
+  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&outputDesc));
   
   // 设置张量描述符
   CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
-      xDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, n, c, h, w));
-  CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
-      yDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, n, c, h, w));
-  
-  // 获取标量值
-  float scalarValue = *(float*)scalar;
-  float one = 1.0f;
-  float zero = 0.0f;
-  
-  // 首先复制输入到输出
-  CUDNN_REPORT_IF_ERROR(cudnnTransformTensor(
-      handle,
-      &one, xDesc, input,
-      &zero, yDesc, output));
-  
-  // 创建一个1x1x1x1的描述符用于标量
-  cudnnTensorDescriptor_t scalarDesc;
-  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&scalarDesc));
+      inputDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, n, c, h, w));
   CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
       scalarDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, 1, 1, 1, 1));
+  CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
+      outputDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, n, c, h, w));
   
-  // 在GPU上创建一个只有一个元素的缓冲区存储标量
-  float h_scalar = scalarValue;
-  float* d_scalar;
-  cudaMalloc(&d_scalar, sizeof(float));
-  cudaMemcpy(d_scalar, &h_scalar, sizeof(float), cudaMemcpyHostToDevice);
+  // 创建操作描述符
+  cudnnOpTensorDescriptor_t opDesc;
+  CUDNN_REPORT_IF_ERROR(cudnnCreateOpTensorDescriptor(&opDesc));
   
-  // 添加标量值到所有元素: output = output + scalarValue
-  CUDNN_REPORT_IF_ERROR(cudnnAddTensor(
-      handle,
-      &one, scalarDesc, d_scalar,
-      &one, yDesc, output));
+  // 设置为加法操作
+  CUDNN_REPORT_IF_ERROR(cudnnSetOpTensorDescriptor(
+      opDesc, CUDNN_OP_TENSOR_ADD, CUDNN_DATA_FLOAT, CUDNN_NOT_PROPAGATE_NAN));
   
-  // 清理
-  cudaFree(d_scalar);
-  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(xDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(yDesc));
+  // 设置缩放因子
+  float alpha1 = 1.0f;  // input的系数
+  float alpha2 = 1.0f;  // scalar的系数  
+  float beta = 0.0f;    // output的系数
+  
+  // 执行操作: output = alpha1 * input + alpha2 * scalar + beta * output
+  CUDNN_REPORT_IF_ERROR(cudnnOpTensor(
+      handle, opDesc,
+      &alpha1, inputDesc, input,
+      &alpha2, scalarDesc, scalar,
+      &beta, outputDesc, output));
+  
+  // 清理描述符
+  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(inputDesc));
   CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(scalarDesc));
+  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(outputDesc));
+  CUDNN_REPORT_IF_ERROR(cudnnDestroyOpTensorDescriptor(opDesc));
 }
+
+// 标量减法操作: C = A - scalar
+extern "C" MLIR_CUDA_WRAPPERS_EXPORT void 
+mgpuCudnnSubScalar(void* input, void* scalar, void* output,
+                  int n, int c, int h, int w,
+                  CUstream stream) {
+  mgpuEnsureContext();
+  
+  StreamHandles handles;
+  if (!getHandlesForStream(stream, handles)) {
+    return; // 错误信息已在getHandlesForStream中打印
+  }
+  cudnnHandle_t handle = handles.cudnn_handle;
+  
+  // 创建张量描述符
+  cudnnTensorDescriptor_t inputDesc, scalarDesc, outputDesc;
+  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&inputDesc));
+  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&scalarDesc));
+  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&outputDesc));
+  
+  // 设置张量描述符
+  CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
+      inputDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, n, c, h, w));
+  CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
+      scalarDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, 1, 1, 1, 1));
+  CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
+      outputDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, n, c, h, w));
+  
+  // 创建操作描述符
+  cudnnOpTensorDescriptor_t opDesc;
+  CUDNN_REPORT_IF_ERROR(cudnnCreateOpTensorDescriptor(&opDesc));
+  
+  // 设置为加法操作 (通过负系数实现减法)
+  CUDNN_REPORT_IF_ERROR(cudnnSetOpTensorDescriptor(
+      opDesc, CUDNN_OP_TENSOR_ADD, CUDNN_DATA_FLOAT, CUDNN_NOT_PROPAGATE_NAN));
+  
+  // 设置缩放因子
+  float alpha1 = 1.0f;   // input的系数
+  float alpha2 = -1.0f;  // scalar的系数 (负数实现减法)
+  float beta = 0.0f;     // output的系数
+  
+  // 执行操作: output = alpha1 * input + alpha2 * scalar + beta * output
+  // 即: output = input + (-1) * scalar = input - scalar
+  CUDNN_REPORT_IF_ERROR(cudnnOpTensor(
+      handle, opDesc,
+      &alpha1, inputDesc, input,
+      &alpha2, scalarDesc, scalar,
+      &beta, outputDesc, output));
+  
+  // 清理描述符
+  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(inputDesc));
+  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(scalarDesc));
+  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(outputDesc));
+  CUDNN_REPORT_IF_ERROR(cudnnDestroyOpTensorDescriptor(opDesc));
+}
+
+// 反向标量减法操作: C = scalar - A
+extern "C" MLIR_CUDA_WRAPPERS_EXPORT void 
+mgpuCudnnRSubScalar(void* input, void* scalar, void* output,
+                   int n, int c, int h, int w,
+                   CUstream stream) {
+  mgpuEnsureContext();
+  
+  StreamHandles handles;
+  if (!getHandlesForStream(stream, handles)) {
+    return; // 错误信息已在getHandlesForStream中打印
+  }
+  cudnnHandle_t handle = handles.cudnn_handle;
+  
+  // 创建张量描述符
+  cudnnTensorDescriptor_t inputDesc, scalarDesc, outputDesc;
+  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&inputDesc));
+  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&scalarDesc));
+  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&outputDesc));
+  
+  // 设置张量描述符
+  CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
+      inputDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, n, c, h, w));
+  CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
+      scalarDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, 1, 1, 1, 1));
+  CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
+      outputDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, n, c, h, w));
+  
+  // 创建操作描述符
+  cudnnOpTensorDescriptor_t opDesc;
+  CUDNN_REPORT_IF_ERROR(cudnnCreateOpTensorDescriptor(&opDesc));
+  
+  // 设置为加法操作 (通过负系数实现反向减法)
+  CUDNN_REPORT_IF_ERROR(cudnnSetOpTensorDescriptor(
+      opDesc, CUDNN_OP_TENSOR_ADD, CUDNN_DATA_FLOAT, CUDNN_NOT_PROPAGATE_NAN));
+  
+  // 设置缩放因子
+  float alpha1 = -1.0f;  // input的系数 (负数)
+  float alpha2 = 1.0f;   // scalar的系数
+  float beta = 0.0f;     // output的系数
+  
+  // 执行操作: output = alpha1 * input + alpha2 * scalar + beta * output
+  // 即: output = (-1) * input + scalar = scalar - input
+  CUDNN_REPORT_IF_ERROR(cudnnOpTensor(
+      handle, opDesc,
+      &alpha1, inputDesc, input,
+      &alpha2, scalarDesc, scalar,
+      &beta, outputDesc, output));
+  
+  // 清理描述符
+  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(inputDesc));
+  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(scalarDesc));
+  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(outputDesc));
+  CUDNN_REPORT_IF_ERROR(cudnnDestroyOpTensorDescriptor(opDesc));
+}
+
+// // 标量乘法操作: B = A * scalar
+// extern "C" MLIR_CUDA_WRAPPERS_EXPORT void 
+// mgpuCudnnMulScalar(void* input, void* scalar, void* output,
+//                   int n, int c, int h, int w,
+//                   CUstream stream) {
+//   mgpuEnsureContext();
+  
+//   StreamHandles handles;
+//   if (!getHandlesForStream(stream, handles)) {
+//     return; // 错误信息已在getHandlesForStream中打印
+//   }
+//   cudnnHandle_t handle = handles.cudnn_handle;
+
+//   // 获取此流的cuDNN句柄
+//   // cudnnHandle_t handle = mgpuCudnnGetHandle(stream);
+  
+//   // 创建张量描述符
+//   cudnnTensorDescriptor_t xDesc, yDesc;
+//   CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&xDesc));
+//   CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&yDesc));
+  
+//   // 设置张量描述符
+//   CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
+//       xDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, n, c, h, w));
+//   CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
+//       yDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, n, c, h, w));
+  
+//   // 获取标量值
+//   float scalarValue = *(float*)scalar;
+//   float beta = 0.0f;
+  
+//   // 使用cudnnTransformTensor实现标量乘法: output = scalar * input + 0 * output
+//   CUDNN_REPORT_IF_ERROR(cudnnTransformTensor(
+//       handle,
+//       &scalarValue, xDesc, input,
+//       &beta, yDesc, output));
+  
+//   // 清理描述符
+//   CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(xDesc));
+//   CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(yDesc));
+// }
+
+// // 标量减法操作: C = A - scalar
+// extern "C" MLIR_CUDA_WRAPPERS_EXPORT void 
+// mgpuCudnnSubScalar(void* input, void* scalar, void* output,
+//                   int n, int c, int h, int w,
+//                   CUstream stream) {
+//   mgpuEnsureContext();
+  
+//   StreamHandles handles;
+//   if (!getHandlesForStream(stream, handles)) {
+//     return; // 错误信息已在getHandlesForStream中打印
+//   }
+//   cudnnHandle_t handle = handles.cudnn_handle;
+
+//   // 获取此流的cuDNN句柄
+//   // cudnnHandle_t handle = mgpuCudnnGetHandle(stream);
+  
+//   // 创建张量描述符
+//   cudnnTensorDescriptor_t xDesc, yDesc;
+//   CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&xDesc));
+//   CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&yDesc));
+  
+//   // 设置张量描述符
+//   CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
+//       xDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, n, c, h, w));
+//   CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
+//       yDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, n, c, h, w));
+  
+//   // 获取标量值，并将其变为负值以实现减法
+//   float scalarValue = *(float*)scalar;
+//   float negScalarValue = -scalarValue;  // 输入 - 标量 相当于 1.0 * 输入 + (-标量)
+//   float one = 1.0f;
+//   float zero = 0.0f;
+  
+//   // 首先将输入复制到输出
+//   CUDNN_REPORT_IF_ERROR(cudnnTransformTensor(
+//       handle,
+//       &one, xDesc, input,
+//       &zero, yDesc, output));
+  
+//   // 然后添加负的标量值 (使用cudnnAddTensor实现)
+//   // 创建一个1x1x1x1的描述符用于标量
+//   cudnnTensorDescriptor_t scalarDesc;
+//   CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&scalarDesc));
+//   CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
+//       scalarDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, 1, 1, 1, 1));
+  
+//   // 在GPU上创建一个只有一个元素的缓冲区存储标量
+//   float h_scalar = negScalarValue;
+//   float* d_scalar;
+//   cudaMalloc(&d_scalar, sizeof(float));
+//   cudaMemcpy(d_scalar, &h_scalar, sizeof(float), cudaMemcpyHostToDevice);
+  
+//   // 添加负的标量值到所有元素: output = output + negScalarValue
+//   CUDNN_REPORT_IF_ERROR(cudnnAddTensor(
+//       handle,
+//       &one, scalarDesc, d_scalar,
+//       &one, yDesc, output));
+  
+//   // 清理
+//   cudaFree(d_scalar);
+//   CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(xDesc));
+//   CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(yDesc));
+//   CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(scalarDesc));
+// }
+
+// // 反向标量减法操作: C = scalar - A
+// extern "C" MLIR_CUDA_WRAPPERS_EXPORT void 
+// mgpuCudnnRSubScalar(void* input, void* scalar, void* output,
+//                    int n, int c, int h, int w,
+//                    CUstream stream) {
+//   mgpuEnsureContext();
+  
+//   StreamHandles handles;
+//   if (!getHandlesForStream(stream, handles)) {
+//     return; // 错误信息已在getHandlesForStream中打印
+//   }
+//   cudnnHandle_t handle = handles.cudnn_handle;
+
+//   // 获取此流的cuDNN句柄
+//   // cudnnHandle_t handle = mgpuCudnnGetHandle(stream);
+  
+//   // 创建张量描述符
+//   cudnnTensorDescriptor_t xDesc, yDesc;
+//   CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&xDesc));
+//   CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&yDesc));
+  
+//   // 设置张量描述符
+//   CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
+//       xDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, n, c, h, w));
+//   CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
+//       yDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, n, c, h, w));
+  
+//   // 取负的输入，然后加上标量值
+//   float negOne = -1.0f;
+//   float zero = 0.0f;
+  
+//   // 首先计算 output = -input
+//   CUDNN_REPORT_IF_ERROR(cudnnTransformTensor(
+//       handle,
+//       &negOne, xDesc, input,
+//       &zero, yDesc, output));
+  
+//   // 然后添加标量值 output = -input + scalar
+//   float scalarValue = *(float*)scalar;
+  
+//   // 创建一个1x1x1x1的描述符用于标量
+//   cudnnTensorDescriptor_t scalarDesc;
+//   CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&scalarDesc));
+//   CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
+//       scalarDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, 1, 1, 1, 1));
+  
+//   // 在GPU上创建一个只有一个元素的缓冲区存储标量
+//   float h_scalar = scalarValue;
+//   float* d_scalar;
+//   cudaMalloc(&d_scalar, sizeof(float));
+//   cudaMemcpy(d_scalar, &h_scalar, sizeof(float), cudaMemcpyHostToDevice);
+  
+//   // 添加标量值到所有元素: output = output + scalarValue
+//   float one = 1.0f;
+//   CUDNN_REPORT_IF_ERROR(cudnnAddTensor(
+//       handle,
+//       &one, scalarDesc, d_scalar,
+//       &one, yDesc, output));
+  
+//   // 清理
+//   cudaFree(d_scalar);
+//   CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(xDesc));
+//   CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(yDesc));
+//   CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(scalarDesc));
+// }
+
+// // 标量加法操作: C = A + scalar
+// extern "C" MLIR_CUDA_WRAPPERS_EXPORT void 
+// mgpuCudnnAddScalar(void* input, void* scalar, void* output,
+//                   int n, int c, int h, int w,
+//                   CUstream stream) {
+//   mgpuEnsureContext();
+  
+//   StreamHandles handles;
+//   if (!getHandlesForStream(stream, handles)) {
+//     return; // 错误信息已在getHandlesForStream中打印
+//   }
+//   cudnnHandle_t handle = handles.cudnn_handle;
+
+//   // 获取此流的cuDNN句柄
+//   // cudnnHandle_t handle = mgpuCudnnGetHandle(stream);
+  
+//   // 创建张量描述符
+//   cudnnTensorDescriptor_t xDesc, yDesc;
+//   CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&xDesc));
+//   CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&yDesc));
+  
+//   // 设置张量描述符
+//   CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
+//       xDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, n, c, h, w));
+//   CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
+//       yDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, n, c, h, w));
+  
+//   // 获取标量值
+//   float scalarValue = *(float*)scalar;
+//   float one = 1.0f;
+//   float zero = 0.0f;
+  
+//   // 首先复制输入到输出
+//   CUDNN_REPORT_IF_ERROR(cudnnTransformTensor(
+//       handle,
+//       &one, xDesc, input,
+//       &zero, yDesc, output));
+  
+//   // 创建一个1x1x1x1的描述符用于标量
+//   cudnnTensorDescriptor_t scalarDesc;
+//   CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&scalarDesc));
+//   CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
+//       scalarDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, 1, 1, 1, 1));
+  
+//   // 在GPU上创建一个只有一个元素的缓冲区存储标量
+//   float h_scalar = scalarValue;
+//   float* d_scalar;
+//   cudaMalloc(&d_scalar, sizeof(float));
+//   cudaMemcpy(d_scalar, &h_scalar, sizeof(float), cudaMemcpyHostToDevice);
+  
+//   // 添加标量值到所有元素: output = output + scalarValue
+//   CUDNN_REPORT_IF_ERROR(cudnnAddTensor(
+//       handle,
+//       &one, scalarDesc, d_scalar,
+//       &one, yDesc, output));
+  
+//   // 清理
+//   cudaFree(d_scalar);
+//   CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(xDesc));
+//   CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(yDesc));
+//   CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(scalarDesc));
+// }
 
 // 全局缓存变量
 static CUmodule cachedModule = nullptr;
