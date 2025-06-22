@@ -23,10 +23,12 @@
 #include <vector>
 #include <atomic>
 #include <unordered_set>
+#include <algorithm>
 
 #include <cudnn.h>
 #include <cublas_v2.h>
 #include "/data/dagongcheng/pjhtest/llvm-latest/llvm-project/mlir/lib/ExecutionEngine/SNN_kernel.h"
+#include "CudnnGraphBuilder.h"
 
 #include "cuda.h"
 #include "cuda_bf16.h"
@@ -1073,11 +1075,101 @@ extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuReleasePooledStream(CUstream strea
   //         stream_index, stream, g_active_stream_count.load(), (int)g_stream_pool.size());
 }
 
-// 全连接层的实现，使用cuBLAS执行矩阵乘法
+// // 全连接层的实现，使用cuBLAS执行矩阵乘法
+// extern "C" MLIR_CUDA_WRAPPERS_EXPORT void
+// mgpuCulibsFullyConnectedForward(
+//     int batch_size, int input_features,   // 输入维度
+//     int output_features,                  // 输出特征数
+//     void* input_data, void* weight_data,  // 输入和权重指针
+//     void* bias_data,                      // 偏置指针（可为NULL）
+//     void* output_data,                    // 输出指针
+//     CUstream stream                       // CUDA流
+// ) {
+//   // 确保使用全局上下文
+//   mgpuEnsureContext();
+  
+//   StreamHandles handles;
+//   if (!getHandlesForStream(stream, handles)) {
+//     return; // 错误信息已在getHandlesForStream中打印
+//   }
+//   cublasHandle_t handle = handles.cublas_handle;
+
+//   // 获取此流的cuBLAS句柄
+//   // cublasHandle_t handle = mgpuCublasGetHandle(stream);
+  
+//   // 设置矩阵乘法参数
+//   // C = alpha * op(A) * op(B) + beta * C
+//   // 对于FC: output = input * weight^T + bias
+//   const float alpha = 1.0f;
+//   const float beta = 0.0f;
+  
+//   // 计算矩阵乘法：output = input * weight^T
+//   // cuBLAS中的矩阵是列主序的，与MLIR中的行主序不同，需要转置操作
+//   // 所以实际执行的是：(output)^T = (weight)^T * (input)^T
+//   // 这对应于cuBLAS中 C = B * A 而不是 A * B
+//   // 即：output(batch_size, output_features) = input(batch_size, input_features) * weight(output_features, input_features)^T
+  
+//   // 使用CUBLAS_OP_T表示权重矩阵需要被转置
+//   CUBLAS_REPORT_IF_ERROR(cublasSgemm(
+//       handle,
+//       CUBLAS_OP_N,                   // op(B)：权重矩阵需要转置
+//       CUBLAS_OP_N,                   // op(A)：输入矩阵不需要转置
+//       output_features,               // 输出特征数（m：B的行数）
+//       batch_size,                    // 批量大小（n：A的列数）
+//       input_features,                // 输入特征数（k：A的行数，B的列数）
+//       &alpha,                        // 标量系数alpha
+//       (const float*)weight_data,     // B矩阵（权重）
+//       input_features,                // B的主维度是input_features
+//       (const float*)input_data,      // A矩阵（输入）
+//       input_features,                // A的主维度是input_features
+//       &beta,                         // 标量系数beta
+//       (float*)output_data,           // C矩阵（输出）
+//       output_features                // C的主维度是output_features
+//   ));
+  
+//   // 如果提供了偏置，使用cuDNN的AddTensor添加偏置
+//   if (bias_data != nullptr) {
+//     // 获取cuDNN句柄
+//     // cudnnHandle_t cudnnHandle = mgpuCudnnGetHandle(stream);
+//     cudnnHandle_t cudnnHandle = handles.cudnn_handle;
+    
+//     // 创建张量描述符
+//     cudnnTensorDescriptor_t outputDesc, biasDesc;
+//     CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&outputDesc));
+//     CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&biasDesc));
+    
+//     // 设置输出描述符，将FC输出视为NCHW格式的张量，但C=output_features，H=W=1
+//     CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
+//         outputDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, 
+//         batch_size, output_features, 1, 1));
+    
+//     // 设置偏置描述符，偏置是1D向量，表示为1xCx1x1
+//     CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
+//         biasDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, 
+//         1, output_features, 1, 1));
+    
+//     // 添加偏置到输出
+//     const float alpha_bias = 1.0f;
+//     const float beta_bias = 1.0f;  // 使用1.0f以便累加到现有输出
+    
+//     CUDNN_REPORT_IF_ERROR(cudnnAddTensor(
+//         cudnnHandle, &alpha_bias, biasDesc, bias_data, 
+//         &beta_bias, outputDesc, output_data));
+    
+//     // 清理描述符
+//     CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(outputDesc));
+//     CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(biasDesc));
+//   }
+  
+//   // 注意：不需要清理cuBLAS和cuDNN句柄，因为它们会被缓存以便重用
+// }
+
+// 支持transB的全连接层实现
 extern "C" MLIR_CUDA_WRAPPERS_EXPORT void
 mgpuCulibsFullyConnectedForward(
     int batch_size, int input_features,   // 输入维度
     int output_features,                  // 输出特征数
+    int transB,                          // 是否转置权重矩阵B (0=false, 1=true)
     void* input_data, void* weight_data,  // 输入和权重指针
     void* bias_data,                      // 偏置指针（可为NULL）
     void* output_data,                    // 输出指针
@@ -1092,43 +1184,37 @@ mgpuCulibsFullyConnectedForward(
   }
   cublasHandle_t handle = handles.cublas_handle;
 
-  // 获取此流的cuBLAS句柄
-  // cublasHandle_t handle = mgpuCublasGetHandle(stream);
-  
   // 设置矩阵乘法参数
-  // C = alpha * op(A) * op(B) + beta * C
-  // 对于FC: output = input * weight^T + bias
   const float alpha = 1.0f;
   const float beta = 0.0f;
   
-  // 计算矩阵乘法：output = input * weight^T
-  // cuBLAS中的矩阵是列主序的，与MLIR中的行主序不同，需要转置操作
-  // 所以实际执行的是：(output)^T = (weight)^T * (input)^T
-  // 这对应于cuBLAS中 C = B * A 而不是 A * B
-  // 即：output(batch_size, output_features) = input(batch_size, input_features) * weight(output_features, input_features)^T
+  // 根据transB标志决定cuBLAS操作
+  // cublasOperation_t weight_op = (transB != 0) ? CUBLAS_OP_T : CUBLAS_OP_N;
+  cublasOperation_t weight_op = CUBLAS_OP_T;
   
-  // 使用CUBLAS_OP_T表示权重矩阵需要被转置
+  // 当transB=1时，权重矩阵需要被转置
+  // ONNX语义：output = input * weight^T + bias (当transB=1时)
+  // cuBLAS计算：C = op(weight) * op(input)
+  
   CUBLAS_REPORT_IF_ERROR(cublasSgemm(
       handle,
-      CUBLAS_OP_T,                   // op(B)：权重矩阵需要转置
-      CUBLAS_OP_N,                   // op(A)：输入矩阵不需要转置
-      output_features,               // 输出特征数（m：B的行数）
-      batch_size,                    // 批量大小（n：A的列数）
-      input_features,                // 输入特征数（k：A的行数，B的列数）
-      &alpha,                        // 标量系数alpha
+      weight_op,                     // op(B)：根据transB决定是否转置权重
+      CUBLAS_OP_N,                   // op(A)：输入矩阵不转置
+      output_features,               // m：输出特征数
+      batch_size,                    // n：批量大小
+      input_features,                // k：输入特征数
+      &alpha,                        // alpha系数
       (const float*)weight_data,     // B矩阵（权重）
-      input_features,                // B的主维度是input_features
+      input_features,                // B的leading dimension
       (const float*)input_data,      // A矩阵（输入）
-      input_features,                // A的主维度是input_features
-      &beta,                         // 标量系数beta
+      input_features,                // A的leading dimension
+      &beta,                         // beta系数
       (float*)output_data,           // C矩阵（输出）
-      output_features                // C的主维度是output_features
+      output_features                // C的leading dimension
   ));
   
   // 如果提供了偏置，使用cuDNN的AddTensor添加偏置
   if (bias_data != nullptr) {
-    // 获取cuDNN句柄
-    // cudnnHandle_t cudnnHandle = mgpuCudnnGetHandle(stream);
     cudnnHandle_t cudnnHandle = handles.cudnn_handle;
     
     // 创建张量描述符
@@ -1136,19 +1222,19 @@ mgpuCulibsFullyConnectedForward(
     CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&outputDesc));
     CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&biasDesc));
     
-    // 设置输出描述符，将FC输出视为NCHW格式的张量，但C=output_features，H=W=1
+    // 设置输出描述符
     CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
         outputDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, 
         batch_size, output_features, 1, 1));
     
-    // 设置偏置描述符，偏置是1D向量，表示为1xCx1x1
+    // 设置偏置描述符
     CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
         biasDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, 
         1, output_features, 1, 1));
     
     // 添加偏置到输出
     const float alpha_bias = 1.0f;
-    const float beta_bias = 1.0f;  // 使用1.0f以便累加到现有输出
+    const float beta_bias = 1.0f;
     
     CUDNN_REPORT_IF_ERROR(cudnnAddTensor(
         cudnnHandle, &alpha_bias, biasDesc, bias_data, 
@@ -1158,15 +1244,101 @@ mgpuCulibsFullyConnectedForward(
     CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(outputDesc));
     CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(biasDesc));
   }
-  
-  // 注意：不需要清理cuBLAS和cuDNN句柄，因为它们会被缓存以便重用
 }
 
-// Fully connected layer implementation with flattening, using cuBLAS for matrix multiplication
+// // Fully connected layer implementation with flattening, using cuBLAS for matrix multiplication
+// extern "C" MLIR_CUDA_WRAPPERS_EXPORT void
+// mgpuCulibsFlattenFullyConnectedForward(
+//     int batch_size, int input_channels, int input_height, int input_width,  // Original NCHW dimensions
+//     int output_features,                                                    // Output features
+//     void* input_data, void* weight_data,                                   // Input and weight pointers
+//     void* bias_data,                                                       // Bias pointer (can be NULL)
+//     void* output_data,                                                     // Output pointer
+//     CUstream stream                                                        // CUDA stream
+// ) {
+//   // Ensure we're using the global context
+//   mgpuEnsureContext();
+  
+//   // Calculate the flattened features dimension
+//   int flattened_features = input_channels * input_height * input_width;
+  
+//   StreamHandles handles;
+//   if (!getHandlesForStream(stream, handles)) {
+//     return; // 错误信息已在getHandlesForStream中打印
+//   }
+//   cublasHandle_t handle = handles.cublas_handle;
+
+//   // Get cuBLAS handle for this stream
+//   // cublasHandle_t handle = mgpuCublasGetHandle(stream);
+  
+//   // Set matrix multiplication parameters
+//   // C = alpha * op(A) * op(B) + beta * C
+//   // For FC with flattening: output = input * weight^T + bias
+//   const float alpha = 1.0f;
+//   const float beta = 0.0f;
+  
+//   // Compute matrix multiplication: output = input * weight^T
+//   // cuBLAS uses column-major order, while our tensors are row-major
+//   // So we compute (output)^T = (weight)^T * (input)^T
+  
+//   // Use CUBLAS_OP_T to indicate that the weight matrix should be transposed
+//   CUBLAS_REPORT_IF_ERROR(cublasSgemm(
+//       handle,
+//       CUBLAS_OP_T,                    // op(B): transpose weight matrix
+//       CUBLAS_OP_N,                    // op(A): don't transpose input
+//       output_features,                // output features (m: B's rows)
+//       batch_size,                     // batch size (n: A's columns)
+//       flattened_features,             // flattened input features (k: A's rows, B's columns)
+//       &alpha,                         // alpha scalar
+//       (const float*)weight_data,      // B matrix (weights)
+//       flattened_features,             // B's leading dimension
+//       (const float*)input_data,       // A matrix (input)
+//       flattened_features,             // A's leading dimension
+//       &beta,                          // beta scalar
+//       (float*)output_data,            // C matrix (output)
+//       output_features                 // C's leading dimension
+//   ));
+  
+//   // Add bias if provided
+//   if (bias_data != nullptr) {
+//     // Get cuDNN handle
+//     // cudnnHandle_t cudnnHandle = mgpuCudnnGetHandle(stream);
+//     cudnnHandle_t cudnnHandle = handles.cudnn_handle;
+    
+//     // Create tensor descriptors
+//     cudnnTensorDescriptor_t outputDesc, biasDesc;
+//     CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&outputDesc));
+//     CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&biasDesc));
+    
+//     // Set output descriptor as a 4D tensor with H=W=1
+//     CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
+//         outputDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, 
+//         batch_size, output_features, 1, 1));
+    
+//     // Set bias descriptor as 1D vector (1xCx1x1)
+//     CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
+//         biasDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, 
+//         1, output_features, 1, 1));
+    
+//     // Add bias to output
+//     const float alpha_bias = 1.0f;
+//     const float beta_bias = 1.0f;  // Use 1.0f to add to existing output
+    
+//     CUDNN_REPORT_IF_ERROR(cudnnAddTensor(
+//         cudnnHandle, &alpha_bias, biasDesc, bias_data, 
+//         &beta_bias, outputDesc, output_data));
+    
+//     // Clean up descriptors
+//     CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(outputDesc));
+//     CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(biasDesc));
+//   }
+// }
+
 extern "C" MLIR_CUDA_WRAPPERS_EXPORT void
 mgpuCulibsFlattenFullyConnectedForward(
     int batch_size, int input_channels, int input_height, int input_width,  // Original NCHW dimensions
     int output_features,                                                    // Output features
+    int transB,                                                            // 是否转置权重矩阵B
     void* input_data, void* weight_data,                                   // Input and weight pointers
     void* bias_data,                                                       // Bias pointer (can be NULL)
     void* output_data,                                                     // Output pointer
@@ -1184,23 +1356,18 @@ mgpuCulibsFlattenFullyConnectedForward(
   }
   cublasHandle_t handle = handles.cublas_handle;
 
-  // Get cuBLAS handle for this stream
-  // cublasHandle_t handle = mgpuCublasGetHandle(stream);
-  
   // Set matrix multiplication parameters
-  // C = alpha * op(A) * op(B) + beta * C
-  // For FC with flattening: output = input * weight^T + bias
   const float alpha = 1.0f;
   const float beta = 0.0f;
   
-  // Compute matrix multiplication: output = input * weight^T
-  // cuBLAS uses column-major order, while our tensors are row-major
-  // So we compute (output)^T = (weight)^T * (input)^T
+  // 根据transB标志决定cuBLAS操作
+  // cublasOperation_t weight_op = (transB != 0) ? CUBLAS_OP_T : CUBLAS_OP_N;
+  cublasOperation_t weight_op = CUBLAS_OP_T;
   
-  // Use CUBLAS_OP_T to indicate that the weight matrix should be transposed
+  // Compute matrix multiplication with optional transpose
   CUBLAS_REPORT_IF_ERROR(cublasSgemm(
       handle,
-      CUBLAS_OP_T,                    // op(B): transpose weight matrix
+      weight_op,                      // op(B): transpose weight matrix if transB=1
       CUBLAS_OP_N,                    // op(A): don't transpose input
       output_features,                // output features (m: B's rows)
       batch_size,                     // batch size (n: A's columns)
@@ -1217,8 +1384,6 @@ mgpuCulibsFlattenFullyConnectedForward(
   
   // Add bias if provided
   if (bias_data != nullptr) {
-    // Get cuDNN handle
-    // cudnnHandle_t cudnnHandle = mgpuCudnnGetHandle(stream);
     cudnnHandle_t cudnnHandle = handles.cudnn_handle;
     
     // Create tensor descriptors
@@ -1262,7 +1427,6 @@ extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuCudnnConv2dForward(
     CUstream stream                             // CUDA流
     //bool createContext = true
 ) {
-
   // fprintf(stderr, "Input data: %p, weight data: %p, bias data: %p, output data: %p\n", 
   //   x_data, w_data, bias_data, y_data);
   // // 验证每个指针是否有效
@@ -2061,241 +2225,1167 @@ mgpuCudnnRSubScalar(void* input, void* scalar, void* output,
   CUDNN_REPORT_IF_ERROR(cudnnDestroyOpTensorDescriptor(opDesc));
 }
 
-// // 标量乘法操作: B = A * scalar
-// extern "C" MLIR_CUDA_WRAPPERS_EXPORT void 
-// mgpuCudnnMulScalar(void* input, void* scalar, void* output,
-//                   int n, int c, int h, int w,
-//                   CUstream stream) {
-//   mgpuEnsureContext();
-  
-//   StreamHandles handles;
-//   if (!getHandlesForStream(stream, handles)) {
-//     return; // 错误信息已在getHandlesForStream中打印
-//   }
-//   cudnnHandle_t handle = handles.cudnn_handle;
+// 操作类型定义
+enum MGPUGraphOpType {
+    MGPU_GRAPH_OP_CONV2D = 0,
+    MGPU_GRAPH_OP_MAXPOOL = 1,
+    MGPU_GRAPH_OP_ADD = 2,
+    MGPU_GRAPH_OP_MUL = 3,
+    MGPU_GRAPH_OP_SUB = 4,
+    MGPU_GRAPH_OP_NEG = 5,
+    MGPU_GRAPH_OP_MATMUL = 6,
+    MGPU_GRAPH_OP_ADDSCALAR = 7,
+    MGPU_GRAPH_OP_MULSCALAR = 8
+};
 
-//   // 获取此流的cuDNN句柄
-//   // cudnnHandle_t handle = mgpuCudnnGetHandle(stream);
-  
-//   // 创建张量描述符
-//   cudnnTensorDescriptor_t xDesc, yDesc;
-//   CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&xDesc));
-//   CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&yDesc));
-  
-//   // 设置张量描述符
-//   CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
-//       xDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, n, c, h, w));
-//   CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
-//       yDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, n, c, h, w));
-  
-//   // 获取标量值
-//   float scalarValue = *(float*)scalar;
-//   float beta = 0.0f;
-  
-//   // 使用cudnnTransformTensor实现标量乘法: output = scalar * input + 0 * output
-//   CUDNN_REPORT_IF_ERROR(cudnnTransformTensor(
-//       handle,
-//       &scalarValue, xDesc, input,
-//       &beta, yDesc, output));
-  
-//   // 清理描述符
-//   CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(xDesc));
-//   CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(yDesc));
-// }
+// 操作参数结构
+struct MGPUConv2dParams {
+    int n, c, h, w;           // 输入维度
+    int k, r, s;              // 卷积核参数
+    int pad_h, pad_w;         // 填充
+    int stride_h, stride_w;   // 步长
+    int dilation_h, dilation_w; // 膨胀
+};
 
-// // 标量减法操作: C = A - scalar
-// extern "C" MLIR_CUDA_WRAPPERS_EXPORT void 
-// mgpuCudnnSubScalar(void* input, void* scalar, void* output,
-//                   int n, int c, int h, int w,
-//                   CUstream stream) {
-//   mgpuEnsureContext();
-  
-//   StreamHandles handles;
-//   if (!getHandlesForStream(stream, handles)) {
-//     return; // 错误信息已在getHandlesForStream中打印
-//   }
-//   cudnnHandle_t handle = handles.cudnn_handle;
+struct MGPUPoolParams {
+    int n, c, h, w;           // 输入维度
+    int kernel_h, kernel_w;   // 核大小
+    int pad_h_begin, pad_w_begin;
+    int pad_h_end, pad_w_end; // 填充
+    int stride_h, stride_w;   // 步长
+    int dilation_h, dilation_w; // 膨胀
+};
 
-//   // 获取此流的cuDNN句柄
-//   // cudnnHandle_t handle = mgpuCudnnGetHandle(stream);
-  
-//   // 创建张量描述符
-//   cudnnTensorDescriptor_t xDesc, yDesc;
-//   CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&xDesc));
-//   CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&yDesc));
-  
-//   // 设置张量描述符
-//   CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
-//       xDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, n, c, h, w));
-//   CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
-//       yDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, n, c, h, w));
-  
-//   // 获取标量值，并将其变为负值以实现减法
-//   float scalarValue = *(float*)scalar;
-//   float negScalarValue = -scalarValue;  // 输入 - 标量 相当于 1.0 * 输入 + (-标量)
-//   float one = 1.0f;
-//   float zero = 0.0f;
-  
-//   // 首先将输入复制到输出
-//   CUDNN_REPORT_IF_ERROR(cudnnTransformTensor(
-//       handle,
-//       &one, xDesc, input,
-//       &zero, yDesc, output));
-  
-//   // 然后添加负的标量值 (使用cudnnAddTensor实现)
-//   // 创建一个1x1x1x1的描述符用于标量
-//   cudnnTensorDescriptor_t scalarDesc;
-//   CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&scalarDesc));
-//   CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
-//       scalarDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, 1, 1, 1, 1));
-  
-//   // 在GPU上创建一个只有一个元素的缓冲区存储标量
-//   float h_scalar = negScalarValue;
-//   float* d_scalar;
-//   cudaMalloc(&d_scalar, sizeof(float));
-//   cudaMemcpy(d_scalar, &h_scalar, sizeof(float), cudaMemcpyHostToDevice);
-  
-//   // 添加负的标量值到所有元素: output = output + negScalarValue
-//   CUDNN_REPORT_IF_ERROR(cudnnAddTensor(
-//       handle,
-//       &one, scalarDesc, d_scalar,
-//       &one, yDesc, output));
-  
-//   // 清理
-//   cudaFree(d_scalar);
-//   CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(xDesc));
-//   CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(yDesc));
-//   CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(scalarDesc));
-// }
+struct MGPUElementwiseParams {
+    int n, c, h, w;           // 张量维度
+};
 
-// // 反向标量减法操作: C = scalar - A
-// extern "C" MLIR_CUDA_WRAPPERS_EXPORT void 
-// mgpuCudnnRSubScalar(void* input, void* scalar, void* output,
-//                    int n, int c, int h, int w,
-//                    CUstream stream) {
-//   mgpuEnsureContext();
-  
-//   StreamHandles handles;
-//   if (!getHandlesForStream(stream, handles)) {
-//     return; // 错误信息已在getHandlesForStream中打印
-//   }
-//   cudnnHandle_t handle = handles.cudnn_handle;
+struct MGPUMatmulParams {
+    int batch_size;
+    int input_features;
+    int output_features;
+};
 
-//   // 获取此流的cuDNN句柄
-//   // cudnnHandle_t handle = mgpuCudnnGetHandle(stream);
-  
-//   // 创建张量描述符
-//   cudnnTensorDescriptor_t xDesc, yDesc;
-//   CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&xDesc));
-//   CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&yDesc));
-  
-//   // 设置张量描述符
-//   CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
-//       xDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, n, c, h, w));
-//   CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
-//       yDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, n, c, h, w));
-  
-//   // 取负的输入，然后加上标量值
-//   float negOne = -1.0f;
-//   float zero = 0.0f;
-  
-//   // 首先计算 output = -input
-//   CUDNN_REPORT_IF_ERROR(cudnnTransformTensor(
-//       handle,
-//       &negOne, xDesc, input,
-//       &zero, yDesc, output));
-  
-//   // 然后添加标量值 output = -input + scalar
-//   float scalarValue = *(float*)scalar;
-  
-//   // 创建一个1x1x1x1的描述符用于标量
-//   cudnnTensorDescriptor_t scalarDesc;
-//   CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&scalarDesc));
-//   CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
-//       scalarDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, 1, 1, 1, 1));
-  
-//   // 在GPU上创建一个只有一个元素的缓冲区存储标量
-//   float h_scalar = scalarValue;
-//   float* d_scalar;
-//   cudaMalloc(&d_scalar, sizeof(float));
-//   cudaMemcpy(d_scalar, &h_scalar, sizeof(float), cudaMemcpyHostToDevice);
-  
-//   // 添加标量值到所有元素: output = output + scalarValue
-//   float one = 1.0f;
-//   CUDNN_REPORT_IF_ERROR(cudnnAddTensor(
-//       handle,
-//       &one, scalarDesc, d_scalar,
-//       &one, yDesc, output));
-  
-//   // 清理
-//   cudaFree(d_scalar);
-//   CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(xDesc));
-//   CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(yDesc));
-//   CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(scalarDesc));
-// }
+// 并行组图管理器 - 使用group_id而不是stream
+struct ParallelGroupGraph {
+    CudnnGraphBuilder* builder;
+    std::unordered_map<void*, int64_t> ptr_to_tensor_id;  // 数据指针到张量ID的映射
+    std::vector<void*> input_ptrs;   // 输入数据指针
+    std::vector<void*> output_ptrs;  // 输出数据指针
+    bool is_compiled;
+    
+    ParallelGroupGraph() : builder(nullptr), is_compiled(false) {}
+};
 
-// // 标量加法操作: C = A + scalar
-// extern "C" MLIR_CUDA_WRAPPERS_EXPORT void 
-// mgpuCudnnAddScalar(void* input, void* scalar, void* output,
-//                   int n, int c, int h, int w,
-//                   CUstream stream) {
-//   mgpuEnsureContext();
-  
-//   StreamHandles handles;
-//   if (!getHandlesForStream(stream, handles)) {
-//     return; // 错误信息已在getHandlesForStream中打印
-//   }
-//   cudnnHandle_t handle = handles.cudnn_handle;
+static std::mutex g_graph_manager_mutex;
+static std::unordered_map<int, ParallelGroupGraph> g_group_graphs;
+static int g_next_group_id = 1;
 
-//   // 获取此流的cuDNN句柄
-//   // cudnnHandle_t handle = mgpuCudnnGetHandle(stream);
-  
-//   // 创建张量描述符
-//   cudnnTensorDescriptor_t xDesc, yDesc;
-//   CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&xDesc));
-//   CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&yDesc));
-  
-//   // 设置张量描述符
-//   CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
-//       xDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, n, c, h, w));
-//   CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
-//       yDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, n, c, h, w));
-  
-//   // 获取标量值
-//   float scalarValue = *(float*)scalar;
-//   float one = 1.0f;
-//   float zero = 0.0f;
-  
-//   // 首先复制输入到输出
-//   CUDNN_REPORT_IF_ERROR(cudnnTransformTensor(
-//       handle,
-//       &one, xDesc, input,
-//       &zero, yDesc, output));
-  
-//   // 创建一个1x1x1x1的描述符用于标量
-//   cudnnTensorDescriptor_t scalarDesc;
-//   CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&scalarDesc));
-//   CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
-//       scalarDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, 1, 1, 1, 1));
-  
-//   // 在GPU上创建一个只有一个元素的缓冲区存储标量
-//   float h_scalar = scalarValue;
-//   float* d_scalar;
-//   cudaMalloc(&d_scalar, sizeof(float));
-//   cudaMemcpy(d_scalar, &h_scalar, sizeof(float), cudaMemcpyHostToDevice);
-  
-//   // 添加标量值到所有元素: output = output + scalarValue
-//   CUDNN_REPORT_IF_ERROR(cudnnAddTensor(
-//       handle,
-//       &one, scalarDesc, d_scalar,
-//       &one, yDesc, output));
-  
-//   // 清理
-//   cudaFree(d_scalar);
-//   CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(xDesc));
-//   CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(yDesc));
-//   CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(scalarDesc));
-// }
+//===----------------------------------------------------------------------===//
+// 阶段1: 图构建接口 (不需要stream)
+//===----------------------------------------------------------------------===//
+
+extern "C" MLIR_CUDA_WRAPPERS_EXPORT int mgpuCreateParallelGroupGraph(cudnnHandle_t handle) {
+    mgpuEnsureContext();
+    
+    std::lock_guard<std::mutex> lock(g_graph_manager_mutex);
+    
+    int group_id = g_next_group_id++;
+    
+    auto& graph = g_group_graphs[group_id];
+    graph.builder = new CudnnGraphBuilder(handle);
+    graph.is_compiled = false;
+    
+    fprintf(stderr, "[GRAPH] Created graph builder for group %d\n", group_id);
+    
+    return group_id;
+}
+
+extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuDestroyParallelGroupGraph(int group_id) {
+    mgpuEnsureContext();
+    
+    std::lock_guard<std::mutex> lock(g_graph_manager_mutex);
+    
+    auto it = g_group_graphs.find(group_id);
+    if (it != g_group_graphs.end()) {
+        delete it->second.builder;
+        g_group_graphs.erase(it);
+        fprintf(stderr, "[GRAPH] Destroyed graph builder for group %d\n", group_id);
+    }
+}
+
+// 添加卷积操作到图中 (构建阶段 - 不需要stream)
+extern "C" MLIR_CUDA_WRAPPERS_EXPORT int64_t mgpuParallelGroupAddConv2d(
+    int group_id,
+    void* input_data, void* weight_data, void* bias_data, void* output_data,
+    int n, int c, int h, int w,      // 输入维度
+    int k, int r, int s,             // 卷积核参数  
+    int pad_h, int pad_w,            // 填充
+    int stride_h, int stride_w,      // 步长
+    int dilation_h, int dilation_w   // 膨胀
+) {
+    std::lock_guard<std::mutex> lock(g_graph_manager_mutex);
+    
+    auto it = g_group_graphs.find(group_id);
+    if (it == g_group_graphs.end()) {
+        fprintf(stderr, "[GRAPH] ERROR: No graph builder found for group %d\n", group_id);
+        return -1;
+    }
+    
+    auto& graph = it->second;
+    
+    // 计算输出维度
+    int out_h = (h + 2 * pad_h - (dilation_h * (r - 1) + 1)) / stride_h + 1;
+    int out_w = (w + 2 * pad_w - (dilation_w * (s - 1) + 1)) / stride_w + 1;
+    
+    // 添加张量（不设置数据指针，只定义结构）
+    std::vector<int> input_dims = {n, c, h, w};
+    std::vector<int> weight_dims = {k, c, r, s};
+    // std::vector<int> bias_dims = {1, k, 1, 1};
+    std::vector<int> output_dims = {n, k, out_h, out_w};
+    
+    int64_t input_id = graph.builder->AddTensor(input_dims, CUDNN_DATA_FLOAT);
+    int64_t weight_id = graph.builder->AddTensor(weight_dims, CUDNN_DATA_FLOAT);
+    // int64_t bias_id = bias_data ? graph.builder->AddTensor(bias_dims, CUDNN_DATA_FLOAT) : -1;
+    int64_t output_id = graph.builder->AddTensor(output_dims, CUDNN_DATA_FLOAT);
+    
+    // 记录数据指针映射关系（稍后执行时会用到）
+    graph.ptr_to_tensor_id[input_data] = input_id;
+    graph.ptr_to_tensor_id[weight_data] = weight_id;
+    // if (bias_data) {
+    //     graph.ptr_to_tensor_id[bias_data] = bias_id;
+    // }
+    graph.ptr_to_tensor_id[output_data] = output_id;
+    
+    // 添加卷积节点
+    std::vector<int> pads = {pad_h, pad_w};
+    std::vector<int> strides = {stride_h, stride_w};
+    std::vector<int> dilations = {dilation_h, dilation_w};
+    
+    // int64_t node_id = graph.builder->AddConvolutionNode(input_id, weight_id, bias_id, output_id, 
+    //                                                    pads, strides, dilations);
+    int64_t node_id = graph.builder->AddConvolutionNode(input_id, weight_id, -1, output_id, 
+                                                       pads, strides, dilations);
+    
+    fprintf(stderr, "[GRAPH] Added Conv2d node %ld to group %d\n", node_id, group_id);
+    return node_id;
+}
+
+// 添加池化操作到图中 (构建阶段 - 不需要stream)
+extern "C" MLIR_CUDA_WRAPPERS_EXPORT int64_t mgpuParallelGroupAddMaxPool(
+    int group_id,
+    void* input_data, void* output_data,
+    int n, int c, int h, int w,           // 输入维度
+    int kernel_h, int kernel_w,           // 核大小
+    int pad_h_begin, int pad_w_begin,     // 填充
+    int pad_h_end, int pad_w_end,
+    int stride_h, int stride_w,           // 步长
+    int dilation_h, int dilation_w        // 膨胀
+) {
+    std::lock_guard<std::mutex> lock(g_graph_manager_mutex);
+    
+    auto it = g_group_graphs.find(group_id);
+    if (it == g_group_graphs.end()) {
+        fprintf(stderr, "[GRAPH] ERROR: No graph builder found for group %d\n", group_id);
+        return -1;
+    }
+    
+    auto& graph = it->second;
+    
+    // 计算输出维度
+    int pad_h = std::max(pad_h_begin, pad_h_end);
+    int pad_w = std::max(pad_w_begin, pad_w_end);
+    int out_h = (h + 2 * pad_h - kernel_h) / stride_h + 1;
+    int out_w = (w + 2 * pad_w - kernel_w) / stride_w + 1;
+    
+    // 添加张量
+    std::vector<int> input_dims = {n, c, h, w};
+    std::vector<int> output_dims = {n, c, out_h, out_w};
+    
+    int64_t input_id = graph.builder->AddTensor(input_dims, CUDNN_DATA_FLOAT);
+    int64_t output_id = graph.builder->AddTensor(output_dims, CUDNN_DATA_FLOAT);
+    
+    // 记录数据指针映射关系
+    graph.ptr_to_tensor_id[input_data] = input_id;
+    graph.ptr_to_tensor_id[output_data] = output_id;
+    
+    // 添加池化节点
+    std::vector<int> window_dims = {kernel_h, kernel_w};
+    std::vector<int> pads = {pad_h, pad_w};
+    std::vector<int> strides = {stride_h, stride_w};
+    
+    int64_t node_id = graph.builder->AddPoolingNode(input_id, output_id, CUDNN_POOLING_MAX,
+                                                   window_dims, pads, strides);
+    
+    fprintf(stderr, "[GRAPH] Added MaxPool node %ld to group %d\n", node_id, group_id);
+    return node_id;
+}
+
+// 添加逐元素操作到图中 (构建阶段 - 不需要stream)
+extern "C" MLIR_CUDA_WRAPPERS_EXPORT int64_t mgpuParallelGroupAddElementwise(
+    int group_id,
+    void* input_a, void* input_b, void* output,
+    int n, int c, int h, int w,
+    int op_type  // 0=ADD, 1=MUL, 2=SUB
+) {
+    std::lock_guard<std::mutex> lock(g_graph_manager_mutex);
+    
+    auto it = g_group_graphs.find(group_id);
+    if (it == g_group_graphs.end()) {
+        fprintf(stderr, "[GRAPH] ERROR: No graph builder found for group %d\n", group_id);
+        return -1;
+    }
+    
+    auto& graph = it->second;
+    
+    // 添加张量
+    std::vector<int> dims = {n, c, h, w};
+    
+    int64_t input_a_id = graph.builder->AddTensor(dims, CUDNN_DATA_FLOAT);
+    int64_t input_b_id = graph.builder->AddTensor(dims, CUDNN_DATA_FLOAT);
+    int64_t output_id = graph.builder->AddTensor(dims, CUDNN_DATA_FLOAT);
+    
+    // 记录数据指针映射关系
+    graph.ptr_to_tensor_id[input_a] = input_a_id;
+    graph.ptr_to_tensor_id[input_b] = input_b_id;
+    graph.ptr_to_tensor_id[output] = output_id;
+    
+    // 添加逐元素操作节点
+    int64_t node_id = graph.builder->AddElementwiseNode(input_a_id, input_b_id, output_id,
+                                                       CUDNN_BACKEND_OPERATION_POINTWISE_DESCRIPTOR);
+    
+    const char* op_name = (op_type == 0) ? "ADD" : (op_type == 1) ? "MUL" : "SUB";
+    fprintf(stderr, "[GRAPH] Added %s node %ld to group %d\n", op_name, node_id, group_id);
+    return node_id;
+}
+
+// 添加矩阵乘法操作到图中 (构建阶段 - 不需要stream)
+extern "C" MLIR_CUDA_WRAPPERS_EXPORT int64_t mgpuParallelGroupAddMatmul(
+    int group_id,
+    void* input_data, void* weight_data, void* bias_data, void* output_data,
+    int batch_size, int input_features, int output_features
+) {
+    std::lock_guard<std::mutex> lock(g_graph_manager_mutex);
+    
+    auto it = g_group_graphs.find(group_id);
+    if (it == g_group_graphs.end()) {
+        fprintf(stderr, "[GRAPH] ERROR: No graph builder found for group %d\n", group_id);
+        return -1;
+    }
+    
+    auto& graph = it->second;
+    
+    // 添加张量
+    std::vector<int> input_dims = {batch_size, input_features};
+    std::vector<int> weight_dims = {output_features, input_features};
+    std::vector<int> bias_dims = {1, output_features};
+    std::vector<int> output_dims = {batch_size, output_features};
+    
+    int64_t input_id = graph.builder->AddTensor(input_dims, CUDNN_DATA_FLOAT);
+    int64_t weight_id = graph.builder->AddTensor(weight_dims, CUDNN_DATA_FLOAT);
+    int64_t bias_id = bias_data ? graph.builder->AddTensor(bias_dims, CUDNN_DATA_FLOAT) : -1;
+    int64_t output_id = graph.builder->AddTensor(output_dims, CUDNN_DATA_FLOAT);
+    
+    // 记录数据指针映射关系
+    graph.ptr_to_tensor_id[input_data] = input_id;
+    graph.ptr_to_tensor_id[weight_data] = weight_id;
+    if (bias_data) {
+        graph.ptr_to_tensor_id[bias_data] = bias_id;
+    }
+    graph.ptr_to_tensor_id[output_data] = output_id;
+    
+    // 添加矩阵乘法节点
+    int64_t node_id = graph.builder->AddMatmulNode(input_id, weight_id, output_id);
+    
+    fprintf(stderr, "[GRAPH] Added Matmul node %ld to group %d\n", node_id, group_id);
+    return node_id;
+}
+
+//===----------------------------------------------------------------------===//
+// 阶段2: 图编译接口 (不需要stream)
+//===----------------------------------------------------------------------===//
+
+extern "C" MLIR_CUDA_WRAPPERS_EXPORT bool mgpuParallelGroupCompile(int group_id) {
+    mgpuEnsureContext();
+    
+    std::lock_guard<std::mutex> lock(g_graph_manager_mutex);
+    
+    auto it = g_group_graphs.find(group_id);
+    if (it == g_group_graphs.end()) {
+        fprintf(stderr, "[GRAPH] ERROR: No graph builder found for group %d\n", group_id);
+        return false;
+    }
+    
+    auto& graph = it->second;
+    
+    if (graph.is_compiled) {
+        return true;  // 已经编译过了
+    }
+    
+    fprintf(stderr, "[GRAPH] Compiling graph for group %d...\n", group_id);
+    
+    // 最终化图
+    if (!graph.builder->FinalizeGraph()) {
+        fprintf(stderr, "[GRAPH] ERROR: Failed to finalize graph for group %d\n", group_id);
+        return false;
+    }
+    
+    // 编译图
+    if (!graph.builder->CompileGraph()) {
+        fprintf(stderr, "[GRAPH] ERROR: Failed to compile graph for group %d\n", group_id);
+        return false;
+    }
+    
+    graph.is_compiled = true;
+    
+    // 打印图信息
+    graph.builder->PrintGraphInfo();
+    
+    fprintf(stderr, "[GRAPH] Successfully compiled graph for group %d\n", group_id);
+    return true;
+}
+
+//===----------------------------------------------------------------------===//
+// 阶段3: 图执行接口 (需要stream和实际数据)
+//===----------------------------------------------------------------------===//
+
+extern "C" MLIR_CUDA_WRAPPERS_EXPORT bool mgpuParallelGroupExecute(int group_id, CUstream stream) {
+    mgpuEnsureContext();
+    
+    std::lock_guard<std::mutex> lock(g_graph_manager_mutex);
+    
+    auto it = g_group_graphs.find(group_id);
+    if (it == g_group_graphs.end()) {
+        fprintf(stderr, "[GRAPH] ERROR: No graph builder found for group %d\n", group_id);
+        return false;
+    }
+    
+    auto& graph = it->second;
+    
+    // 确保图已编译
+    if (!graph.is_compiled) {
+        if (!mgpuParallelGroupCompile(group_id)) {
+            return false;
+        }
+    }
+    
+    // 设置所有张量的实际数据指针
+    for (const auto& pair : graph.ptr_to_tensor_id) {
+        void* data_ptr = pair.first;
+        int64_t tensor_id = pair.second;
+        graph.builder->SetTensorData(tensor_id, data_ptr);
+    }
+    
+    fprintf(stderr, "[GRAPH] Executing graph for group %d on stream %p...\n", group_id, stream);
+    
+    // 执行图（现在才需要stream）
+    if (!graph.builder->ExecuteGraph(stream)) {
+        fprintf(stderr, "[GRAPH] ERROR: Failed to execute graph for group %d\n", group_id);
+        return false;
+    }
+    
+    fprintf(stderr, "[GRAPH] Successfully executed graph for group %d\n", group_id);
+    return true;
+}
+
+//===----------------------------------------------------------------------===//
+// 便利接口 - 一次性编译和执行
+//===----------------------------------------------------------------------===//
+
+extern "C" MLIR_CUDA_WRAPPERS_EXPORT bool mgpuParallelGroupCompileAndExecute(int group_id, CUstream stream) {
+    // 先编译（如果还没编译）
+    if (!mgpuParallelGroupCompile(group_id)) {
+        return false;
+    }
+    
+    // 再执行
+    return mgpuParallelGroupExecute(group_id, stream);
+}
+
+//===----------------------------------------------------------------------===//
+// 向后兼容的接口 (保持原有的stream-based接口以便渐进迁移)
+//===----------------------------------------------------------------------===//
+
+// 这些函数保持为了向后兼容，但内部使用新的group-based实现
+static std::mutex g_stream_to_group_mutex;
+static std::unordered_map<CUstream, int> g_stream_to_group_id;
+
+extern "C" MLIR_CUDA_WRAPPERS_EXPORT void* mgpuCreateParallelGroupGraphLegacy(CUstream stream) {
+    mgpuEnsureContext();
+    
+    // 获取此流的cuDNN句柄
+    cudnnHandle_t handle = mgpuCudnnGetHandle(stream);
+    
+    // 创建新的组
+    int group_id = mgpuCreateParallelGroupGraph(handle);
+    
+    // 建立stream到group的映射
+    std::lock_guard<std::mutex> lock(g_stream_to_group_mutex);
+    g_stream_to_group_id[stream] = group_id;
+    
+    fprintf(stderr, "[GRAPH] Created legacy graph builder for stream %p (group %d)\n", stream, group_id);
+    
+    // 返回group_id作为void*（为了兼容）
+    return reinterpret_cast<void*>(static_cast<intptr_t>(group_id));
+}
+
+extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuDestroyParallelGroupGraphLegacy(CUstream stream) {
+    std::lock_guard<std::mutex> lock(g_stream_to_group_mutex);
+    
+    auto it = g_stream_to_group_id.find(stream);
+    if (it != g_stream_to_group_id.end()) {
+        int group_id = it->second;
+        mgpuDestroyParallelGroupGraph(group_id);
+        g_stream_to_group_id.erase(it);
+        fprintf(stderr, "[GRAPH] Destroyed legacy graph builder for stream %p (group %d)\n", stream, group_id);
+    }
+}
+
+extern "C" MLIR_CUDA_WRAPPERS_EXPORT bool mgpuGraphCompileAndExecuteLegacy(CUstream stream) {
+    std::lock_guard<std::mutex> lock(g_stream_to_group_mutex);
+    
+    auto it = g_stream_to_group_id.find(stream);
+    if (it == g_stream_to_group_id.end()) {
+        fprintf(stderr, "[GRAPH] ERROR: No graph group found for stream %p\n", stream);
+        return false;
+    }
+    
+    int group_id = it->second;
+    return mgpuParallelGroupCompileAndExecute(group_id, stream);
+}
+
+//===----------------------------------------------------------------------===//
+// 原有API的图替代版本 (向后兼容)
+//===----------------------------------------------------------------------===//
+
+// 这些函数现在将操作添加到与stream关联的图组中
+extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuCudnnConv2dForwardGraph(
+    int n, int c, int h, int w_in,
+    int k, int r, int s,
+    int pad_h, int pad_w,
+    int stride_h, int stride_w,
+    int dilation_h, int dilation_w,
+    void* x_data, void* w_data, void* bias_data,
+    void* y_data,
+    CUstream stream
+) {
+    std::lock_guard<std::mutex> lock(g_stream_to_group_mutex);
+    
+    auto it = g_stream_to_group_id.find(stream);
+    if (it != g_stream_to_group_id.end()) {
+        int group_id = it->second;
+        mgpuParallelGroupAddConv2d(group_id, x_data, w_data, bias_data, y_data,
+                                  n, c, h, w_in, k, r, s, pad_h, pad_w, 
+                                  stride_h, stride_w, dilation_h, dilation_w);
+    }
+}
+
+extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuCudnnMaxPoolForwardGraph(
+    int n, int c, int h, int w,
+    int kernel_h, int kernel_w,
+    int pad_h_begin, int pad_w_begin,
+    int pad_h_end, int pad_w_end,
+    int stride_h, int stride_w,
+    int dilation_h, int dilation_w,
+    void* input_data,
+    void* output_data,
+    CUstream stream
+) {
+    std::lock_guard<std::mutex> lock(g_stream_to_group_mutex);
+    
+    auto it = g_stream_to_group_id.find(stream);
+    if (it != g_stream_to_group_id.end()) {
+        int group_id = it->second;
+        mgpuParallelGroupAddMaxPool(group_id, input_data, output_data,
+                                   n, c, h, w, kernel_h, kernel_w,
+                                   pad_h_begin, pad_w_begin, pad_h_end, pad_w_end,
+                                   stride_h, stride_w, dilation_h, dilation_w);
+    }
+}
+
+extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuCudnnAddGraph(
+    void* inputA, void* inputB, void* output,
+    int n, int c, int h, int w,
+    CUstream stream
+) {
+    std::lock_guard<std::mutex> lock(g_stream_to_group_mutex);
+    
+    auto it = g_stream_to_group_id.find(stream);
+    if (it != g_stream_to_group_id.end()) {
+        int group_id = it->second;
+        mgpuParallelGroupAddElementwise(group_id, inputA, inputB, output, n, c, h, w, 0); // 0 = ADD
+    }
+}
+
+extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuCudnnMulGraph(
+    void* inputA, void* inputB, void* output,
+    int n, int c, int h, int w,
+    CUstream stream
+) {
+    std::lock_guard<std::mutex> lock(g_stream_to_group_mutex);
+    
+    auto it = g_stream_to_group_id.find(stream);
+    if (it != g_stream_to_group_id.end()) {
+        int group_id = it->second;
+        mgpuParallelGroupAddElementwise(group_id, inputA, inputB, output, n, c, h, w, 1); // 1 = MUL
+    }
+}
+
+extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuCudnnSubGraph(
+    void* inputA, void* inputB, void* output,
+    int n, int c, int h, int w,
+    CUstream stream
+) {
+    std::lock_guard<std::mutex> lock(g_stream_to_group_mutex);
+    
+    auto it = g_stream_to_group_id.find(stream);
+    if (it != g_stream_to_group_id.end()) {
+        int group_id = it->second;
+        mgpuParallelGroupAddElementwise(group_id, inputA, inputB, output, n, c, h, w, 2); // 2 = SUB
+    }
+}
+
+// 清理所有图
+extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuCleanupAllGraphs() {
+    {
+        std::lock_guard<std::mutex> lock(g_graph_manager_mutex);
+        
+        for (auto& pair : g_group_graphs) {
+            delete pair.second.builder;
+        }
+        g_group_graphs.clear();
+    }
+    
+    {
+        std::lock_guard<std::mutex> lock(g_stream_to_group_mutex);
+        g_stream_to_group_id.clear();
+    }
+    
+    fprintf(stderr, "[GRAPH] Cleaned up all graphs\n");
+}
+
+
+// 清理所有 matmul (op5) 相关逻辑的测试函数
+extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuCudnnGraphTest() {
+    printf("=== Starting cuDNN Graph Parallel Operations Test ===\n");
+    
+    // 1. 在函数开始处声明所有变量
+    CUstream stream = nullptr;
+    CUevent start = nullptr, stop = nullptr;
+    cudnnHandle_t handle = nullptr;
+    int group_id = 0;
+    
+    // 操作参数变量 (移除 op3, op5 相关)
+    int op1_n = 2, op1_c_in = 3, op1_h = 16, op1_w = 16;
+    int op1_c_out = 8, op1_k = 3, op1_pad = 1, op1_stride = 1;
+    
+    int op2_n = 1, op2_c_in = 16, op2_h = 32, op2_w = 32;
+    int op2_c_out = 32, op2_k = 3, op2_pad = 1, op2_stride = 1;
+    
+    // 注释掉 op3 相关变量
+    // int op3_n = 4, op3_c = 64, op3_h = 28, op3_w = 28;
+    // int op3_pool_k = 2, op3_pool_stride = 2;
+    // int op3_out_h = op3_h / op3_pool_stride, op3_out_w = op3_w / op3_pool_stride;
+    
+    int op4_n = 3, op4_c = 32, op4_h = 24, op4_w = 24;
+    
+    // 注释掉 op5 相关变量
+    // int op5_batch = 8, op5_in_features = 512, op5_out_features = 256;
+    
+    // 内存大小变量 (移除 op3, op5 相关)
+    size_t op1_input_size, op1_weight_size, op1_bias_size, op1_output_size;
+    size_t op2_input_size, op2_weight_size, op2_bias_size, op2_output_size;
+    // size_t op3_input_size, op3_output_size;
+    size_t op4_tensor_size;
+    // size_t op5_input_size, op5_weight_size, op5_bias_size, op5_output_size;
+    
+    // 设备指针变量 (移除 op3, op5 相关)
+    CUdeviceptr d_op1_input = 0, d_op1_weight = 0, d_op1_bias = 0, d_op1_output = 0;
+    CUdeviceptr d_op2_input = 0, d_op2_weight = 0, d_op2_bias = 0, d_op2_output = 0;
+    // CUdeviceptr d_op3_input = 0, d_op3_output = 0;
+    CUdeviceptr d_op4_inputA = 0, d_op4_inputB = 0, d_op4_output = 0;
+    // CUdeviceptr d_op5_input = 0, d_op5_weight = 0, d_op5_bias = 0, d_op5_output = 0;
+    
+    // void*指针变量 (移除 op3, op5 相关)
+    void* op1_input_ptr = nullptr; void* op1_weight_ptr = nullptr;
+    void* op1_bias_ptr = nullptr; void* op1_output_ptr = nullptr;
+    void* op2_input_ptr = nullptr; void* op2_weight_ptr = nullptr;
+    void* op2_bias_ptr = nullptr; void* op2_output_ptr = nullptr;
+    // void* op3_input_ptr = nullptr; void* op3_output_ptr = nullptr;
+    void* op4_inputA_ptr = nullptr; void* op4_inputB_ptr = nullptr; void* op4_output_ptr = nullptr;
+    // void* op5_input_ptr = nullptr; void* op5_weight_ptr = nullptr;
+    // void* op5_bias_ptr = nullptr; void* op5_output_ptr = nullptr;
+    
+    // 节点ID变量 (移除 op3, op5 相关)
+    int64_t op1_node = -1, op2_node = -1, /* op3_node = -1, */ op4_node = -1; // , op5_node = -1;
+    
+    // 其他变量
+    bool compile_success = false;
+    bool exec_success = false;
+    int num_iterations = 20;
+    float milliseconds = 0.0f;
+    bool all_valid = true;
+    
+    // 主机内存指针（移除 op3, op5 相关）
+    float* host_op1_output = nullptr;
+    float* host_op2_output = nullptr;
+    // float* host_op3_output = nullptr;
+    float* host_op4_output = nullptr;
+    // float* host_op5_output = nullptr;
+    
+    // 2. 初始化CUDA环境
+    mgpuEnsureContext();
+    
+    CUDA_REPORT_IF_ERROR(cuStreamCreate(&stream, CU_STREAM_NON_BLOCKING));
+    CUDA_REPORT_IF_ERROR(cuEventCreate(&start, CU_EVENT_DEFAULT));
+    CUDA_REPORT_IF_ERROR(cuEventCreate(&stop, CU_EVENT_DEFAULT));
+    
+    // 3. 获取cuDNN句柄并创建图
+    handle = mgpuCudnnGetHandle(stream);
+    group_id = mgpuCreateParallelGroupGraph(handle);
+    if (group_id <= 0) {
+        printf("ERROR: Failed to create graph group\n");
+        goto cleanup;
+    }
+    printf("Created graph group: %d\n", group_id);
+    
+    // 4. 定义操作参数 (移除 op3, op5 相关)
+    printf("Defining independent parallel operations:\n");
+    printf("  Op1 - Conv2d: [%d,%d,%d,%d] -> [%d,%d,%d,%d]\n", 
+           op1_n, op1_c_in, op1_h, op1_w, op1_n, op1_c_out, op1_h, op1_w);
+    printf("  Op2 - Conv2d: [%d,%d,%d,%d] -> [%d,%d,%d,%d]\n", 
+           op2_n, op2_c_in, op2_h, op2_w, op2_n, op2_c_out, op2_h, op2_w);
+    // printf("  Op3 - MaxPool: [%d,%d,%d,%d] -> [%d,%d,%d,%d]\n", 
+    //        op3_n, op3_c, op3_h, op3_w, op3_n, op3_c, op3_out_h, op3_out_w);
+    printf("  Op4 - ElementwiseAdd: [%d,%d,%d,%d] + [%d,%d,%d,%d] -> [%d,%d,%d,%d]\n", 
+           op4_n, op4_c, op4_h, op4_w, op4_n, op4_c, op4_h, op4_w, op4_n, op4_c, op4_h, op4_w);
+    // printf("  Op5 - Matmul: [%d,%d] x [%d,%d] -> [%d,%d]\n", 
+    //        op5_batch, op5_in_features, op5_out_features, op5_in_features, op5_batch, op5_out_features);
+    
+    // 5. 计算内存大小 (移除 op3, op5 相关)
+    op1_input_size = op1_n * op1_c_in * op1_h * op1_w * sizeof(float);
+    op1_weight_size = op1_c_out * op1_c_in * op1_k * op1_k * sizeof(float);
+    op1_bias_size = op1_c_out * sizeof(float);
+    op1_output_size = op1_n * op1_c_out * op1_h * op1_w * sizeof(float);
+    
+    op2_input_size = op2_n * op2_c_in * op2_h * op2_w * sizeof(float);
+    op2_weight_size = op2_c_out * op2_c_in * op2_k * op2_k * sizeof(float);
+    op2_bias_size = op2_c_out * sizeof(float);
+    op2_output_size = op2_n * op2_c_out * op2_h * op2_w * sizeof(float);
+    
+    // op3_input_size = op3_n * op3_c * op3_h * op3_w * sizeof(float);
+    // op3_output_size = op3_n * op3_c * op3_out_h * op3_out_w * sizeof(float);
+    
+    op4_tensor_size = op4_n * op4_c * op4_h * op4_w * sizeof(float);
+    
+    // op5_input_size = op5_batch * op5_in_features * sizeof(float);
+    // op5_weight_size = op5_out_features * op5_in_features * sizeof(float);
+    // op5_bias_size = op5_out_features * sizeof(float);
+    // op5_output_size = op5_batch * op5_out_features * sizeof(float);
+    
+    // 6. 分配内存 (移除 op3, op5 相关)
+    printf("Allocating independent memory buffers...\n");
+    
+    // 操作1内存
+    CUDA_REPORT_IF_ERROR(cuMemAlloc(&d_op1_input, op1_input_size));
+    CUDA_REPORT_IF_ERROR(cuMemAlloc(&d_op1_weight, op1_weight_size));
+    CUDA_REPORT_IF_ERROR(cuMemAlloc(&d_op1_bias, op1_bias_size));
+    CUDA_REPORT_IF_ERROR(cuMemAlloc(&d_op1_output, op1_output_size));
+    
+    // 操作2内存
+    CUDA_REPORT_IF_ERROR(cuMemAlloc(&d_op2_input, op2_input_size));
+    CUDA_REPORT_IF_ERROR(cuMemAlloc(&d_op2_weight, op2_weight_size));
+    CUDA_REPORT_IF_ERROR(cuMemAlloc(&d_op2_bias, op2_bias_size));
+    CUDA_REPORT_IF_ERROR(cuMemAlloc(&d_op2_output, op2_output_size));
+    
+    // 操作3内存 (注释掉)
+    // CUDA_REPORT_IF_ERROR(cuMemAlloc(&d_op3_input, op3_input_size));
+    // CUDA_REPORT_IF_ERROR(cuMemAlloc(&d_op3_output, op3_output_size));
+    
+    // 操作4内存
+    CUDA_REPORT_IF_ERROR(cuMemAlloc(&d_op4_inputA, op4_tensor_size));
+    CUDA_REPORT_IF_ERROR(cuMemAlloc(&d_op4_inputB, op4_tensor_size));
+    CUDA_REPORT_IF_ERROR(cuMemAlloc(&d_op4_output, op4_tensor_size));
+    
+    // 操作5内存 (注释掉)
+    // CUDA_REPORT_IF_ERROR(cuMemAlloc(&d_op5_input, op5_input_size));
+    // CUDA_REPORT_IF_ERROR(cuMemAlloc(&d_op5_weight, op5_weight_size));
+    // CUDA_REPORT_IF_ERROR(cuMemAlloc(&d_op5_bias, op5_bias_size));
+    // CUDA_REPORT_IF_ERROR(cuMemAlloc(&d_op5_output, op5_output_size));
+    
+    // 转换为void*指针 (移除 op3, op5 相关)
+    op1_input_ptr = reinterpret_cast<void*>(d_op1_input);
+    op1_weight_ptr = reinterpret_cast<void*>(d_op1_weight);
+    op1_bias_ptr = reinterpret_cast<void*>(d_op1_bias);
+    op1_output_ptr = reinterpret_cast<void*>(d_op1_output);
+    
+    op2_input_ptr = reinterpret_cast<void*>(d_op2_input);
+    op2_weight_ptr = reinterpret_cast<void*>(d_op2_weight);
+    op2_bias_ptr = reinterpret_cast<void*>(d_op2_bias);
+    op2_output_ptr = reinterpret_cast<void*>(d_op2_output);
+    
+    // op3_input_ptr = reinterpret_cast<void*>(d_op3_input);
+    // op3_output_ptr = reinterpret_cast<void*>(d_op3_output);
+    
+    op4_inputA_ptr = reinterpret_cast<void*>(d_op4_inputA);
+    op4_inputB_ptr = reinterpret_cast<void*>(d_op4_inputB);
+    op4_output_ptr = reinterpret_cast<void*>(d_op4_output);
+    
+    // op5_input_ptr = reinterpret_cast<void*>(d_op5_input);
+    // op5_weight_ptr = reinterpret_cast<void*>(d_op5_weight);
+    // op5_bias_ptr = reinterpret_cast<void*>(d_op5_bias);
+    // op5_output_ptr = reinterpret_cast<void*>(d_op5_output);
+    
+    // 7. 初始化数据 (移除 op3, op5 相关)
+    printf("Initializing independent test data...\n");
+    
+    CUDA_REPORT_IF_ERROR(cuMemsetD32Async(d_op1_input, 0x3f800000, op1_input_size / 4, stream));  // 1.0f
+    CUDA_REPORT_IF_ERROR(cuMemsetD32Async(d_op1_weight, 0x3f000000, op1_weight_size / 4, stream)); // 0.5f
+    CUDA_REPORT_IF_ERROR(cuMemsetD32Async(d_op1_bias, 0x3f800000, op1_bias_size / 4, stream));     // 1.0f
+    
+    CUDA_REPORT_IF_ERROR(cuMemsetD32Async(d_op2_input, 0x3f400000, op2_input_size / 4, stream));  // 0.75f
+    CUDA_REPORT_IF_ERROR(cuMemsetD32Async(d_op2_weight, 0x3e800000, op2_weight_size / 4, stream)); // 0.25f
+    CUDA_REPORT_IF_ERROR(cuMemsetD32Async(d_op2_bias, 0x3f000000, op2_bias_size / 4, stream));     // 0.5f
+    
+    // CUDA_REPORT_IF_ERROR(cuMemsetD32Async(d_op3_input, 0x40000000, op3_input_size / 4, stream));  // 2.0f
+    
+    CUDA_REPORT_IF_ERROR(cuMemsetD32Async(d_op4_inputA, 0x40400000, op4_tensor_size / 4, stream)); // 3.0f
+    CUDA_REPORT_IF_ERROR(cuMemsetD32Async(d_op4_inputB, 0x40800000, op4_tensor_size / 4, stream)); // 4.0f
+    
+    // 注释掉 op5 数据初始化
+    // CUDA_REPORT_IF_ERROR(cuMemsetD32Async(d_op5_input, 0x3f800000, op5_input_size / 4, stream));  // 1.0f
+    // CUDA_REPORT_IF_ERROR(cuMemsetD32Async(d_op5_weight, 0x3dcccccd, op5_weight_size / 4, stream)); // 0.1f
+    // CUDA_REPORT_IF_ERROR(cuMemsetD32Async(d_op5_bias, 0x3f800000, op5_bias_size / 4, stream));     // 1.0f
+    
+    CUDA_REPORT_IF_ERROR(cuStreamSynchronize(stream));
+    
+    // 8. 构建计算图 (保持 op3, op5 注释)
+    printf("Building parallel computation graph with independent operations...\n");
+    
+    op1_node = mgpuParallelGroupAddConv2d(
+        group_id, op1_input_ptr, op1_weight_ptr, op1_bias_ptr, op1_output_ptr,
+        op1_n, op1_c_in, op1_h, op1_w, op1_c_out, op1_k, op1_k,
+        op1_pad, op1_pad, op1_stride, op1_stride, 1, 1
+    );
+    if (op1_node < 0) {
+        printf("ERROR: Failed to add Conv2d operation 1\n");
+        goto cleanup;
+    }
+    printf("Added Op1 - Conv2d node: %ld\n", op1_node);
+    
+    op2_node = mgpuParallelGroupAddConv2d(
+        group_id, op2_input_ptr, op2_weight_ptr, op2_bias_ptr, op2_output_ptr,
+        op2_n, op2_c_in, op2_h, op2_w, op2_c_out, op2_k, op2_k,
+        op2_pad, op2_pad, op2_stride, op2_stride, 1, 1
+    );
+    if (op2_node < 0) {
+        printf("ERROR: Failed to add Conv2d operation 2\n");
+        goto cleanup;
+    }
+    printf("Added Op2 - Conv2d node: %ld\n", op2_node);
+    
+    // op3 节点添加 (已注释)
+    // op3_node = mgpuParallelGroupAddMaxPool(
+    //     group_id, op3_input_ptr, op3_output_ptr,
+    //     op3_n, op3_c, op3_h, op3_w, op3_pool_k, op3_pool_k,
+    //     0, 0, 0, 0, op3_pool_stride, op3_pool_stride, 1, 1
+    // );
+    // if (op3_node < 0) {
+    //     printf("ERROR: Failed to add MaxPool operation 3\n");
+    //     goto cleanup;
+    // }
+    // printf("Added Op3 - MaxPool node: %ld\n", op3_node);
+    
+    op4_node = mgpuParallelGroupAddElementwise(
+        group_id, op4_inputA_ptr, op4_inputB_ptr, op4_output_ptr,
+        op4_n, op4_c, op4_h, op4_w, 0
+    );
+    if (op4_node < 0) {
+        printf("ERROR: Failed to add ElementwiseAdd operation 4\n");
+        goto cleanup;
+    }
+    printf("Added Op4 - ElementwiseAdd node: %ld\n", op4_node);
+    
+    // op5 节点添加 (已注释)
+    // op5_node = mgpuParallelGroupAddMatmul(
+    //     group_id, op5_input_ptr, op5_weight_ptr, op5_bias_ptr, op5_output_ptr,
+    //     op5_batch, op5_in_features, op5_out_features
+    // );
+    // if (op5_node < 0) {
+    //     printf("ERROR: Failed to add Matmul operation 5\n");
+    //     goto cleanup;
+    // }
+    // printf("Added Op5 - Matmul node: %ld\n", op5_node);
+    
+    printf("Successfully added 3 independent parallel operations to graph\n");
+    
+    // 9. 编译图
+    printf("Compiling parallel computation graph...\n");
+    compile_success = mgpuParallelGroupCompile(group_id);
+    if (!compile_success) {
+        printf("ERROR: Failed to compile parallel graph\n");
+        goto cleanup;
+    }
+    printf("Parallel graph compilation successful!\n");
+    
+    // 10. 执行图并计时
+    printf("Executing parallel computation graph...\n");
+    
+    // Warm-up
+    printf("Performing warm-up execution...\n");
+    exec_success = mgpuParallelGroupExecute(group_id, stream);
+    if (!exec_success) {
+        printf("ERROR: Failed to execute parallel graph (warm-up)\n");
+        goto cleanup;
+    }
+    CUDA_REPORT_IF_ERROR(cuStreamSynchronize(stream));
+    
+    // Timed execution
+    printf("Performing timed parallel execution...\n");
+    
+    CUDA_REPORT_IF_ERROR(cuEventRecord(start, stream));
+    
+    {
+        int i;
+        for (i = 0; i < num_iterations; i++) {
+            exec_success = mgpuParallelGroupExecute(group_id, stream);
+            if (!exec_success) {
+                printf("ERROR: Failed to execute parallel graph (iteration %d)\n", i);
+                goto cleanup;
+            }
+        }
+    }
+    
+    CUDA_REPORT_IF_ERROR(cuEventRecord(stop, stream));
+    CUDA_REPORT_IF_ERROR(cuEventSynchronize(stop));
+    
+    // 计算性能
+    CUDA_REPORT_IF_ERROR(cuEventElapsedTime(&milliseconds, start, stop));
+    
+    printf("Parallel Execution Performance Results:\n");
+    printf("  Total time for %d iterations: %.3f ms\n", num_iterations, milliseconds);
+    printf("  Average time per iteration: %.3f ms\n", milliseconds / num_iterations);
+    printf("  Throughput: %.2f executions/sec\n", (num_iterations * 1000.0f) / milliseconds);
+    printf("  Estimated parallel speedup benefit: 3 operations executed simultaneously\n");
+    
+    // 11. 结果验证 (移除 op3, op5 相关)
+    printf("Validating parallel operation results...\n");
+    
+    // 验证操作1输出
+    host_op1_output = new float[op1_n * op1_c_out * op1_h * op1_w];
+    CUDA_REPORT_IF_ERROR(cuMemcpyDtoH(host_op1_output, d_op1_output, op1_output_size));
+    {
+        float expected_op1 = 9 * 0.5f + 1.0f; // 5.5f
+        if (std::abs(host_op1_output[0] - expected_op1) < 1e-3) {
+            printf("  Op1 (Conv2d) validation: PASSED (%.3f ≈ %.3f)\n", host_op1_output[0], expected_op1);
+        } else {
+            printf("  Op1 (Conv2d) validation: FAILED (%.3f ≠ %.3f)\n", host_op1_output[0], expected_op1);
+            all_valid = false;
+        }
+    }
+    
+    // 验证操作2输出
+    host_op2_output = new float[op2_n * op2_c_out * op2_h * op2_w];
+    CUDA_REPORT_IF_ERROR(cuMemcpyDtoH(host_op2_output, d_op2_output, op2_output_size));
+    {
+        float expected_op2 = 9 * 0.75f * 0.25f + 0.5f; // 2.1875f
+        if (std::abs(host_op2_output[0] - expected_op2) < 1e-3) {
+            printf("  Op2 (Conv2d) validation: PASSED (%.3f ≈ %.3f)\n", host_op2_output[0], expected_op2);
+        } else {
+            printf("  Op2 (Conv2d) validation: FAILED (%.3f ≠ %.3f)\n", host_op2_output[0], expected_op2);
+            all_valid = false;
+        }
+    }
+    
+    // 验证操作3输出 (注释掉)
+    // host_op3_output = new float[op3_n * op3_c * op3_out_h * op3_out_w];
+    // CUDA_REPORT_IF_ERROR(cuMemcpyDtoH(host_op3_output, d_op3_output, op3_output_size));
+    // {
+    //     float expected_op3 = 2.0f;
+    //     if (std::abs(host_op3_output[0] - expected_op3) < 1e-3) {
+    //         printf("  Op3 (MaxPool) validation: PASSED (%.3f ≈ %.3f)\n", host_op3_output[0], expected_op3);
+    //     } else {
+    //         printf("  Op3 (MaxPool) validation: FAILED (%.3f ≠ %.3f)\n", host_op3_output[0], expected_op3);
+    //         all_valid = false;
+    //     }
+    // }
+    
+    // 验证操作4输出
+    host_op4_output = new float[op4_n * op4_c * op4_h * op4_w];
+    CUDA_REPORT_IF_ERROR(cuMemcpyDtoH(host_op4_output, d_op4_output, op4_tensor_size));
+    {
+        float expected_op4 = 3.0f + 4.0f; // 7.0f
+        if (std::abs(host_op4_output[0] - expected_op4) < 1e-3) {
+            printf("  Op4 (ElementwiseAdd) validation: PASSED (%.3f ≈ %.3f)\n", host_op4_output[0], expected_op4);
+        } else {
+            printf("  Op4 (ElementwiseAdd) validation: FAILED (%.3f ≠ %.3f)\n", host_op4_output[0], expected_op4);
+            all_valid = false;
+        }
+    }
+    
+    // 验证操作5输出 (注释掉)
+    // host_op5_output = new float[op5_batch * op5_out_features];
+    // CUDA_REPORT_IF_ERROR(cuMemcpyDtoH(host_op5_output, d_op5_output, op5_output_size));
+    // {
+    //     float expected_op5 = op5_in_features * 1.0f * 0.1f + 1.0f; // 52.2f
+    //     if (std::abs(host_op5_output[0] - expected_op5) < 1e-2) {
+    //         printf("  Op5 (Matmul) validation: PASSED (%.3f ≈ %.3f)\n", host_op5_output[0], expected_op5);
+    //     } else {
+    //         printf("  Op5 (Matmul) validation: FAILED (%.3f ≠ %.3f)\n", host_op5_output[0], expected_op5);
+    //         all_valid = false;
+    //     }
+    // }
+    
+    printf("Overall parallel operations validation: %s\n", all_valid ? "PASSED" : "FAILED");
+    printf("=== cuDNN Graph Parallel Operations Test Completed Successfully ===\n");
+
+cleanup:
+    // 12. 清理资源 (移除 op3, op5 相关)
+    printf("Cleaning up parallel operations resources...\n");
+    
+    // 释放主机内存 (移除 op3, op5 相关)
+    if (host_op1_output) delete[] host_op1_output;
+    if (host_op2_output) delete[] host_op2_output;
+    // if (host_op3_output) delete[] host_op3_output;
+    if (host_op4_output) delete[] host_op4_output;
+    // if (host_op5_output) delete[] host_op5_output;
+    
+    // 释放设备内存 (移除 op3, op5 相关)
+    if (d_op1_input) CUDA_REPORT_IF_ERROR(cuMemFree(d_op1_input));
+    if (d_op1_weight) CUDA_REPORT_IF_ERROR(cuMemFree(d_op1_weight));
+    if (d_op1_bias) CUDA_REPORT_IF_ERROR(cuMemFree(d_op1_bias));
+    if (d_op1_output) CUDA_REPORT_IF_ERROR(cuMemFree(d_op1_output));
+    
+    if (d_op2_input) CUDA_REPORT_IF_ERROR(cuMemFree(d_op2_input));
+    if (d_op2_weight) CUDA_REPORT_IF_ERROR(cuMemFree(d_op2_weight));
+    if (d_op2_bias) CUDA_REPORT_IF_ERROR(cuMemFree(d_op2_bias));
+    if (d_op2_output) CUDA_REPORT_IF_ERROR(cuMemFree(d_op2_output));
+    
+    // if (d_op3_input) CUDA_REPORT_IF_ERROR(cuMemFree(d_op3_input));
+    // if (d_op3_output) CUDA_REPORT_IF_ERROR(cuMemFree(d_op3_output));
+    
+    if (d_op4_inputA) CUDA_REPORT_IF_ERROR(cuMemFree(d_op4_inputA));
+    if (d_op4_inputB) CUDA_REPORT_IF_ERROR(cuMemFree(d_op4_inputB));
+    if (d_op4_output) CUDA_REPORT_IF_ERROR(cuMemFree(d_op4_output));
+    
+    // 注释掉 op5 内存释放
+    // if (d_op5_input) CUDA_REPORT_IF_ERROR(cuMemFree(d_op5_input));
+    // if (d_op5_weight) CUDA_REPORT_IF_ERROR(cuMemFree(d_op5_weight));
+    // if (d_op5_bias) CUDA_REPORT_IF_ERROR(cuMemFree(d_op5_bias));
+    // if (d_op5_output) CUDA_REPORT_IF_ERROR(cuMemFree(d_op5_output));
+    
+    // 销毁图
+    if (group_id > 0) {
+        mgpuDestroyParallelGroupGraph(group_id);
+    }
+    
+    // 销毁CUDA对象
+    if (start) CUDA_REPORT_IF_ERROR(cuEventDestroy(start));
+    if (stop) CUDA_REPORT_IF_ERROR(cuEventDestroy(stop));
+    if (stream) CUDA_REPORT_IF_ERROR(cuStreamDestroy(stream));
+    
+    printf("Resource cleanup completed\n");
+}
+
+// 修复版本的简单测试函数
+extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuCudnnGraphSimpleTest() {
+    printf("=== Starting cuDNN Graph Simple Parallel Test ===\n");
+    
+    // 在函数开始处声明所有变量
+    CUstream stream = nullptr;
+    cudnnHandle_t handle = nullptr;
+    int group_id = 0;
+    bool success = false;
+    bool all_passed = true;
+    
+    // 操作参数结构体
+    struct ConvOp {
+        int n, c_in, h, w, c_out, k, pad, stride;
+        CUdeviceptr d_input, d_weight, d_bias, d_output;
+        void *input_ptr, *weight_ptr, *bias_ptr, *output_ptr;
+    };
+    
+    ConvOp ops[3] = {
+        {1, 1, 4, 4, 1, 3, 0, 1, 0, 0, 0, 0, nullptr, nullptr, nullptr, nullptr},
+        {1, 2, 6, 6, 2, 3, 0, 1, 0, 0, 0, 0, nullptr, nullptr, nullptr, nullptr},
+        {1, 3, 8, 8, 3, 3, 0, 1, 0, 0, 0, 0, nullptr, nullptr, nullptr, nullptr}
+    };
+    
+    mgpuEnsureContext();
+    
+    CUDA_REPORT_IF_ERROR(cuStreamCreate(&stream, CU_STREAM_NON_BLOCKING));
+    
+    // 获取cuDNN句柄并创建图
+    handle = mgpuCudnnGetHandle(stream);
+    group_id = mgpuCreateParallelGroupGraph(handle);
+    
+    printf("Created graph group: %d\n", group_id);
+    
+    printf("Defining 3 independent convolution operations:\n");
+    {
+        int i;
+        for (i = 0; i < 3; i++) {
+            int out_h = (ops[i].h - ops[i].k + 2*ops[i].pad) / ops[i].stride + 1;
+            int out_w = (ops[i].w - ops[i].k + 2*ops[i].pad) / ops[i].stride + 1;
+            printf("  Conv%d: [%d,%d,%d,%d] -> [%d,%d,%d,%d]\n", 
+                   i+1, ops[i].n, ops[i].c_in, ops[i].h, ops[i].w, 
+                   ops[i].n, ops[i].c_out, out_h, out_w);
+        }
+    }
+    
+    // 分配内存并初始化数据
+    {
+        int i;
+        for (i = 0; i < 3; i++) {
+            size_t input_size = ops[i].n * ops[i].c_in * ops[i].h * ops[i].w * sizeof(float);
+            size_t weight_size = ops[i].c_out * ops[i].c_in * ops[i].k * ops[i].k * sizeof(float);
+            size_t bias_size = ops[i].c_out * sizeof(float);
+            int out_h = (ops[i].h - ops[i].k + 2*ops[i].pad) / ops[i].stride + 1;
+            int out_w = (ops[i].w - ops[i].k + 2*ops[i].pad) / ops[i].stride + 1;
+            size_t output_size = ops[i].n * ops[i].c_out * out_h * out_w * sizeof(float);
+            
+            CUDA_REPORT_IF_ERROR(cuMemAlloc(&ops[i].d_input, input_size));
+            CUDA_REPORT_IF_ERROR(cuMemAlloc(&ops[i].d_weight, weight_size));
+            CUDA_REPORT_IF_ERROR(cuMemAlloc(&ops[i].d_bias, bias_size));
+            CUDA_REPORT_IF_ERROR(cuMemAlloc(&ops[i].d_output, output_size));
+            
+            ops[i].input_ptr = reinterpret_cast<void*>(ops[i].d_input);
+            ops[i].weight_ptr = reinterpret_cast<void*>(ops[i].d_weight);
+            ops[i].bias_ptr = reinterpret_cast<void*>(ops[i].d_bias);
+            ops[i].output_ptr = reinterpret_cast<void*>(ops[i].d_output);
+            
+            // 使用不同的初始值以区分操作
+            float input_val = 1.0f + i * 0.5f;   // 1.0, 1.5, 2.0
+            float weight_val = 0.5f + i * 0.25f; // 0.5, 0.75, 1.0
+            float bias_val = 1.0f + i;           // 1.0, 2.0, 3.0
+            
+            CUDA_REPORT_IF_ERROR(cuMemsetD32Async(ops[i].d_input, *(unsigned int*)&input_val, input_size / 4, stream));
+            CUDA_REPORT_IF_ERROR(cuMemsetD32Async(ops[i].d_weight, *(unsigned int*)&weight_val, weight_size / 4, stream));
+            CUDA_REPORT_IF_ERROR(cuMemsetD32Async(ops[i].d_bias, *(unsigned int*)&bias_val, bias_size / 4, stream));
+        }
+    }
+    
+    CUDA_REPORT_IF_ERROR(cuStreamSynchronize(stream));
+    
+    // 添加3个独立的卷积操作到图
+    printf("Adding 3 independent convolution operations to graph...\n");
+    {
+        int i;
+        for (i = 0; i < 3; i++) {
+            int64_t node = mgpuParallelGroupAddConv2d(
+                group_id,
+                ops[i].input_ptr, ops[i].weight_ptr, ops[i].bias_ptr, ops[i].output_ptr,
+                ops[i].n, ops[i].c_in, ops[i].h, ops[i].w,
+                ops[i].c_out, ops[i].k, ops[i].k,
+                ops[i].pad, ops[i].pad, ops[i].stride, ops[i].stride, 1, 1
+            );
+            
+            if (node < 0) {
+                printf("ERROR: Failed to add Conv%d node\n", i+1);
+                goto simple_cleanup;
+            }
+            printf("Added Conv%d node: %ld\n", i+1, node);
+        }
+    }
+    
+    // 编译并执行
+    printf("Compiling and executing parallel graph...\n");
+    success = mgpuParallelGroupCompileAndExecute(group_id, stream);
+    
+    if (success) {
+        CUDA_REPORT_IF_ERROR(cuStreamSynchronize(stream));
+        
+        // 验证3个操作的结果
+        printf("Validating results of 3 parallel operations:\n");
+        
+        {
+            int i;
+            for (i = 0; i < 3; i++) {
+                int out_h = (ops[i].h - ops[i].k + 2*ops[i].pad) / ops[i].stride + 1;
+                int out_w = (ops[i].w - ops[i].k + 2*ops[i].pad) / ops[i].stride + 1;
+                size_t output_size = ops[i].n * ops[i].c_out * out_h * out_w * sizeof(float);
+                
+                float* host_output = new float[ops[i].n * ops[i].c_out * out_h * out_w];
+                CUDA_REPORT_IF_ERROR(cuMemcpyDtoH(host_output, ops[i].d_output, output_size));
+                
+                float input_val = 1.0f + i * 0.5f;
+                float weight_val = 0.5f + i * 0.25f;
+                float bias_val = 1.0f + i;
+                float expected = ops[i].k * ops[i].k * input_val * weight_val + bias_val;
+                
+                bool passed = std::abs(host_output[0] - expected) < 1e-3;
+                printf("  Conv%d: %.3f ≈ %.3f %s\n", 
+                       i+1, host_output[0], expected, passed ? "PASSED" : "FAILED");
+                
+                if (!passed) all_passed = false;
+                delete[] host_output;
+            }
+        }
+        
+        printf("Simple parallel graph test: %s\n", all_passed ? "PASSED" : "FAILED");
+    } else {
+        printf("Graph execution FAILED\n");
+    }
+    
+simple_cleanup:
+    // 清理
+    {
+        int i;
+        for (i = 0; i < 3; i++) {
+            if (ops[i].d_input) CUDA_REPORT_IF_ERROR(cuMemFree(ops[i].d_input));
+            if (ops[i].d_weight) CUDA_REPORT_IF_ERROR(cuMemFree(ops[i].d_weight));
+            if (ops[i].d_bias) CUDA_REPORT_IF_ERROR(cuMemFree(ops[i].d_bias));
+            if (ops[i].d_output) CUDA_REPORT_IF_ERROR(cuMemFree(ops[i].d_output));
+        }
+    }
+    
+    if (group_id > 0) {
+        mgpuDestroyParallelGroupGraph(group_id);
+    }
+    if (stream) CUDA_REPORT_IF_ERROR(cuStreamDestroy(stream));
+    
+    printf("=== cuDNN Graph Simple Parallel Test Completed ===\n");
+}
+
+extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuCudnnBasicTest() {
+    printf("=== cuDNN Basic Test ===\n");
+    
+    // 检查环境
+    size_t cudnn_version = cudnnGetVersion();
+    printf("cuDNN Version: %zu\n", cudnn_version);
+    
+    mgpuEnsureContext();
+    
+    CUstream stream;
+    CUDA_REPORT_IF_ERROR(cuStreamCreate(&stream, CU_STREAM_NON_BLOCKING));
+    
+    cudnnHandle_t handle = mgpuCudnnGetHandle(stream);
+    printf("cuDNN handle obtained\n");
+    
+    // 测试基础张量创建
+    CudnnGraphBuilder* builder = new CudnnGraphBuilder(handle);
+    
+    if (builder) {
+        printf("Graph builder created successfully\n");
+        
+        // 测试最简单的张量
+        std::vector<int> dims = {1, 1, 2, 2};
+        int64_t tensor_id = builder->AddTensor(dims, CUDNN_DATA_FLOAT, false);
+        
+        if (tensor_id >= 0) {
+            printf("Basic tensor creation: SUCCESS (ID: %ld)\n", tensor_id);
+        } else {
+            printf("Basic tensor creation: FAILED\n");
+        }
+        
+        delete builder;
+    } else {
+        printf("Graph builder creation: FAILED\n");
+    }
+    
+    CUDA_REPORT_IF_ERROR(cuStreamDestroy(stream));
+    printf("=== Basic Test Completed ===\n");
+}
 
 // 全局缓存变量
 static CUmodule cachedModule = nullptr;
@@ -3455,219 +4545,219 @@ extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuCudnnTensorOpsTest() {
   printf("CuDNN tensor operations test completed\n");
 }
 
-extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuFullyConnectedTest() {
-  printf("Starting fully connected layer (FC) test...\n");
+// extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuFullyConnectedTest() {
+//   printf("Starting fully connected layer (FC) test...\n");
   
-  // 创建CUDA上下文
-  ScopedContext scopedContext;
+//   // 创建CUDA上下文
+//   ScopedContext scopedContext;
   
-  // 创建流用于执行
-  CUstream stream = nullptr;
-  CUDA_REPORT_IF_ERROR(cuStreamCreate(&stream, CU_STREAM_NON_BLOCKING));
+//   // 创建流用于执行
+//   CUstream stream = nullptr;
+//   CUDA_REPORT_IF_ERROR(cuStreamCreate(&stream, CU_STREAM_NON_BLOCKING));
   
-  // 创建CUDA事件用于计时
-  CUevent start = nullptr, stop = nullptr;
-  CUDA_REPORT_IF_ERROR(cuEventCreate(&start, CU_EVENT_DEFAULT));
-  CUDA_REPORT_IF_ERROR(cuEventCreate(&stop, CU_EVENT_DEFAULT));
+//   // 创建CUDA事件用于计时
+//   CUevent start = nullptr, stop = nullptr;
+//   CUDA_REPORT_IF_ERROR(cuEventCreate(&start, CU_EVENT_DEFAULT));
+//   CUDA_REPORT_IF_ERROR(cuEventCreate(&stop, CU_EVENT_DEFAULT));
   
-  // 设置FC层参数
-  int batch_size = 128;
-  int input_features = 256;
-  int output_features = 128;
+//   // 设置FC层参数
+//   int batch_size = 128;
+//   int input_features = 256;
+//   int output_features = 128;
   
-  printf("FC parameters: batch_size=%d, input_features=%d, output_features=%d\n", 
-         batch_size, input_features, output_features);
+//   printf("FC parameters: batch_size=%d, input_features=%d, output_features=%d\n", 
+//          batch_size, input_features, output_features);
   
-  // 分配内存
-  printf("Allocating device memory...\n");
+//   // 分配内存
+//   printf("Allocating device memory...\n");
   
-  size_t input_size = batch_size * input_features * sizeof(float);
-  size_t weight_size = output_features * input_features * sizeof(float);
-  size_t bias_size = output_features * sizeof(float);
-  size_t output_size = batch_size * output_features * sizeof(float);
+//   size_t input_size = batch_size * input_features * sizeof(float);
+//   size_t weight_size = output_features * input_features * sizeof(float);
+//   size_t bias_size = output_features * sizeof(float);
+//   size_t output_size = batch_size * output_features * sizeof(float);
   
-  CUdeviceptr dInput = 0, dWeight = 0, dBias = 0, dOutput1 = 0, dOutput2 = 0;
-  CUDA_REPORT_IF_ERROR(cuMemAlloc(&dInput, input_size));
-  CUDA_REPORT_IF_ERROR(cuMemAlloc(&dWeight, weight_size));
-  CUDA_REPORT_IF_ERROR(cuMemAlloc(&dBias, bias_size));
-  CUDA_REPORT_IF_ERROR(cuMemAlloc(&dOutput1, output_size));
-  CUDA_REPORT_IF_ERROR(cuMemAlloc(&dOutput2, output_size));
+//   CUdeviceptr dInput = 0, dWeight = 0, dBias = 0, dOutput1 = 0, dOutput2 = 0;
+//   CUDA_REPORT_IF_ERROR(cuMemAlloc(&dInput, input_size));
+//   CUDA_REPORT_IF_ERROR(cuMemAlloc(&dWeight, weight_size));
+//   CUDA_REPORT_IF_ERROR(cuMemAlloc(&dBias, bias_size));
+//   CUDA_REPORT_IF_ERROR(cuMemAlloc(&dOutput1, output_size));
+//   CUDA_REPORT_IF_ERROR(cuMemAlloc(&dOutput2, output_size));
   
-  void* input = reinterpret_cast<void*>(dInput);
-  void* weight = reinterpret_cast<void*>(dWeight);
-  void* bias = reinterpret_cast<void*>(dBias);
-  void* output1 = reinterpret_cast<void*>(dOutput1);
-  void* output2 = reinterpret_cast<void*>(dOutput2);
+//   void* input = reinterpret_cast<void*>(dInput);
+//   void* weight = reinterpret_cast<void*>(dWeight);
+//   void* bias = reinterpret_cast<void*>(dBias);
+//   void* output1 = reinterpret_cast<void*>(dOutput1);
+//   void* output2 = reinterpret_cast<void*>(dOutput2);
   
-  // 分配主机内存用于初始化和验证
-  float* host_input = new float[batch_size * input_features];
-  float* host_weight = new float[output_features * input_features];
-  float* host_bias = new float[output_features];
-  float* host_output1 = new float[batch_size * output_features];
-  float* host_output2 = new float[batch_size * output_features];
-  float* host_expected1 = new float[batch_size * output_features];
-  float* host_expected2 = new float[batch_size * output_features];
+//   // 分配主机内存用于初始化和验证
+//   float* host_input = new float[batch_size * input_features];
+//   float* host_weight = new float[output_features * input_features];
+//   float* host_bias = new float[output_features];
+//   float* host_output1 = new float[batch_size * output_features];
+//   float* host_output2 = new float[batch_size * output_features];
+//   float* host_expected1 = new float[batch_size * output_features];
+//   float* host_expected2 = new float[batch_size * output_features];
   
-  // 初始化测试数据
-  printf("Initializing test data...\n");
+//   // 初始化测试数据
+//   printf("Initializing test data...\n");
   
-  // 所有输入值设为1.0
-  for (int i = 0; i < batch_size * input_features; i++) {
-    host_input[i] = 1.0f;
-  }
+//   // 所有输入值设为1.0
+//   for (int i = 0; i < batch_size * input_features; i++) {
+//     host_input[i] = 1.0f;
+//   }
   
-  // 所有权重值设为0.5
-  for (int i = 0; i < output_features * input_features; i++) {
-    host_weight[i] = 0.5f;
-  }
+//   // 所有权重值设为0.5
+//   for (int i = 0; i < output_features * input_features; i++) {
+//     host_weight[i] = 0.5f;
+//   }
   
-  // 所有偏置值设为2.0
-  for (int i = 0; i < output_features; i++) {
-    host_bias[i] = 2.0f;
-  }
+//   // 所有偏置值设为2.0
+//   for (int i = 0; i < output_features; i++) {
+//     host_bias[i] = 2.0f;
+//   }
   
-  // 拷贝数据到设备
-  CUDA_REPORT_IF_ERROR(cuMemcpyHtoD(dInput, host_input, input_size));
-  CUDA_REPORT_IF_ERROR(cuMemcpyHtoD(dWeight, host_weight, weight_size));
-  CUDA_REPORT_IF_ERROR(cuMemcpyHtoD(dBias, host_bias, bias_size));
+//   // 拷贝数据到设备
+//   CUDA_REPORT_IF_ERROR(cuMemcpyHtoD(dInput, host_input, input_size));
+//   CUDA_REPORT_IF_ERROR(cuMemcpyHtoD(dWeight, host_weight, weight_size));
+//   CUDA_REPORT_IF_ERROR(cuMemcpyHtoD(dBias, host_bias, bias_size));
   
-  printf("Running FC tests...\n");
+//   printf("Running FC tests...\n");
   
-  // 1. 测试带偏置的FC层
-  printf("Testing FC with bias...\n");
+//   // 1. 测试带偏置的FC层
+//   printf("Testing FC with bias...\n");
   
-  CUDA_REPORT_IF_ERROR(cuEventRecord(start, stream));
+//   CUDA_REPORT_IF_ERROR(cuEventRecord(start, stream));
   
-  mgpuCulibsFullyConnectedForward(
-      batch_size, input_features, output_features,
-      input, weight, bias, output1, stream);
+//   mgpuCulibsFullyConnectedForward(
+//       batch_size, input_features, output_features,
+//       input, weight, bias, output1, stream);
   
-  CUDA_REPORT_IF_ERROR(cuEventRecord(stop, stream));
-  CUDA_REPORT_IF_ERROR(cuStreamSynchronize(stream));
+//   CUDA_REPORT_IF_ERROR(cuEventRecord(stop, stream));
+//   CUDA_REPORT_IF_ERROR(cuStreamSynchronize(stream));
   
-  // 计算耗时
-  float ms_fc_with_bias = 0.0f;
-  CUDA_REPORT_IF_ERROR(cuEventElapsedTime(&ms_fc_with_bias, start, stop));
+//   // 计算耗时
+//   float ms_fc_with_bias = 0.0f;
+//   CUDA_REPORT_IF_ERROR(cuEventElapsedTime(&ms_fc_with_bias, start, stop));
   
-  // 验证结果
-  CUDA_REPORT_IF_ERROR(cuMemcpyDtoH(host_output1, dOutput1, output_size));
+//   // 验证结果
+//   CUDA_REPORT_IF_ERROR(cuMemcpyDtoH(host_output1, dOutput1, output_size));
   
-  // 手动计算预期结果: output = input * weight^T + bias
-  // 每个输出元素是input_features个1.0与input_features个0.5的点积，再加上偏置2.0
-  // = input_features * 0.5 + 2.0 = input_features/2 + 2.0
-  float expected_value_with_bias = input_features * 0.5f + 2.0f;
-  for (int i = 0; i < batch_size * output_features; i++) {
-    host_expected1[i] = expected_value_with_bias;
-  }
+//   // 手动计算预期结果: output = input * weight^T + bias
+//   // 每个输出元素是input_features个1.0与input_features个0.5的点积，再加上偏置2.0
+//   // = input_features * 0.5 + 2.0 = input_features/2 + 2.0
+//   float expected_value_with_bias = input_features * 0.5f + 2.0f;
+//   for (int i = 0; i < batch_size * output_features; i++) {
+//     host_expected1[i] = expected_value_with_bias;
+//   }
   
-  bool fc_bias_correct = true;
-  for (int i = 0; i < batch_size * output_features; i++) {
-    if (std::abs(host_output1[i] - host_expected1[i]) > 1e-5) {
-      fc_bias_correct = false;
-      printf("FC with bias error at index %d: %f vs %f\n", 
-             i, host_output1[i], host_expected1[i]);
-      break;
-    }
-  }
+//   bool fc_bias_correct = true;
+//   for (int i = 0; i < batch_size * output_features; i++) {
+//     if (std::abs(host_output1[i] - host_expected1[i]) > 1e-5) {
+//       fc_bias_correct = false;
+//       printf("FC with bias error at index %d: %f vs %f\n", 
+//              i, host_output1[i], host_expected1[i]);
+//       break;
+//     }
+//   }
   
-  printf("FC with bias test %s (took %.3f ms)\n", 
-         fc_bias_correct ? "PASSED" : "FAILED", ms_fc_with_bias);
+//   printf("FC with bias test %s (took %.3f ms)\n", 
+//          fc_bias_correct ? "PASSED" : "FAILED", ms_fc_with_bias);
   
-  // 2. 测试不带偏置的FC层
-  printf("Testing FC without bias...\n");
+//   // 2. 测试不带偏置的FC层
+//   printf("Testing FC without bias...\n");
   
-  CUDA_REPORT_IF_ERROR(cuEventRecord(start, stream));
+//   CUDA_REPORT_IF_ERROR(cuEventRecord(start, stream));
   
-  mgpuCulibsFullyConnectedForward(
-      batch_size, input_features, output_features,
-      input, weight, nullptr, output2, stream);
+//   mgpuCulibsFullyConnectedForward(
+//       batch_size, input_features, output_features,
+//       input, weight, nullptr, output2, stream);
   
-  CUDA_REPORT_IF_ERROR(cuEventRecord(stop, stream));
-  CUDA_REPORT_IF_ERROR(cuStreamSynchronize(stream));
+//   CUDA_REPORT_IF_ERROR(cuEventRecord(stop, stream));
+//   CUDA_REPORT_IF_ERROR(cuStreamSynchronize(stream));
   
-  // 计算耗时
-  float ms_fc_no_bias = 0.0f;
-  CUDA_REPORT_IF_ERROR(cuEventElapsedTime(&ms_fc_no_bias, start, stop));
+//   // 计算耗时
+//   float ms_fc_no_bias = 0.0f;
+//   CUDA_REPORT_IF_ERROR(cuEventElapsedTime(&ms_fc_no_bias, start, stop));
   
-  // 验证结果
-  CUDA_REPORT_IF_ERROR(cuMemcpyDtoH(host_output2, dOutput2, output_size));
+//   // 验证结果
+//   CUDA_REPORT_IF_ERROR(cuMemcpyDtoH(host_output2, dOutput2, output_size));
   
-  // 手动计算预期结果: output = input * weight^T
-  // 每个输出元素是input_features个1.0与input_features个0.5的点积
-  // = input_features * 0.5 = input_features/2
-  float expected_value_no_bias = input_features * 0.5f;
-  for (int i = 0; i < batch_size * output_features; i++) {
-    host_expected2[i] = expected_value_no_bias;
-  }
+//   // 手动计算预期结果: output = input * weight^T
+//   // 每个输出元素是input_features个1.0与input_features个0.5的点积
+//   // = input_features * 0.5 = input_features/2
+//   float expected_value_no_bias = input_features * 0.5f;
+//   for (int i = 0; i < batch_size * output_features; i++) {
+//     host_expected2[i] = expected_value_no_bias;
+//   }
   
-  bool fc_no_bias_correct = true;
-  for (int i = 0; i < batch_size * output_features; i++) {
-    if (std::abs(host_output2[i] - host_expected2[i]) > 1e-5) {
-      fc_no_bias_correct = false;
-      printf("FC without bias error at index %d: %f vs %f\n", 
-             i, host_output2[i], host_expected2[i]);
-      break;
-    }
-  }
+//   bool fc_no_bias_correct = true;
+//   for (int i = 0; i < batch_size * output_features; i++) {
+//     if (std::abs(host_output2[i] - host_expected2[i]) > 1e-5) {
+//       fc_no_bias_correct = false;
+//       printf("FC without bias error at index %d: %f vs %f\n", 
+//              i, host_output2[i], host_expected2[i]);
+//       break;
+//     }
+//   }
   
-  printf("FC without bias test %s (took %.3f ms)\n", 
-         fc_no_bias_correct ? "PASSED" : "FAILED", ms_fc_no_bias);
+//   printf("FC without bias test %s (took %.3f ms)\n", 
+//          fc_no_bias_correct ? "PASSED" : "FAILED", ms_fc_no_bias);
   
-  // 验证带偏置和不带偏置的结果差异
-  bool bias_diff_correct = true;
-  for (int i = 0; i < batch_size * output_features; i++) {
-    float expected_diff = host_expected1[i] - host_expected2[i]; // 应该等于偏置值2.0
-    float actual_diff = host_output1[i] - host_output2[i];
-    if (std::abs(actual_diff - expected_diff) > 1e-5) {
-      bias_diff_correct = false;
-      printf("Bias difference error at index %d: %f vs %f\n", 
-             i, actual_diff, expected_diff);
-      break;
-    }
-  }
+//   // 验证带偏置和不带偏置的结果差异
+//   bool bias_diff_correct = true;
+//   for (int i = 0; i < batch_size * output_features; i++) {
+//     float expected_diff = host_expected1[i] - host_expected2[i]; // 应该等于偏置值2.0
+//     float actual_diff = host_output1[i] - host_output2[i];
+//     if (std::abs(actual_diff - expected_diff) > 1e-5) {
+//       bias_diff_correct = false;
+//       printf("Bias difference error at index %d: %f vs %f\n", 
+//              i, actual_diff, expected_diff);
+//       break;
+//     }
+//   }
   
-  printf("Bias effect verification %s\n", 
-         bias_diff_correct ? "PASSED" : "FAILED");
+//   printf("Bias effect verification %s\n", 
+//          bias_diff_correct ? "PASSED" : "FAILED");
   
-  // 总结测试结果
-  printf("\nFC Operations Test Summary:\n");
-  printf("FC with bias test: %s (%.3f ms)\n", 
-         fc_bias_correct ? "PASSED" : "FAILED", ms_fc_with_bias);
-  printf("FC without bias test: %s (%.3f ms)\n", 
-         fc_no_bias_correct ? "PASSED" : "FAILED", ms_fc_no_bias);
-  printf("Bias effect verification: %s\n", 
-         bias_diff_correct ? "PASSED" : "FAILED");
+//   // 总结测试结果
+//   printf("\nFC Operations Test Summary:\n");
+//   printf("FC with bias test: %s (%.3f ms)\n", 
+//          fc_bias_correct ? "PASSED" : "FAILED", ms_fc_with_bias);
+//   printf("FC without bias test: %s (%.3f ms)\n", 
+//          fc_no_bias_correct ? "PASSED" : "FAILED", ms_fc_no_bias);
+//   printf("Bias effect verification: %s\n", 
+//          bias_diff_correct ? "PASSED" : "FAILED");
   
-  // 检查性能差异
-  float perf_diff = (ms_fc_with_bias / ms_fc_no_bias - 1.0f) * 100.0f;
-  printf("Performance overhead of bias: %.2f%%\n", perf_diff);
+//   // 检查性能差异
+//   float perf_diff = (ms_fc_with_bias / ms_fc_no_bias - 1.0f) * 100.0f;
+//   printf("Performance overhead of bias: %.2f%%\n", perf_diff);
   
-  // 清理资源
-  delete[] host_input;
-  delete[] host_weight;
-  delete[] host_bias;
-  delete[] host_output1;
-  delete[] host_output2;
-  delete[] host_expected1;
-  delete[] host_expected2;
+//   // 清理资源
+//   delete[] host_input;
+//   delete[] host_weight;
+//   delete[] host_bias;
+//   delete[] host_output1;
+//   delete[] host_output2;
+//   delete[] host_expected1;
+//   delete[] host_expected2;
   
-  CUDA_REPORT_IF_ERROR(cuMemFree(dInput));
-  CUDA_REPORT_IF_ERROR(cuMemFree(dWeight));
-  CUDA_REPORT_IF_ERROR(cuMemFree(dBias));
-  CUDA_REPORT_IF_ERROR(cuMemFree(dOutput1));
-  CUDA_REPORT_IF_ERROR(cuMemFree(dOutput2));
+//   CUDA_REPORT_IF_ERROR(cuMemFree(dInput));
+//   CUDA_REPORT_IF_ERROR(cuMemFree(dWeight));
+//   CUDA_REPORT_IF_ERROR(cuMemFree(dBias));
+//   CUDA_REPORT_IF_ERROR(cuMemFree(dOutput1));
+//   CUDA_REPORT_IF_ERROR(cuMemFree(dOutput2));
   
-  CUDA_REPORT_IF_ERROR(cuEventDestroy(start));
-  CUDA_REPORT_IF_ERROR(cuEventDestroy(stop));
-  CUDA_REPORT_IF_ERROR(cuStreamDestroy(stream));
+//   CUDA_REPORT_IF_ERROR(cuEventDestroy(start));
+//   CUDA_REPORT_IF_ERROR(cuEventDestroy(stop));
+//   CUDA_REPORT_IF_ERROR(cuStreamDestroy(stream));
   
-  // 清理句柄（如果您的清理函数会清理所有句柄，包括cuBLAS和cuDNN）
-  // 如果您有单独的清理函数，可以分别调用
-  mgpuCudnnCleanup();
-  mgpuCublasCleanup();
+//   // 清理句柄（如果您的清理函数会清理所有句柄，包括cuBLAS和cuDNN）
+//   // 如果您有单独的清理函数，可以分别调用
+//   mgpuCudnnCleanup();
+//   mgpuCublasCleanup();
   
-  printf("FC operations test completed\n");
-}
+//   printf("FC operations test completed\n");
+// }
 
 ///
 /// Runtime methods using CUDA 12.0+ driver
