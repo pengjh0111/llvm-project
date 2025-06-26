@@ -1075,95 +1075,22 @@ extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuReleasePooledStream(CUstream strea
   //         stream_index, stream, g_active_stream_count.load(), (int)g_stream_pool.size());
 }
 
-// // 全连接层的实现，使用cuBLAS执行矩阵乘法
-// extern "C" MLIR_CUDA_WRAPPERS_EXPORT void
-// mgpuCulibsFullyConnectedForward(
-//     int batch_size, int input_features,   // 输入维度
-//     int output_features,                  // 输出特征数
-//     void* input_data, void* weight_data,  // 输入和权重指针
-//     void* bias_data,                      // 偏置指针（可为NULL）
-//     void* output_data,                    // 输出指针
-//     CUstream stream                       // CUDA流
-// ) {
-//   // 确保使用全局上下文
-//   mgpuEnsureContext();
-  
-//   StreamHandles handles;
-//   if (!getHandlesForStream(stream, handles)) {
-//     return; // 错误信息已在getHandlesForStream中打印
-//   }
-//   cublasHandle_t handle = handles.cublas_handle;
+// 下面是兼容旧API的函数，使用新实现
+extern "C" MLIR_CUDA_WRAPPERS_EXPORT cudnnHandle_t mgpuCudnnCreate() {
+  return mgpuCudnnGetHandle(nullptr);  // 使用默认流
+}
 
-//   // 获取此流的cuBLAS句柄
-//   // cublasHandle_t handle = mgpuCublasGetHandle(stream);
-  
-//   // 设置矩阵乘法参数
-//   // C = alpha * op(A) * op(B) + beta * C
-//   // 对于FC: output = input * weight^T + bias
-//   const float alpha = 1.0f;
-//   const float beta = 0.0f;
-  
-//   // 计算矩阵乘法：output = input * weight^T
-//   // cuBLAS中的矩阵是列主序的，与MLIR中的行主序不同，需要转置操作
-//   // 所以实际执行的是：(output)^T = (weight)^T * (input)^T
-//   // 这对应于cuBLAS中 C = B * A 而不是 A * B
-//   // 即：output(batch_size, output_features) = input(batch_size, input_features) * weight(output_features, input_features)^T
-  
-//   // 使用CUBLAS_OP_T表示权重矩阵需要被转置
-//   CUBLAS_REPORT_IF_ERROR(cublasSgemm(
-//       handle,
-//       CUBLAS_OP_N,                   // op(B)：权重矩阵需要转置
-//       CUBLAS_OP_N,                   // op(A)：输入矩阵不需要转置
-//       output_features,               // 输出特征数（m：B的行数）
-//       batch_size,                    // 批量大小（n：A的列数）
-//       input_features,                // 输入特征数（k：A的行数，B的列数）
-//       &alpha,                        // 标量系数alpha
-//       (const float*)weight_data,     // B矩阵（权重）
-//       input_features,                // B的主维度是input_features
-//       (const float*)input_data,      // A矩阵（输入）
-//       input_features,                // A的主维度是input_features
-//       &beta,                         // 标量系数beta
-//       (float*)output_data,           // C矩阵（输出）
-//       output_features                // C的主维度是output_features
-//   ));
-  
-//   // 如果提供了偏置，使用cuDNN的AddTensor添加偏置
-//   if (bias_data != nullptr) {
-//     // 获取cuDNN句柄
-//     // cudnnHandle_t cudnnHandle = mgpuCudnnGetHandle(stream);
-//     cudnnHandle_t cudnnHandle = handles.cudnn_handle;
-    
-//     // 创建张量描述符
-//     cudnnTensorDescriptor_t outputDesc, biasDesc;
-//     CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&outputDesc));
-//     CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&biasDesc));
-    
-//     // 设置输出描述符，将FC输出视为NCHW格式的张量，但C=output_features，H=W=1
-//     CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
-//         outputDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, 
-//         batch_size, output_features, 1, 1));
-    
-//     // 设置偏置描述符，偏置是1D向量，表示为1xCx1x1
-//     CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
-//         biasDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, 
-//         1, output_features, 1, 1));
-    
-//     // 添加偏置到输出
-//     const float alpha_bias = 1.0f;
-//     const float beta_bias = 1.0f;  // 使用1.0f以便累加到现有输出
-    
-//     CUDNN_REPORT_IF_ERROR(cudnnAddTensor(
-//         cudnnHandle, &alpha_bias, biasDesc, bias_data, 
-//         &beta_bias, outputDesc, output_data));
-    
-//     // 清理描述符
-//     CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(outputDesc));
-//     CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(biasDesc));
-//   }
-  
-//   // 注意：不需要清理cuBLAS和cuDNN句柄，因为它们会被缓存以便重用
-// }
+extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuCudnnDestroy() {
+  mgpuCudnnDestroyHandle(nullptr);  // 销毁默认流的句柄
+}
 
+extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuCudnnSetStream(CUstream stream) {
+  // 此操作不再必要，因为每个流都有自己的句柄
+  // 为了兼容旧代码，我们确保存在一个与该流关联的句柄
+  mgpuCudnnGetHandle(stream);
+}
+
+// fp32
 // 支持transB的全连接层实现
 extern "C" MLIR_CUDA_WRAPPERS_EXPORT void
 mgpuCulibsFullyConnectedForward(
@@ -1246,93 +1173,6 @@ mgpuCulibsFullyConnectedForward(
   }
 }
 
-// // Fully connected layer implementation with flattening, using cuBLAS for matrix multiplication
-// extern "C" MLIR_CUDA_WRAPPERS_EXPORT void
-// mgpuCulibsFlattenFullyConnectedForward(
-//     int batch_size, int input_channels, int input_height, int input_width,  // Original NCHW dimensions
-//     int output_features,                                                    // Output features
-//     void* input_data, void* weight_data,                                   // Input and weight pointers
-//     void* bias_data,                                                       // Bias pointer (can be NULL)
-//     void* output_data,                                                     // Output pointer
-//     CUstream stream                                                        // CUDA stream
-// ) {
-//   // Ensure we're using the global context
-//   mgpuEnsureContext();
-  
-//   // Calculate the flattened features dimension
-//   int flattened_features = input_channels * input_height * input_width;
-  
-//   StreamHandles handles;
-//   if (!getHandlesForStream(stream, handles)) {
-//     return; // 错误信息已在getHandlesForStream中打印
-//   }
-//   cublasHandle_t handle = handles.cublas_handle;
-
-//   // Get cuBLAS handle for this stream
-//   // cublasHandle_t handle = mgpuCublasGetHandle(stream);
-  
-//   // Set matrix multiplication parameters
-//   // C = alpha * op(A) * op(B) + beta * C
-//   // For FC with flattening: output = input * weight^T + bias
-//   const float alpha = 1.0f;
-//   const float beta = 0.0f;
-  
-//   // Compute matrix multiplication: output = input * weight^T
-//   // cuBLAS uses column-major order, while our tensors are row-major
-//   // So we compute (output)^T = (weight)^T * (input)^T
-  
-//   // Use CUBLAS_OP_T to indicate that the weight matrix should be transposed
-//   CUBLAS_REPORT_IF_ERROR(cublasSgemm(
-//       handle,
-//       CUBLAS_OP_T,                    // op(B): transpose weight matrix
-//       CUBLAS_OP_N,                    // op(A): don't transpose input
-//       output_features,                // output features (m: B's rows)
-//       batch_size,                     // batch size (n: A's columns)
-//       flattened_features,             // flattened input features (k: A's rows, B's columns)
-//       &alpha,                         // alpha scalar
-//       (const float*)weight_data,      // B matrix (weights)
-//       flattened_features,             // B's leading dimension
-//       (const float*)input_data,       // A matrix (input)
-//       flattened_features,             // A's leading dimension
-//       &beta,                          // beta scalar
-//       (float*)output_data,            // C matrix (output)
-//       output_features                 // C's leading dimension
-//   ));
-  
-//   // Add bias if provided
-//   if (bias_data != nullptr) {
-//     // Get cuDNN handle
-//     // cudnnHandle_t cudnnHandle = mgpuCudnnGetHandle(stream);
-//     cudnnHandle_t cudnnHandle = handles.cudnn_handle;
-    
-//     // Create tensor descriptors
-//     cudnnTensorDescriptor_t outputDesc, biasDesc;
-//     CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&outputDesc));
-//     CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&biasDesc));
-    
-//     // Set output descriptor as a 4D tensor with H=W=1
-//     CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
-//         outputDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, 
-//         batch_size, output_features, 1, 1));
-    
-//     // Set bias descriptor as 1D vector (1xCx1x1)
-//     CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
-//         biasDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, 
-//         1, output_features, 1, 1));
-    
-//     // Add bias to output
-//     const float alpha_bias = 1.0f;
-//     const float beta_bias = 1.0f;  // Use 1.0f to add to existing output
-    
-//     CUDNN_REPORT_IF_ERROR(cudnnAddTensor(
-//         cudnnHandle, &alpha_bias, biasDesc, bias_data, 
-//         &beta_bias, outputDesc, output_data));
-    
-//     // Clean up descriptors
-//     CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(outputDesc));
-//     CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(biasDesc));
-//   }
-// }
 
 extern "C" MLIR_CUDA_WRAPPERS_EXPORT void
 mgpuCulibsFlattenFullyConnectedForward(
@@ -1415,7 +1255,7 @@ mgpuCulibsFlattenFullyConnectedForward(
   }
 }
 
-// 修改后的卷积函数，每个流使用独立的句柄
+// fp32 conv
 extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuCudnnConv2dForward(
     int n, int c, int h, int w_in,              // 输入尺寸
     int k, int r, int s,                         // 卷积核尺寸
@@ -1515,6 +1355,7 @@ extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuCudnnConv2dForward(
   cudnnConvolutionFwdAlgo_t algo = CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_GEMM; // 或其他适合你计算的预定义算法
   // cudnnConvolutionFwdAlgo_t algo = CUDNN_CONVOLUTION_FWD_ALGO_WINOGRAD;
   // cudnnConvolutionFwdAlgo_t algo = CUDNN_CONVOLUTION_FWD_ALGO_WINOGRAD_NONFUSED;
+  // cudnnConvolutionFwdAlgo_t algo = CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM;
 
 
   // 获取工作空间大小
@@ -1663,21 +1504,6 @@ mgpuCudnnMaxPoolForward(
   CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(inputDesc));
   CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(outputDesc));
   CUDNN_REPORT_IF_ERROR(cudnnDestroyPoolingDescriptor(poolDesc));
-}
-
-// 下面是兼容旧API的函数，使用新实现
-extern "C" MLIR_CUDA_WRAPPERS_EXPORT cudnnHandle_t mgpuCudnnCreate() {
-  return mgpuCudnnGetHandle(nullptr);  // 使用默认流
-}
-
-extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuCudnnDestroy() {
-  mgpuCudnnDestroyHandle(nullptr);  // 销毁默认流的句柄
-}
-
-extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuCudnnSetStream(CUstream stream) {
-  // 此操作不再必要，因为每个流都有自己的句柄
-  // 为了兼容旧代码，我们确保存在一个与该流关联的句柄
-  mgpuCudnnGetHandle(stream);
 }
 
 
@@ -1855,93 +1681,6 @@ mgpuCudnnSub(void* inputA, void* inputB, void* output,
   CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(cDesc));
   CUDNN_REPORT_IF_ERROR(cudnnDestroyOpTensorDescriptor(opDesc));
 }
-
-// 张量除法操作: C = A / B
-// 通过乘法实现: C = A * (1/B)
-// extern "C" MLIR_CUDA_WRAPPERS_EXPORT void 
-// mgpuCudnnDiv(void* inputA, void* inputB, void* output,
-//              int n, int c, int h, int w,
-//              CUstream stream) {
-//   ScopedContext scopedContext;
-  
-//   // 获取此流的cuDNN句柄
-//   cudnnHandle_t handle = mgpuCudnnGetHandle(stream);
-  
-//   // 创建张量描述符
-//   cudnnTensorDescriptor_t aDesc, bDesc, cDesc;
-//   CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&aDesc));
-//   CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&bDesc));
-//   CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&cDesc));
-  
-//   // 设置张量描述符
-//   CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
-//       aDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, n, c, h, w));
-//   CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
-//       bDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, n, c, h, w));
-//   CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
-//       cDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, n, c, h, w));
-  
-//   // 注意：cuDNN没有直接的除法操作，需要创建一个临时缓冲区来存储1/B
-//   // 分配临时缓冲区
-//   CUdeviceptr dTemp = 0;
-//   size_t size = n * c * h * w * sizeof(float);
-//   CUDA_REPORT_IF_ERROR(cuMemAlloc(&dTemp, size));
-//   void* temp = reinterpret_cast<void*>(dTemp);
-  
-//   // 设置临时描述符
-//   cudnnTensorDescriptor_t tempDesc;
-//   CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&tempDesc));
-//   CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
-//       tempDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, n, c, h, w));
-  
-//   // 使用自定义kernel计算1/B
-//   // 注意：cuDNN没有直接的倒数操作，所以需要使用一个自定义kernel
-//   // 这里假设我们有一个名为inverseTensorKernel的kernel函数
-//   // 实际应用中，您需要根据您的环境实现该函数
-  
-//   // 临时解决方案：使用标量除法
-//   // 创建一个全1张量，然后用常量除法
-//   float one = 1.0f;
-//   CUDA_REPORT_IF_ERROR(cuMemsetD32Async(dTemp, *(unsigned int*)&one, size/sizeof(float), stream));
-  
-//   // 创建倒数操作描述符
-//   cudnnOpTensorDescriptor_t divDesc;
-//   CUDNN_REPORT_IF_ERROR(cudnnCreateOpTensorDescriptor(&divDesc));
-//   CUDNN_REPORT_IF_ERROR(cudnnSetOpTensorDescriptor(
-//       divDesc, CUDNN_OP_TENSOR_DIV, CUDNN_DATA_FLOAT, CUDNN_NOT_PROPAGATE_NAN));
-  
-//   // 计算1/B
-//   float alpha1 = 1.0f;
-//   float alpha2 = 1.0f;
-//   float beta = 0.0f;
-//   CUDNN_REPORT_IF_ERROR(cudnnOpTensor(
-//       handle, divDesc,
-//       &alpha1, tempDesc, temp,  // 1.0
-//       &alpha2, bDesc, inputB,   // B
-//       &beta, tempDesc, temp));  // 结果存入temp (1.0/B)
-  
-//   // 创建乘法操作描述符
-//   cudnnOpTensorDescriptor_t mulDesc;
-//   CUDNN_REPORT_IF_ERROR(cudnnCreateOpTensorDescriptor(&mulDesc));
-//   CUDNN_REPORT_IF_ERROR(cudnnSetOpTensorDescriptor(
-//       mulDesc, CUDNN_OP_TENSOR_MUL, CUDNN_DATA_FLOAT, CUDNN_NOT_PROPAGATE_NAN));
-  
-//   // 执行操作: C = A * (1/B)
-//   CUDNN_REPORT_IF_ERROR(cudnnOpTensor(
-//       handle, mulDesc,
-//       &alpha1, aDesc, inputA,
-//       &alpha2, tempDesc, temp,
-//       &beta, cDesc, output));
-  
-//   // 清理描述符和临时内存
-//   CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(aDesc));
-//   CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(bDesc));
-//   CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(cDesc));
-//   CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(tempDesc));
-//   CUDNN_REPORT_IF_ERROR(cudnnDestroyOpTensorDescriptor(divDesc));
-//   CUDNN_REPORT_IF_ERROR(cudnnDestroyOpTensorDescriptor(mulDesc));
-//   CUDA_REPORT_IF_ERROR(cuMemFree(dTemp));
-// }
 
 // 张量取反操作: B = -A
 extern "C" MLIR_CUDA_WRAPPERS_EXPORT void 
@@ -2223,6 +1962,948 @@ mgpuCudnnRSubScalar(void* input, void* scalar, void* output,
   CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(scalarDesc));
   CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(outputDesc));
   CUDNN_REPORT_IF_ERROR(cudnnDestroyOpTensorDescriptor(opDesc));
+}
+
+// fp16
+// 张量乘法操作: C = A * B (FP16 + Tensor Core)
+extern "C" MLIR_CUDA_WRAPPERS_EXPORT void 
+mgpuCudnnMul_fp16(void* inputA, void* inputB, void* output,
+             int n, int c, int h, int w,
+             CUstream stream) {
+  mgpuEnsureContext();
+  
+  StreamHandles handles;
+  if (!getHandlesForStream(stream, handles)) {
+    return; // 错误信息已在getHandlesForStream中打印
+  }
+  cudnnHandle_t handle = handles.cudnn_handle;
+  
+  // 创建张量描述符
+  cudnnTensorDescriptor_t aDesc, bDesc, cDesc;
+  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&aDesc));
+  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&bDesc));
+  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&cDesc));
+  
+  // 设置张量描述符 - 修改为FP16
+  CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
+      aDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_HALF, n, c, h, w));
+  CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
+      bDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_HALF, n, c, h, w));
+  CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
+      cDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_HALF, n, c, h, w));
+  
+  // 创建操作描述符
+  cudnnOpTensorDescriptor_t opDesc;
+  CUDNN_REPORT_IF_ERROR(cudnnCreateOpTensorDescriptor(&opDesc));
+  
+  // 设置为乘法操作
+  CUDNN_REPORT_IF_ERROR(cudnnSetOpTensorDescriptor(
+      opDesc, CUDNN_OP_TENSOR_MUL, CUDNN_DATA_FLOAT, CUDNN_NOT_PROPAGATE_NAN));
+  
+  // 设置缩放因子 - 修改为FP16
+  const __half alpha1 = __float2half(1.0f);
+  const __half alpha2 = __float2half(1.0f);
+  const __half beta = __float2half(0.0f);
+  
+  // 执行操作: C = alpha1 * A * alpha2 * B + beta * C
+  CUDNN_REPORT_IF_ERROR(cudnnOpTensor(
+      handle, opDesc,
+      &alpha1, aDesc, inputA,
+      &alpha2, bDesc, inputB,
+      &beta, cDesc, output));
+  
+  // 清理描述符
+  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(aDesc));
+  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(bDesc));
+  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(cDesc));
+  CUDNN_REPORT_IF_ERROR(cudnnDestroyOpTensorDescriptor(opDesc));
+}
+
+// 张量加法操作: C = A + B (FP16 + Tensor Core)
+extern "C" MLIR_CUDA_WRAPPERS_EXPORT void 
+mgpuCudnnAdd_fp16(void* inputA, void* inputB, void* output,
+             int n, int c, int h, int w,
+             CUstream stream) {
+  mgpuEnsureContext();
+  
+  // 获取预创建的handle组
+  StreamHandles handles;
+  if (!getHandlesForStream(stream, handles)) {
+    return; // 错误信息已在getHandlesForStream中打印
+  }
+  
+  cudnnHandle_t handle = handles.cudnn_handle;
+  
+  // 创建张量描述符
+  cudnnTensorDescriptor_t aDesc, bDesc, cDesc;
+  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&aDesc));
+  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&bDesc));
+  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&cDesc));
+  
+  // 设置张量描述符 - 修改为FP16
+  CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
+      aDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_HALF, n, c, h, w));
+  CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
+      bDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_HALF, n, c, h, w));
+  CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
+      cDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_HALF, n, c, h, w));
+  
+  // 创建操作描述符
+  cudnnOpTensorDescriptor_t opDesc;
+  CUDNN_REPORT_IF_ERROR(cudnnCreateOpTensorDescriptor(&opDesc));
+  
+  // 设置为加法操作
+  CUDNN_REPORT_IF_ERROR(cudnnSetOpTensorDescriptor(
+      opDesc, CUDNN_OP_TENSOR_ADD, CUDNN_DATA_FLOAT, CUDNN_NOT_PROPAGATE_NAN));
+  
+  // 设置缩放因子 - 修改为FP16
+  const __half alpha1 = __float2half(1.0f);
+  const __half alpha2 = __float2half(1.0f);
+  const __half beta = __float2half(0.0f);
+  
+  // 执行操作: C = alpha1 * A + alpha2 * B + beta * C
+  CUDNN_REPORT_IF_ERROR(cudnnOpTensor(
+      handle, opDesc,
+      &alpha1, aDesc, inputA,
+      &alpha2, bDesc, inputB,
+      &beta, cDesc, output));
+  
+  // 清理描述符
+  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(aDesc));
+  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(bDesc));
+  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(cDesc));
+  CUDNN_REPORT_IF_ERROR(cudnnDestroyOpTensorDescriptor(opDesc));
+}
+
+extern "C" MLIR_CUDA_WRAPPERS_EXPORT void 
+mgpuCudnnSub_fp16(void* inputA, void* inputB, void* output,
+             int n, int c, int h, int w,
+             CUstream stream) {
+  mgpuEnsureContext();
+  
+  StreamHandles handles;
+  if (!getHandlesForStream(stream, handles)) {
+    return; // 错误信息已在getHandlesForStream中打印
+  }
+  cudnnHandle_t handle = handles.cudnn_handle;
+  
+  // 创建张量描述符
+  cudnnTensorDescriptor_t aDesc, bDesc, cDesc;
+  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&aDesc));
+  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&bDesc));
+  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&cDesc));
+  
+  // 设置张量描述符 - 修改为FP16
+  CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
+      aDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_HALF, n, c, h, w));
+  CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
+      bDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_HALF, n, c, h, w));
+  CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
+      cDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_HALF, n, c, h, w));
+  
+  // 创建操作描述符
+  cudnnOpTensorDescriptor_t opDesc;
+  CUDNN_REPORT_IF_ERROR(cudnnCreateOpTensorDescriptor(&opDesc));
+  
+  // 设置为加法操作
+  CUDNN_REPORT_IF_ERROR(cudnnSetOpTensorDescriptor(
+      opDesc, CUDNN_OP_TENSOR_ADD, CUDNN_DATA_FLOAT, CUDNN_NOT_PROPAGATE_NAN));
+  
+  // 设置缩放因子：alpha1 = 1.0 (A), alpha2 = -1.0 (-B) - 修改为FP16
+  const __half alpha1 = __float2half(1.0f);
+  const __half alpha2 = __float2half(-1.0f);  // 关键：使用负系数来实现减法
+  const __half beta = __float2half(0.0f);
+  
+  // 执行操作: C = alpha1 * A + alpha2 * B + beta * C
+  CUDNN_REPORT_IF_ERROR(cudnnOpTensor(
+      handle, opDesc,
+      &alpha1, aDesc, inputA,
+      &alpha2, bDesc, inputB,
+      &beta, cDesc, output));
+  
+  // 清理描述符
+  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(aDesc));
+  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(bDesc));
+  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(cDesc));
+  CUDNN_REPORT_IF_ERROR(cudnnDestroyOpTensorDescriptor(opDesc));
+}
+
+// 张量取反操作: B = -A (FP16 + Tensor Core)
+extern "C" MLIR_CUDA_WRAPPERS_EXPORT void 
+mgpuCudnnNeg_fp16(void* input, void* output,
+             int n, int c, int h, int w,
+             CUstream stream) {
+  mgpuEnsureContext();
+  
+  StreamHandles handles;
+  if (!getHandlesForStream(stream, handles)) {
+    return; // 错误信息已在getHandlesForStream中打印
+  }
+  cudnnHandle_t handle = handles.cudnn_handle;
+  
+  // 创建张量描述符
+  cudnnTensorDescriptor_t aDesc, cDesc;
+  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&aDesc));
+  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&cDesc));
+  
+  // 设置张量描述符 - 修改为FP16
+  CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
+      aDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_HALF, n, c, h, w));
+  CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
+      cDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_HALF, n, c, h, w));
+  
+  // 为第二个操作数创建一个虚拟张量描述符（实际不会使用）
+  cudnnTensorDescriptor_t dummyDesc;
+  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&dummyDesc));
+  CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
+      dummyDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_HALF, 1, 1, 1, 1));
+  
+  // 创建操作描述符
+  cudnnOpTensorDescriptor_t opDesc;
+  CUDNN_REPORT_IF_ERROR(cudnnCreateOpTensorDescriptor(&opDesc));
+  
+  // 使用加法操作实现取反: -A = -1.0 * A + 0 * dummy
+  CUDNN_REPORT_IF_ERROR(cudnnSetOpTensorDescriptor(
+      opDesc, CUDNN_OP_TENSOR_ADD, CUDNN_DATA_FLOAT, CUDNN_NOT_PROPAGATE_NAN));
+  
+  // 设置缩放因子，alpha1 = -1.0表示将输入值取反 - 修改为FP16
+  const __half alpha1 = __float2half(-1.0f);
+  const __half alpha2 = __float2half(0.0f);
+  const __half beta = __float2half(0.0f);
+  
+  // 创建一个虚拟输入
+  __half dummyValue = __float2half(0.0f);
+  
+  // 执行操作: B = -1.0 * A + 0.0 * dummy + 0.0 * B
+  CUDNN_REPORT_IF_ERROR(cudnnOpTensor(
+      handle, opDesc,
+      &alpha1, aDesc, input,
+      &alpha2, dummyDesc, &dummyValue,
+      &beta, cDesc, output));
+  
+  // 清理描述符
+  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(aDesc));
+  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(cDesc));
+  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(dummyDesc));
+  CUDNN_REPORT_IF_ERROR(cudnnDestroyOpTensorDescriptor(opDesc));
+}
+
+// 标量乘法操作: C = A * scalar (FP16 + Tensor Core)
+extern "C" MLIR_CUDA_WRAPPERS_EXPORT void 
+mgpuCudnnMulScalar_fp16(void* input, void* scalar, void* output,
+                  int n, int c, int h, int w,
+                  CUstream stream) {
+  mgpuEnsureContext();
+  
+  StreamHandles handles;
+  if (!getHandlesForStream(stream, handles)) {
+    return; // 错误信息已在getHandlesForStream中打印
+  }
+  cudnnHandle_t handle = handles.cudnn_handle;
+  
+  // 创建张量描述符
+  cudnnTensorDescriptor_t inputDesc, scalarDesc, outputDesc;
+  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&inputDesc));
+  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&scalarDesc));
+  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&outputDesc));
+  
+  // 设置张量描述符 - 修改为FP16
+  CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
+      inputDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_HALF, n, c, h, w));
+  CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
+      scalarDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_HALF, 1, 1, 1, 1));
+  CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
+      outputDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_HALF, n, c, h, w));
+  
+  // 创建操作描述符
+  cudnnOpTensorDescriptor_t opDesc;
+  CUDNN_REPORT_IF_ERROR(cudnnCreateOpTensorDescriptor(&opDesc));
+  
+  // 设置为乘法操作
+  CUDNN_REPORT_IF_ERROR(cudnnSetOpTensorDescriptor(
+      opDesc, CUDNN_OP_TENSOR_MUL, CUDNN_DATA_FLOAT, CUDNN_NOT_PROPAGATE_NAN));
+  
+  // 设置缩放因子 - 修改为FP16
+  const __half alpha1 = __float2half(1.0f);  // input的系数
+  const __half alpha2 = __float2half(1.0f);  // scalar的系数
+  const __half beta = __float2half(0.0f);    // output的系数
+  
+  // 执行操作: output = alpha1 * input * alpha2 * scalar + beta * output
+  CUDNN_REPORT_IF_ERROR(cudnnOpTensor(
+      handle, opDesc,
+      &alpha1, inputDesc, input,
+      &alpha2, scalarDesc, scalar,
+      &beta, outputDesc, output));
+  
+  // 清理描述符
+  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(inputDesc));
+  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(scalarDesc));
+  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(outputDesc));
+  CUDNN_REPORT_IF_ERROR(cudnnDestroyOpTensorDescriptor(opDesc));
+}
+
+// 标量加法操作: C = A + scalar (FP16 + Tensor Core)
+extern "C" MLIR_CUDA_WRAPPERS_EXPORT void 
+mgpuCudnnAddScalar_fp16(void* input, void* scalar, void* output,
+                  int n, int c, int h, int w,
+                  CUstream stream) {
+  mgpuEnsureContext();
+  
+  StreamHandles handles;
+  if (!getHandlesForStream(stream, handles)) {
+    return; // 错误信息已在getHandlesForStream中打印
+  }
+  cudnnHandle_t handle = handles.cudnn_handle;
+  
+  // 创建张量描述符
+  cudnnTensorDescriptor_t inputDesc, scalarDesc, outputDesc;
+  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&inputDesc));
+  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&scalarDesc));
+  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&outputDesc));
+  
+  // 设置张量描述符 - 修改为FP16
+  CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
+      inputDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_HALF, n, c, h, w));
+  CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
+      scalarDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_HALF, 1, 1, 1, 1));
+  CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
+      outputDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_HALF, n, c, h, w));
+  
+  // 创建操作描述符
+  cudnnOpTensorDescriptor_t opDesc;
+  CUDNN_REPORT_IF_ERROR(cudnnCreateOpTensorDescriptor(&opDesc));
+  
+  // 设置为加法操作
+  CUDNN_REPORT_IF_ERROR(cudnnSetOpTensorDescriptor(
+      opDesc, CUDNN_OP_TENSOR_ADD, CUDNN_DATA_FLOAT, CUDNN_NOT_PROPAGATE_NAN));
+  
+  // 设置缩放因子 - 修改为FP16
+  const __half alpha1 = __float2half(1.0f);  // input的系数
+  const __half alpha2 = __float2half(1.0f);  // scalar的系数  
+  const __half beta = __float2half(0.0f);    // output的系数
+  
+  // 执行操作: output = alpha1 * input + alpha2 * scalar + beta * output
+  CUDNN_REPORT_IF_ERROR(cudnnOpTensor(
+      handle, opDesc,
+      &alpha1, inputDesc, input,
+      &alpha2, scalarDesc, scalar,
+      &beta, outputDesc, output));
+  
+  // 清理描述符
+  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(inputDesc));
+  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(scalarDesc));
+  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(outputDesc));
+  CUDNN_REPORT_IF_ERROR(cudnnDestroyOpTensorDescriptor(opDesc));
+}
+
+// 标量减法操作: C = A - scalar (FP16 + Tensor Core)
+extern "C" MLIR_CUDA_WRAPPERS_EXPORT void 
+mgpuCudnnSubScalar_fp16(void* input, void* scalar, void* output,
+                  int n, int c, int h, int w,
+                  CUstream stream) {
+  mgpuEnsureContext();
+  
+  StreamHandles handles;
+  if (!getHandlesForStream(stream, handles)) {
+    return; // 错误信息已在getHandlesForStream中打印
+  }
+  cudnnHandle_t handle = handles.cudnn_handle;
+  
+  // 创建张量描述符
+  cudnnTensorDescriptor_t inputDesc, scalarDesc, outputDesc;
+  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&inputDesc));
+  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&scalarDesc));
+  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&outputDesc));
+  
+  // 设置张量描述符 - 修改为FP16
+  CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
+      inputDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_HALF, n, c, h, w));
+  CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
+      scalarDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_HALF, 1, 1, 1, 1));
+  CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
+      outputDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_HALF, n, c, h, w));
+  
+  // 创建操作描述符
+  cudnnOpTensorDescriptor_t opDesc;
+  CUDNN_REPORT_IF_ERROR(cudnnCreateOpTensorDescriptor(&opDesc));
+  
+  // 设置为加法操作 (通过负系数实现减法)
+  CUDNN_REPORT_IF_ERROR(cudnnSetOpTensorDescriptor(
+      opDesc, CUDNN_OP_TENSOR_ADD, CUDNN_DATA_FLOAT, CUDNN_NOT_PROPAGATE_NAN));
+  
+  // 设置缩放因子 - 修改为FP16
+  const __half alpha1 = __float2half(1.0f);   // input的系数
+  const __half alpha2 = __float2half(-1.0f);  // scalar的系数 (负数实现减法)
+  const __half beta = __float2half(0.0f);     // output的系数
+  
+  // 执行操作: output = alpha1 * input + alpha2 * scalar + beta * output
+  // 即: output = input + (-1) * scalar = input - scalar
+  CUDNN_REPORT_IF_ERROR(cudnnOpTensor(
+      handle, opDesc,
+      &alpha1, inputDesc, input,
+      &alpha2, scalarDesc, scalar,
+      &beta, outputDesc, output));
+  
+  // 清理描述符
+  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(inputDesc));
+  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(scalarDesc));
+  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(outputDesc));
+  CUDNN_REPORT_IF_ERROR(cudnnDestroyOpTensorDescriptor(opDesc));
+}
+
+// 反向标量减法操作: C = scalar - A (FP16 + Tensor Core)
+extern "C" MLIR_CUDA_WRAPPERS_EXPORT void 
+mgpuCudnnRSubScalar_fp16(void* input, void* scalar, void* output,
+                   int n, int c, int h, int w,
+                   CUstream stream) {
+  mgpuEnsureContext();
+  
+  StreamHandles handles;
+  if (!getHandlesForStream(stream, handles)) {
+    return; // 错误信息已在getHandlesForStream中打印
+  }
+  cudnnHandle_t handle = handles.cudnn_handle;
+  
+  // 创建张量描述符
+  cudnnTensorDescriptor_t inputDesc, scalarDesc, outputDesc;
+  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&inputDesc));
+  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&scalarDesc));
+  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&outputDesc));
+  
+  // 设置张量描述符 - 修改为FP16
+  CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
+      inputDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_HALF, n, c, h, w));
+  CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
+      scalarDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_HALF, 1, 1, 1, 1));
+  CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
+      outputDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_HALF, n, c, h, w));
+  
+  // 创建操作描述符
+  cudnnOpTensorDescriptor_t opDesc;
+  CUDNN_REPORT_IF_ERROR(cudnnCreateOpTensorDescriptor(&opDesc));
+  
+  // 设置为加法操作 (通过负系数实现反向减法)
+  CUDNN_REPORT_IF_ERROR(cudnnSetOpTensorDescriptor(
+      opDesc, CUDNN_OP_TENSOR_ADD, CUDNN_DATA_FLOAT, CUDNN_NOT_PROPAGATE_NAN));
+  
+  // 设置缩放因子 - 修改为FP16
+  const __half alpha1 = __float2half(-1.0f);  // input的系数 (负数)
+  const __half alpha2 = __float2half(1.0f);   // scalar的系数
+  const __half beta = __float2half(0.0f);     // output的系数
+  
+  // 执行操作: output = alpha1 * input + alpha2 * scalar + beta * output
+  // 即: output = (-1) * input + scalar = scalar - input
+  CUDNN_REPORT_IF_ERROR(cudnnOpTensor(
+      handle, opDesc,
+      &alpha1, inputDesc, input,
+      &alpha2, scalarDesc, scalar,
+      &beta, outputDesc, output));
+  
+  // 清理描述符
+  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(inputDesc));
+  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(scalarDesc));
+  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(outputDesc));
+  CUDNN_REPORT_IF_ERROR(cudnnDestroyOpTensorDescriptor(opDesc));
+}
+
+// MaxPool implementation using cuDNN (FP16 + Tensor Core)
+extern "C" MLIR_CUDA_WRAPPERS_EXPORT void
+mgpuCudnnMaxPoolForward_fp16(
+    int n, int c, int h, int w,           // 输入维度 (NCHW)
+    int kernel_h, int kernel_w,           // 核维度
+    int pad_h_begin, int pad_w_begin,     // 填充 (开始)
+    int pad_h_end, int pad_w_end,         // 填充 (结束)
+    int stride_h, int stride_w,           // 步长
+    int dilation_h, int dilation_w,       // 膨胀
+    void* input_data,                     // 输入张量
+    void* output_data,                    // 输出张量
+    CUstream stream                       // CUDA流
+) {
+  // 确保使用全局上下文
+  mgpuEnsureContext();
+  
+  StreamHandles handles;
+  if (!getHandlesForStream(stream, handles)) {
+    return; // 错误信息已在getHandlesForStream中打印
+  }
+  cudnnHandle_t handle = handles.cudnn_handle;
+  
+  // 创建描述符
+  cudnnTensorDescriptor_t inputDesc, outputDesc;
+  cudnnPoolingDescriptor_t poolDesc;
+  
+  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&inputDesc));
+  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&outputDesc));
+  CUDNN_REPORT_IF_ERROR(cudnnCreatePoolingDescriptor(&poolDesc));
+  
+  // 设置输入描述符 - 修改为FP16
+  CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
+      inputDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_HALF, n, c, h, w));
+  
+  // 检查是否为非对称填充
+  bool asymmetricPadding = (pad_h_begin != pad_h_end) || (pad_w_begin != pad_w_end);
+  
+  if (asymmetricPadding) {
+    // 对于非对称填充，使用最大填充值
+    fprintf(stderr, "Warning: Asymmetric padding in MaxPool (%d,%d,%d,%d) may not produce exact results\n",
+            pad_h_begin, pad_w_begin, pad_h_end, pad_w_end);
+  }
+  
+  // cuDNN的pooling API要求对称填充，因此我们使用最大值
+  int pad_h = std::max(pad_h_begin, pad_h_end);
+  int pad_w = std::max(pad_w_begin, pad_w_end);
+  
+  // 设置池化描述符
+  CUDNN_REPORT_IF_ERROR(cudnnSetPooling2dDescriptor(
+      poolDesc, CUDNN_POOLING_MAX, CUDNN_NOT_PROPAGATE_NAN,
+      kernel_h, kernel_w, pad_h, pad_w, stride_h, stride_w));
+  
+  // 计算输出维度
+  int out_n, out_c, out_h, out_w;
+  CUDNN_REPORT_IF_ERROR(cudnnGetPooling2dForwardOutputDim(
+      poolDesc, inputDesc, &out_n, &out_c, &out_h, &out_w));
+  
+  // 设置输出描述符 - 修改为FP16
+  CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
+      outputDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_HALF, out_n, out_c, out_h, out_w));
+  
+  // 执行最大池化 - 修改为FP16
+  const __half alpha = __float2half(1.0f);
+  const __half beta = __float2half(0.0f);
+  CUDNN_REPORT_IF_ERROR(cudnnPoolingForward(
+      handle, poolDesc, &alpha, inputDesc, input_data, &beta, outputDesc, output_data));
+  
+  // 清理描述符
+  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(inputDesc));
+  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(outputDesc));
+  CUDNN_REPORT_IF_ERROR(cudnnDestroyPoolingDescriptor(poolDesc));
+}
+
+// 支持transB的全连接层实现 (FP16 + Tensor Core)
+extern "C" MLIR_CUDA_WRAPPERS_EXPORT void
+mgpuCulibsFullyConnectedForward_fp16(
+    int batch_size, int input_features,   // 输入维度
+    int output_features,                  // 输出特征数
+    int transB,                          // 是否转置权重矩阵B (0=false, 1=true)
+    void* input_data, void* weight_data,  // 输入和权重指针
+    void* bias_data,                      // 偏置指针（可为NULL）
+    void* output_data,                    // 输出指针
+    CUstream stream                       // CUDA流
+) {
+  // 确保使用全局上下文
+  mgpuEnsureContext();
+  
+  StreamHandles handles;
+  if (!getHandlesForStream(stream, handles)) {
+    return; // 错误信息已在getHandlesForStream中打印
+  }
+  cublasHandle_t handle = handles.cublas_handle;
+
+  // 启用Tensor Core支持
+  CUBLAS_REPORT_IF_ERROR(cublasSetMathMode(handle, CUBLAS_TENSOR_OP_MATH));
+  
+  // 设置矩阵乘法参数 - 修改为FP16
+  const __half alpha = __float2half(1.0f);
+  const __half beta = __float2half(0.0f);
+  
+  // 根据transB标志决定cuBLAS操作
+  cublasOperation_t weight_op = CUBLAS_OP_T;
+  
+  // 使用FP16版本的cuBLAS API
+  CUBLAS_REPORT_IF_ERROR(cublasHgemm(
+      handle,
+      weight_op,                     // op(B)：根据transB决定是否转置权重
+      CUBLAS_OP_N,                   // op(A)：输入矩阵不转置
+      output_features,               // m：输出特征数
+      batch_size,                    // n：批量大小
+      input_features,                // k：输入特征数
+      &alpha,                        // alpha系数
+      (const __half*)weight_data,    // B矩阵（权重）
+      input_features,                // B的leading dimension
+      (const __half*)input_data,     // A矩阵（输入）
+      input_features,                // A的leading dimension
+      &beta,                         // beta系数
+      (__half*)output_data,          // C矩阵（输出）
+      output_features                // C的leading dimension
+  ));
+  
+  // 如果提供了偏置，使用cuDNN的AddTensor添加偏置
+  if (bias_data != nullptr) {
+    cudnnHandle_t cudnnHandle = handles.cudnn_handle;
+    
+    // 创建张量描述符
+    cudnnTensorDescriptor_t outputDesc, biasDesc;
+    CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&outputDesc));
+    CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&biasDesc));
+    
+    // 设置输出描述符 - 修改为FP16
+    CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
+        outputDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_HALF, 
+        batch_size, output_features, 1, 1));
+    
+    // 设置偏置描述符 - 修改为FP16
+    CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
+        biasDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_HALF, 
+        1, output_features, 1, 1));
+    
+    // 添加偏置到输出 - 修改为FP16
+    const __half alpha_bias = __float2half(1.0f);
+    const __half beta_bias = __float2half(1.0f);
+    
+    CUDNN_REPORT_IF_ERROR(cudnnAddTensor(
+        cudnnHandle, &alpha_bias, biasDesc, bias_data, 
+        &beta_bias, outputDesc, output_data));
+    
+    // 清理描述符
+    CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(outputDesc));
+    CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(biasDesc));
+  }
+}
+
+extern "C" MLIR_CUDA_WRAPPERS_EXPORT void
+mgpuCulibsFlattenFullyConnectedForward_fp16(
+    int batch_size, int input_channels, int input_height, int input_width,  // Original NCHW dimensions
+    int output_features,                                                    // Output features
+    int transB,                                                            // 是否转置权重矩阵B
+    void* input_data, void* weight_data,                                   // Input and weight pointers
+    void* bias_data,                                                       // Bias pointer (can be NULL)
+    void* output_data,                                                     // Output pointer
+    CUstream stream                                                        // CUDA stream
+) {
+  // Ensure we're using the global context
+  mgpuEnsureContext();
+  
+  // Calculate the flattened features dimension
+  int flattened_features = input_channels * input_height * input_width;
+  
+  StreamHandles handles;
+  if (!getHandlesForStream(stream, handles)) {
+    return; // 错误信息已在getHandlesForStream中打印
+  }
+  cublasHandle_t handle = handles.cublas_handle;
+
+  // 启用Tensor Core支持
+  CUBLAS_REPORT_IF_ERROR(cublasSetMathMode(handle, CUBLAS_TENSOR_OP_MATH));
+
+  // Set matrix multiplication parameters - 修改为FP16
+  const __half alpha = __float2half(1.0f);
+  const __half beta = __float2half(0.0f);
+  
+  // 根据transB标志决定cuBLAS操作
+  cublasOperation_t weight_op = CUBLAS_OP_T;
+  
+  // Compute matrix multiplication with optional transpose - 使用FP16版本的cuBLAS API
+  CUBLAS_REPORT_IF_ERROR(cublasHgemm(
+      handle,
+      weight_op,                      // op(B): transpose weight matrix if transB=1
+      CUBLAS_OP_N,                    // op(A): don't transpose input
+      output_features,                // output features (m: B's rows)
+      batch_size,                     // batch size (n: A's columns)
+      flattened_features,             // flattened input features (k: A's rows, B's columns)
+      &alpha,                         // alpha scalar
+      (const __half*)weight_data,     // B matrix (weights)
+      flattened_features,             // B's leading dimension
+      (const __half*)input_data,      // A matrix (input)
+      flattened_features,             // A's leading dimension
+      &beta,                          // beta scalar
+      (__half*)output_data,           // C matrix (output)
+      output_features                 // C's leading dimension
+  ));
+  
+  // Add bias if provided
+  if (bias_data != nullptr) {
+    cudnnHandle_t cudnnHandle = handles.cudnn_handle;
+    
+    // Create tensor descriptors
+    cudnnTensorDescriptor_t outputDesc, biasDesc;
+    CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&outputDesc));
+    CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&biasDesc));
+    
+    // Set output descriptor as a 4D tensor with H=W=1 - 修改为FP16
+    CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
+        outputDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_HALF, 
+        batch_size, output_features, 1, 1));
+    
+    // Set bias descriptor as 1D vector (1xCx1x1) - 修改为FP16
+    CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
+        biasDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_HALF, 
+        1, output_features, 1, 1));
+    
+    // Add bias to output - 修改为FP16
+    const __half alpha_bias = __float2half(1.0f);
+    const __half beta_bias = __float2half(1.0f);  // Use 1.0f to add to existing output
+    
+    CUDNN_REPORT_IF_ERROR(cudnnAddTensor(
+        cudnnHandle, &alpha_bias, biasDesc, bias_data, 
+        &beta_bias, outputDesc, output_data));
+    
+    // Clean up descriptors
+    CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(outputDesc));
+    CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(biasDesc));
+  }
+}
+
+// // fp16 conv
+// extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuCudnnConv2dForward_fp16(
+//     int n, int c, int h, int w_in,              // 输入尺寸
+//     int k, int r, int s,                         // 卷积核尺寸
+//     int pad_h, int pad_w,                        // 填充
+//     int stride_h, int stride_w,                  // 步长
+//     int dilation_h, int dilation_w,              // 膨胀
+//     void* x_data, void* w_data, void* bias_data, // 输入、权重和偏置指针
+//     void* y_data,                               // 输出指针
+//     CUstream stream                             // CUDA流
+//     //bool createContext = true
+// ) {
+//   // 确保使用全局上下文
+//   mgpuEnsureContext();
+
+//   // 获取预创建的handle组
+//   StreamHandles handles;
+//   if (!getHandlesForStream(stream, handles)) {
+//     return; // 错误信息已在getHandlesForStream中打印
+//   }
+//   cudnnHandle_t handle = handles.cudnn_handle;
+  
+//   // 创建描述符
+//   cudnnTensorDescriptor_t xDesc, yDesc, biasDesc;
+//   cudnnFilterDescriptor_t wDesc;
+//   cudnnConvolutionDescriptor_t convDesc;
+  
+//   CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&xDesc));
+//   CUDNN_REPORT_IF_ERROR(cudnnCreateFilterDescriptor(&wDesc));
+//   CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&yDesc));
+//   CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&biasDesc));
+//   CUDNN_REPORT_IF_ERROR(cudnnCreateConvolutionDescriptor(&convDesc));
+  
+//   // 设置输入描述符 - 修改为FP16
+//   CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
+//       xDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_HALF, n, c, h, w_in));
+  
+//   // 设置权重描述符 - 修改为FP16
+//   CUDNN_REPORT_IF_ERROR(cudnnSetFilter4dDescriptor(
+//       wDesc, CUDNN_DATA_HALF, CUDNN_TENSOR_NCHW, k, c, r, s));
+  
+//   // 设置卷积描述符 - 修改为FP16
+//   CUDNN_REPORT_IF_ERROR(cudnnSetConvolution2dDescriptor(
+//       convDesc, pad_h, pad_w, stride_h, stride_w, dilation_h, dilation_w,
+//       CUDNN_CROSS_CORRELATION, CUDNN_DATA_HALF));
+  
+//   // 启用Tensor Core支持（保持原有设置）
+//   CUDNN_REPORT_IF_ERROR(cudnnSetConvolutionMathType(convDesc, CUDNN_TENSOR_OP_MATH_ALLOW_CONVERSION));
+
+//   // 获取输出尺寸
+//   int out_n, out_c, out_h, out_w;
+//   CUDNN_REPORT_IF_ERROR(cudnnGetConvolution2dForwardOutputDim(
+//       convDesc, xDesc, wDesc, &out_n, &out_c, &out_h, &out_w));
+  
+//   // 设置输出描述符 - 修改为FP16
+//   CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
+//       yDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_HALF, out_n, out_c, out_h, out_w));
+  
+//   // 设置偏置描述符(1xCx1x1) - 修改为FP16
+//   CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
+//       biasDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_HALF, 1, k, 1, 1));
+  
+//   // 自动选择最佳算法
+//   int requestedAlgoCount = 10;
+//   int returnedAlgoCount;
+//   cudnnConvolutionFwdAlgoPerf_t perfResults[10];
+//   CUDNN_REPORT_IF_ERROR(cudnnGetConvolutionForwardAlgorithm_v7(
+//       handle, xDesc, wDesc, convDesc, yDesc,
+//       requestedAlgoCount, &returnedAlgoCount, perfResults));
+  
+//   // 选择最快的且可用的算法
+//   cudnnConvolutionFwdAlgo_t algo = perfResults[0].algo;
+  
+//   // cudnnConvolutionFwdAlgo_t algo = CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_GEMM; // 或其他适合你计算的预定义算法
+//   // cudnnConvolutionFwdAlgo_t algo = CUDNN_CONVOLUTION_FWD_ALGO_WINOGRAD;
+//   // cudnnConvolutionFwdAlgo_t algo = CUDNN_CONVOLUTION_FWD_ALGO_WINOGRAD_NONFUSED;
+//   // cudnnConvolutionFwdAlgo_t algo = CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM;
+
+//   // 获取工作空间大小
+//   size_t workspaceSize = 0;
+//   CUDNN_REPORT_IF_ERROR(cudnnGetConvolutionForwardWorkspaceSize(
+//       handle, xDesc, wDesc, convDesc, yDesc, algo, &workspaceSize));
+  
+//   // 分配工作空间
+//   void* workspace = nullptr;
+//   if (workspaceSize > 0) {
+//     CUdeviceptr wsPtr = 0;
+//     CUDA_REPORT_IF_ERROR(cuMemAlloc(&wsPtr, workspaceSize));
+//     workspace = reinterpret_cast<void*>(wsPtr);
+//   }
+
+//   // 执行卷积 - 修改alpha/beta为FP16类型
+//   const __half alpha = __float2half(1.0f);
+//   const __half beta = __float2half(0.0f);
+
+//   cudnnStatus_t status = cudnnConvolutionForward(
+//   handle, &alpha, xDesc, x_data, wDesc, w_data, convDesc, algo,
+//   workspace, workspaceSize, &beta, yDesc, y_data);
+
+//   // 报告错误（如果有）
+//   CUDNN_REPORT_IF_ERROR(status);
+
+//   // 添加偏置(如果提供) - 修改alpha/beta为FP16类型
+//   if (bias_data != nullptr) {
+//     const __half alpha_bias = __float2half(1.0f);
+//     const __half beta_bias = __float2half(1.0f);
+//     CUDNN_REPORT_IF_ERROR(cudnnAddTensor(
+//         handle, &alpha_bias, biasDesc, bias_data, &beta_bias, yDesc, y_data));
+//   }
+  
+//   // 释放工作空间
+//   if (workspace != nullptr) {
+//     CUDA_REPORT_IF_ERROR(cuMemFree(reinterpret_cast<CUdeviceptr>(workspace)));
+//   }
+  
+//   // 清理描述符
+//   CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(xDesc));
+//   CUDNN_REPORT_IF_ERROR(cudnnDestroyFilterDescriptor(wDesc));
+//   CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(yDesc));
+//   CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(biasDesc));
+//   CUDNN_REPORT_IF_ERROR(cudnnDestroyConvolutionDescriptor(convDesc));
+// }
+
+// 简单的全局算法缓存
+static cudnnConvolutionFwdAlgo_t g_cached_algo = CUDNN_CONVOLUTION_FWD_ALGO_COUNT; // 无效值表示未初始化
+static bool g_algo_cached = false;
+
+// fp16 conv
+extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuCudnnConv2dForward_fp16(
+    int n, int c, int h, int w_in,              // 输入尺寸
+    int k, int r, int s,                         // 卷积核尺寸
+    int pad_h, int pad_w,                        // 填充
+    int stride_h, int stride_w,                  // 步长
+    int dilation_h, int dilation_w,              // 膨胀
+    void* x_data, void* w_data, void* bias_data, // 输入、权重和偏置指针
+    void* y_data,                               // 输出指针
+    CUstream stream                             // CUDA流
+) {
+    // 确保使用全局上下文
+    mgpuEnsureContext();
+
+    // 获取预创建的handle组
+    StreamHandles handles;
+    if (!getHandlesForStream(stream, handles)) {
+        return; // 错误信息已在getHandlesForStream中打印
+    }
+    cudnnHandle_t handle = handles.cudnn_handle;
+    
+    // 获取算法（如果已缓存则直接使用，否则搜索并缓存）
+    cudnnConvolutionFwdAlgo_t algo;
+    bool need_search = !g_algo_cached;
+    
+    if (!need_search) {
+        algo = g_cached_algo;
+    }
+    
+    // 创建描述符
+    cudnnTensorDescriptor_t xDesc, yDesc, biasDesc;
+    cudnnFilterDescriptor_t wDesc;
+    cudnnConvolutionDescriptor_t convDesc;
+    
+    CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&xDesc));
+    CUDNN_REPORT_IF_ERROR(cudnnCreateFilterDescriptor(&wDesc));
+    CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&yDesc));
+    CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&biasDesc));
+    CUDNN_REPORT_IF_ERROR(cudnnCreateConvolutionDescriptor(&convDesc));
+    
+    // 设置输入描述符 - 修改为FP16
+    CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
+        xDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_HALF, n, c, h, w_in));
+    
+    // 设置权重描述符 - 修改为FP16
+    CUDNN_REPORT_IF_ERROR(cudnnSetFilter4dDescriptor(
+        wDesc, CUDNN_DATA_HALF, CUDNN_TENSOR_NCHW, k, c, r, s));
+    
+    // 设置卷积描述符 - 修改为FP16
+    CUDNN_REPORT_IF_ERROR(cudnnSetConvolution2dDescriptor(
+        convDesc, pad_h, pad_w, stride_h, stride_w, dilation_h, dilation_w,
+        CUDNN_CROSS_CORRELATION, CUDNN_DATA_HALF));
+    
+    // 启用Tensor Core支持（保持原有设置）
+    CUDNN_REPORT_IF_ERROR(cudnnSetConvolutionMathType(convDesc, CUDNN_TENSOR_OP_MATH_ALLOW_CONVERSION));
+
+    // 获取输出尺寸
+    int out_n, out_c, out_h, out_w;
+    CUDNN_REPORT_IF_ERROR(cudnnGetConvolution2dForwardOutputDim(
+        convDesc, xDesc, wDesc, &out_n, &out_c, &out_h, &out_w));
+    
+    // 设置输出描述符 - 修改为FP16
+    CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
+        yDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_HALF, out_n, out_c, out_h, out_w));
+    
+    // 设置偏置描述符(1xCx1x1) - 修改为FP16
+    CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
+        biasDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_HALF, 1, k, 1, 1));
+    
+    // 如果需要搜索算法
+    if (need_search) {
+        // 自动选择最佳算法
+        int requestedAlgoCount = 10;
+        int returnedAlgoCount;
+        cudnnConvolutionFwdAlgoPerf_t perfResults[10];
+        CUDNN_REPORT_IF_ERROR(cudnnGetConvolutionForwardAlgorithm_v7(
+            handle, xDesc, wDesc, convDesc, yDesc,
+            requestedAlgoCount, &returnedAlgoCount, perfResults));
+        
+        // 选择最快的且可用的算法
+        algo = perfResults[0].algo;
+        
+        // 缓存算法供后续使用
+        if (!g_algo_cached) {
+            g_cached_algo = algo;
+            g_algo_cached = true;
+            // 可选：打印日志
+            // printf("Cached conv algorithm: %d\n", static_cast<int>(algo));
+        }
+    }
+    
+    // 获取工作空间大小
+    size_t workspaceSize = 0;
+    CUDNN_REPORT_IF_ERROR(cudnnGetConvolutionForwardWorkspaceSize(
+        handle, xDesc, wDesc, convDesc, yDesc, algo, &workspaceSize));
+    
+    // 分配工作空间
+    void* workspace = nullptr;
+    if (workspaceSize > 0) {
+        CUdeviceptr wsPtr = 0;
+        CUDA_REPORT_IF_ERROR(cuMemAlloc(&wsPtr, workspaceSize));
+        workspace = reinterpret_cast<void*>(wsPtr);
+    }
+
+    // 执行卷积 - 修改alpha/beta为FP16类型
+    const __half alpha = __float2half(1.0f);
+    const __half beta = __float2half(0.0f);
+
+    cudnnStatus_t status = cudnnConvolutionForward(
+        handle, &alpha, xDesc, x_data, wDesc, w_data, convDesc, algo,
+        workspace, workspaceSize, &beta, yDesc, y_data);
+
+    // 报告错误（如果有）
+    CUDNN_REPORT_IF_ERROR(status);
+
+    // 添加偏置(如果提供) - 修改alpha/beta为FP16类型
+    if (bias_data != nullptr) {
+        const __half alpha_bias = __float2half(1.0f);
+        const __half beta_bias = __float2half(1.0f);
+        CUDNN_REPORT_IF_ERROR(cudnnAddTensor(
+            handle, &alpha_bias, biasDesc, bias_data, &beta_bias, yDesc, y_data));
+    }
+    
+    // 释放工作空间
+    if (workspace != nullptr) {
+        CUDA_REPORT_IF_ERROR(cuMemFree(reinterpret_cast<CUdeviceptr>(workspace)));
+    }
+    
+    // 清理描述符
+    CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(xDesc));
+    CUDNN_REPORT_IF_ERROR(cudnnDestroyFilterDescriptor(wDesc));
+    CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(yDesc));
+    CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(biasDesc));
+    CUDNN_REPORT_IF_ERROR(cudnnDestroyConvolutionDescriptor(convDesc));
 }
 
 // 操作类型定义
