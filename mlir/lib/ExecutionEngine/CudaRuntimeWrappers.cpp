@@ -1090,6 +1090,892 @@ extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuCudnnSetStream(CUstream stream) {
   mgpuCudnnGetHandle(stream);
 }
 
+
+//===----------------------------------------------------------------------===//
+// 描述符池数据结构定义
+//===----------------------------------------------------------------------===//
+
+// 通用描述符池模板
+template<typename DescriptorType>
+struct DescriptorPool {
+  std::queue<DescriptorType> available_descriptors;
+  std::unordered_set<DescriptorType> active_descriptors;  // 追踪正在使用的描述符
+  std::mutex mutex;
+  std::atomic<int> total_created{0};
+  
+  DescriptorPool() = default;
+  DescriptorPool(const DescriptorPool&) = delete;
+  DescriptorPool& operator=(const DescriptorPool&) = delete;
+};
+
+// 各种描述符池的全局实例
+static DescriptorPool<cudnnTensorDescriptor_t> g_tensor_desc_pool;
+static DescriptorPool<cudnnFilterDescriptor_t> g_filter_desc_pool;
+static DescriptorPool<cudnnConvolutionDescriptor_t> g_conv_desc_pool;
+static DescriptorPool<cudnnPoolingDescriptor_t> g_pooling_desc_pool;
+static DescriptorPool<cudnnOpTensorDescriptor_t> g_op_tensor_desc_pool;
+
+static bool g_descriptor_pool_initialized = false;
+static std::mutex g_pool_init_mutex;
+
+//===----------------------------------------------------------------------===//
+// 描述符池初始化和清理函数
+//===----------------------------------------------------------------------===//
+
+/**
+ * 初始化描述符池
+ */
+extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuInitDescriptorPool(
+    int tensor_pool_size,
+    int filter_pool_size, 
+    int conv_pool_size,
+    int pooling_pool_size,
+    int op_tensor_pool_size
+) {
+  mgpuEnsureContext();
+  
+  std::lock_guard<std::mutex> lock(g_pool_init_mutex);
+  
+  if (g_descriptor_pool_initialized) {
+    // fprintf(stderr, "[DESC POOL] Already initialized\n");
+    return;
+  }
+  
+  // fprintf(stderr, "[DESC POOL] Initializing pools: T=%d, F=%d, C=%d, P=%d, O=%d\n",
+  //         tensor_pool_size, filter_pool_size, conv_pool_size, 
+  //         pooling_pool_size, op_tensor_pool_size);
+  
+  // 为每种描述符类型单独初始化池
+  auto init_tensor_pool = [](DescriptorPool<cudnnTensorDescriptor_t>& pool, int size, const char* name) {
+    std::lock_guard<std::mutex> pool_lock(pool.mutex);
+    
+    for (int i = 0; i < size; i++) {
+      cudnnTensorDescriptor_t desc;
+      
+      auto status = cudnnCreateTensorDescriptor(&desc);
+      if (status != CUDNN_STATUS_SUCCESS) {
+        // fprintf(stderr, "[DESC POOL] Failed to create %s descriptor %d: %s\n", 
+        //         name, i, cudnnGetErrorString(status));
+        
+        // 清理已创建的描述符
+        while (!pool.available_descriptors.empty()) {
+          auto d = pool.available_descriptors.front();
+          pool.available_descriptors.pop();
+          cudnnDestroyTensorDescriptor(d);
+        }
+        pool.total_created = 0;
+        return false;
+      }
+      
+      pool.available_descriptors.push(desc);
+      pool.total_created++;
+    }
+    
+    // fprintf(stderr, "[DESC POOL] Created %d %s descriptors\n", size, name);
+    return true;
+  };
+  
+  auto init_filter_pool = [](DescriptorPool<cudnnFilterDescriptor_t>& pool, int size, const char* name) {
+    std::lock_guard<std::mutex> pool_lock(pool.mutex);
+    
+    for (int i = 0; i < size; i++) {
+      cudnnFilterDescriptor_t desc;
+      
+      auto status = cudnnCreateFilterDescriptor(&desc);
+      if (status != CUDNN_STATUS_SUCCESS) {
+        // fprintf(stderr, "[DESC POOL] Failed to create %s descriptor %d: %s\n", 
+        //         name, i, cudnnGetErrorString(status));
+        
+        // 清理已创建的描述符
+        while (!pool.available_descriptors.empty()) {
+          auto d = pool.available_descriptors.front();
+          pool.available_descriptors.pop();
+          cudnnDestroyFilterDescriptor(d);
+        }
+        pool.total_created = 0;
+        return false;
+      }
+      
+      pool.available_descriptors.push(desc);
+      pool.total_created++;
+    }
+    
+    // fprintf(stderr, "[DESC POOL] Created %d %s descriptors\n", size, name);
+    return true;
+  };
+  
+  auto init_conv_pool = [](DescriptorPool<cudnnConvolutionDescriptor_t>& pool, int size, const char* name) {
+    std::lock_guard<std::mutex> pool_lock(pool.mutex);
+    
+    for (int i = 0; i < size; i++) {
+      cudnnConvolutionDescriptor_t desc;
+      
+      auto status = cudnnCreateConvolutionDescriptor(&desc);
+      if (status != CUDNN_STATUS_SUCCESS) {
+        // fprintf(stderr, "[DESC POOL] Failed to create %s descriptor %d: %s\n", 
+        //         name, i, cudnnGetErrorString(status));
+        
+        // 清理已创建的描述符
+        while (!pool.available_descriptors.empty()) {
+          auto d = pool.available_descriptors.front();
+          pool.available_descriptors.pop();
+          cudnnDestroyConvolutionDescriptor(d);
+        }
+        pool.total_created = 0;
+        return false;
+      }
+      
+      pool.available_descriptors.push(desc);
+      pool.total_created++;
+    }
+    
+    // fprintf(stderr, "[DESC POOL] Created %d %s descriptors\n", size, name);
+    return true;
+  };
+  
+  auto init_pooling_pool = [](DescriptorPool<cudnnPoolingDescriptor_t>& pool, int size, const char* name) {
+    std::lock_guard<std::mutex> pool_lock(pool.mutex);
+    
+    for (int i = 0; i < size; i++) {
+      cudnnPoolingDescriptor_t desc;
+      
+      auto status = cudnnCreatePoolingDescriptor(&desc);
+      if (status != CUDNN_STATUS_SUCCESS) {
+        // fprintf(stderr, "[DESC POOL] Failed to create %s descriptor %d: %s\n", 
+        //         name, i, cudnnGetErrorString(status));
+        
+        // 清理已创建的描述符
+        while (!pool.available_descriptors.empty()) {
+          auto d = pool.available_descriptors.front();
+          pool.available_descriptors.pop();
+          cudnnDestroyPoolingDescriptor(d);
+        }
+        pool.total_created = 0;
+        return false;
+      }
+      
+      pool.available_descriptors.push(desc);
+      pool.total_created++;
+    }
+    
+    // fprintf(stderr, "[DESC POOL] Created %d %s descriptors\n", size, name);
+    return true;
+  };
+  
+  auto init_op_tensor_pool = [](DescriptorPool<cudnnOpTensorDescriptor_t>& pool, int size, const char* name) {
+    std::lock_guard<std::mutex> pool_lock(pool.mutex);
+    
+    for (int i = 0; i < size; i++) {
+      cudnnOpTensorDescriptor_t desc;
+      
+      auto status = cudnnCreateOpTensorDescriptor(&desc);
+      if (status != CUDNN_STATUS_SUCCESS) {
+        // fprintf(stderr, "[DESC POOL] Failed to create %s descriptor %d: %s\n", 
+        //         name, i, cudnnGetErrorString(status));
+        
+        // 清理已创建的描述符
+        while (!pool.available_descriptors.empty()) {
+          auto d = pool.available_descriptors.front();
+          pool.available_descriptors.pop();
+          cudnnDestroyOpTensorDescriptor(d);
+        }
+        pool.total_created = 0;
+        return false;
+      }
+      
+      pool.available_descriptors.push(desc);
+      pool.total_created++;
+    }
+    
+    // fprintf(stderr, "[DESC POOL] Created %d %s descriptors\n", size, name);
+    return true;
+  };
+  
+  // 初始化各种描述符池
+  bool success = true;
+  
+  if (tensor_pool_size > 0) {
+    success &= init_tensor_pool(g_tensor_desc_pool, tensor_pool_size, "tensor");
+  }
+  
+  if (filter_pool_size > 0) {
+    success &= init_filter_pool(g_filter_desc_pool, filter_pool_size, "filter");
+  }
+  
+  if (conv_pool_size > 0) {
+    success &= init_conv_pool(g_conv_desc_pool, conv_pool_size, "convolution");
+  }
+  
+  if (pooling_pool_size > 0) {
+    success &= init_pooling_pool(g_pooling_desc_pool, pooling_pool_size, "pooling");
+  }
+  
+  if (op_tensor_pool_size > 0) {
+    success &= init_op_tensor_pool(g_op_tensor_desc_pool, op_tensor_pool_size, "op_tensor");
+  }
+  
+  // if (success) {
+  //   g_descriptor_pool_initialized = true;
+  //   fprintf(stderr, "[DESC POOL] Initialization completed successfully\n");
+  // } else {
+  //   fprintf(stderr, "[DESC POOL] Initialization failed\n");
+  // }
+}
+
+/**
+ * 清理描述符池
+ */
+extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuDestroyDescriptorPool() {
+  mgpuEnsureContext();
+  
+  std::lock_guard<std::mutex> lock(g_pool_init_mutex);
+  
+  if (!g_descriptor_pool_initialized) {
+    // fprintf(stderr, "[DESC POOL] Pool not initialized, nothing to destroy\n");
+    return;
+  }
+  
+  auto cleanup_tensor_pool = [](DescriptorPool<cudnnTensorDescriptor_t>& pool, const char* name) {
+    std::lock_guard<std::mutex> pool_lock(pool.mutex);
+    
+    int destroyed = 0;
+    
+    // 销毁所有可用的描述符
+    while (!pool.available_descriptors.empty()) {
+      auto desc = pool.available_descriptors.front();
+      pool.available_descriptors.pop();
+      cudnnDestroyTensorDescriptor(desc);
+      destroyed++;
+    }
+    
+    // 销毁所有活跃的描述符
+    for (auto desc : pool.active_descriptors) {
+      cudnnDestroyTensorDescriptor(desc);
+      destroyed++;
+    }
+    
+    // fprintf(stderr, "[DESC POOL] Destroyed %d %s descriptors\n", destroyed, name);
+    pool.active_descriptors.clear();
+    pool.total_created = 0;
+  };
+  
+  auto cleanup_filter_pool = [](DescriptorPool<cudnnFilterDescriptor_t>& pool, const char* name) {
+    std::lock_guard<std::mutex> pool_lock(pool.mutex);
+    
+    int destroyed = 0;
+    
+    // 销毁所有可用的描述符
+    while (!pool.available_descriptors.empty()) {
+      auto desc = pool.available_descriptors.front();
+      pool.available_descriptors.pop();
+      cudnnDestroyFilterDescriptor(desc);
+      destroyed++;
+    }
+    
+    // 销毁所有活跃的描述符
+    for (auto desc : pool.active_descriptors) {
+      cudnnDestroyFilterDescriptor(desc);
+      destroyed++;
+    }
+    
+    // fprintf(stderr, "[DESC POOL] Destroyed %d %s descriptors\n", destroyed, name);
+    pool.active_descriptors.clear();
+    pool.total_created = 0;
+  };
+  
+  auto cleanup_conv_pool = [](DescriptorPool<cudnnConvolutionDescriptor_t>& pool, const char* name) {
+    std::lock_guard<std::mutex> pool_lock(pool.mutex);
+    
+    int destroyed = 0;
+    
+    // 销毁所有可用的描述符
+    while (!pool.available_descriptors.empty()) {
+      auto desc = pool.available_descriptors.front();
+      pool.available_descriptors.pop();
+      cudnnDestroyConvolutionDescriptor(desc);
+      destroyed++;
+    }
+    
+    // 销毁所有活跃的描述符
+    for (auto desc : pool.active_descriptors) {
+      cudnnDestroyConvolutionDescriptor(desc);
+      destroyed++;
+    }
+    
+    // fprintf(stderr, "[DESC POOL] Destroyed %d %s descriptors\n", destroyed, name);
+    pool.active_descriptors.clear();
+    pool.total_created = 0;
+  };
+  
+  auto cleanup_pooling_pool = [](DescriptorPool<cudnnPoolingDescriptor_t>& pool, const char* name) {
+    std::lock_guard<std::mutex> pool_lock(pool.mutex);
+    
+    int destroyed = 0;
+    
+    // 销毁所有可用的描述符
+    while (!pool.available_descriptors.empty()) {
+      auto desc = pool.available_descriptors.front();
+      pool.available_descriptors.pop();
+      cudnnDestroyPoolingDescriptor(desc);
+      destroyed++;
+    }
+    
+    // 销毁所有活跃的描述符
+    for (auto desc : pool.active_descriptors) {
+      cudnnDestroyPoolingDescriptor(desc);
+      destroyed++;
+    }
+    
+    // fprintf(stderr, "[DESC POOL] Destroyed %d %s descriptors\n", destroyed, name);
+    pool.active_descriptors.clear();
+    pool.total_created = 0;
+  };
+  
+  auto cleanup_op_tensor_pool = [](DescriptorPool<cudnnOpTensorDescriptor_t>& pool, const char* name) {
+    std::lock_guard<std::mutex> pool_lock(pool.mutex);
+    
+    int destroyed = 0;
+    
+    // 销毁所有可用的描述符
+    while (!pool.available_descriptors.empty()) {
+      auto desc = pool.available_descriptors.front();
+      pool.available_descriptors.pop();
+      cudnnDestroyOpTensorDescriptor(desc);
+      destroyed++;
+    }
+    
+    // 销毁所有活跃的描述符
+    for (auto desc : pool.active_descriptors) {
+      cudnnDestroyOpTensorDescriptor(desc);
+      destroyed++;
+    }
+    
+    // fprintf(stderr, "[DESC POOL] Destroyed %d %s descriptors\n", destroyed, name);
+    pool.active_descriptors.clear();
+    pool.total_created = 0;
+  };
+  
+  // 清理各种描述符池
+  cleanup_tensor_pool(g_tensor_desc_pool, "tensor");
+  cleanup_filter_pool(g_filter_desc_pool, "filter");
+  cleanup_conv_pool(g_conv_desc_pool, "convolution");
+  cleanup_pooling_pool(g_pooling_desc_pool, "pooling");
+  cleanup_op_tensor_pool(g_op_tensor_desc_pool, "op_tensor");
+  
+  g_descriptor_pool_initialized = false;
+  // fprintf(stderr, "[DESC POOL] Cleanup completed\n");
+}
+
+//===----------------------------------------------------------------------===//
+// 描述符获取函数 - 自动追踪活跃状态
+//===----------------------------------------------------------------------===//
+
+// 通用描述符获取函数模板
+template<typename DescriptorType>
+DescriptorType acquireDescriptor(DescriptorPool<DescriptorType>& pool, 
+                                const char* name,
+                                cudnnStatus_t (*create_func)(DescriptorType*)) {
+  std::lock_guard<std::mutex> lock(pool.mutex);
+  
+  DescriptorType desc;
+  
+  if (!pool.available_descriptors.empty()) {
+    // 从池中获取可用描述符
+    desc = pool.available_descriptors.front();
+    pool.available_descriptors.pop();
+  } else {
+    // 池为空，动态创建新描述符
+    cudnnStatus_t status = create_func(&desc);
+    if (status != CUDNN_STATUS_SUCCESS) {
+      // fprintf(stderr, "[DESC POOL] Failed to create new %s descriptor: %s\n", 
+      //         name, cudnnGetErrorString(status));
+      return nullptr;
+    }
+    pool.total_created++;
+    
+    // 动态扩展日志
+    if (pool.total_created % 10 == 0) {
+      // fprintf(stderr, "[DESC POOL] Dynamic expansion: %s pool now has %d descriptors\n", 
+      //         name, pool.total_created.load());
+    }
+  }
+  
+  // 追踪为活跃状态
+  pool.active_descriptors.insert(desc);
+  
+  return desc;
+}
+
+// 具体的获取函数
+static cudnnTensorDescriptor_t acquireTensorDescriptor() {
+  if (!g_descriptor_pool_initialized) {
+    // 回退到直接创建
+    cudnnTensorDescriptor_t desc;
+    CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&desc));
+    return desc;
+  }
+  return acquireDescriptor(g_tensor_desc_pool, "tensor", cudnnCreateTensorDescriptor);
+}
+
+static cudnnFilterDescriptor_t acquireFilterDescriptor() {
+  if (!g_descriptor_pool_initialized) {
+    cudnnFilterDescriptor_t desc;
+    CUDNN_REPORT_IF_ERROR(cudnnCreateFilterDescriptor(&desc));
+    return desc;
+  }
+  return acquireDescriptor(g_filter_desc_pool, "filter", cudnnCreateFilterDescriptor);
+}
+
+static cudnnConvolutionDescriptor_t acquireConvolutionDescriptor() {
+  if (!g_descriptor_pool_initialized) {
+    cudnnConvolutionDescriptor_t desc;
+    CUDNN_REPORT_IF_ERROR(cudnnCreateConvolutionDescriptor(&desc));
+    return desc;
+  }
+  return acquireDescriptor(g_conv_desc_pool, "convolution", cudnnCreateConvolutionDescriptor);
+}
+
+static cudnnPoolingDescriptor_t acquirePoolingDescriptor() {
+  if (!g_descriptor_pool_initialized) {
+    cudnnPoolingDescriptor_t desc;
+    CUDNN_REPORT_IF_ERROR(cudnnCreatePoolingDescriptor(&desc));
+    return desc;
+  }
+  return acquireDescriptor(g_pooling_desc_pool, "pooling", cudnnCreatePoolingDescriptor);
+}
+
+static cudnnOpTensorDescriptor_t acquireOpTensorDescriptor() {
+  if (!g_descriptor_pool_initialized) {
+    cudnnOpTensorDescriptor_t desc;
+    CUDNN_REPORT_IF_ERROR(cudnnCreateOpTensorDescriptor(&desc));
+    return desc;
+  }
+  return acquireDescriptor(g_op_tensor_desc_pool, "op_tensor", cudnnCreateOpTensorDescriptor);
+}
+
+//===----------------------------------------------------------------------===//
+// 核心功能：一键归还所有活跃描述符
+//===----------------------------------------------------------------------===//
+
+/**
+ * 一键归还所有当前正在使用的描述符到池中
+ * 用于并行组边界调用，确保GPU操作完成后统一归还
+ */
+extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuReturnAllActiveDescriptors() {
+  if (!g_descriptor_pool_initialized) {
+    // fprintf(stderr, "[DESC POOL] Pool not initialized\n");
+    return;
+  }
+  
+  mgpuEnsureContext();
+  
+  int total_returned = 0;
+  
+  // 归还所有tensor描述符
+  {
+    std::lock_guard<std::mutex> lock(g_tensor_desc_pool.mutex);
+    for (auto desc : g_tensor_desc_pool.active_descriptors) {
+      g_tensor_desc_pool.available_descriptors.push(desc);
+      total_returned++;
+    }
+    g_tensor_desc_pool.active_descriptors.clear();
+  }
+  
+  // 归还所有filter描述符
+  {
+    std::lock_guard<std::mutex> lock(g_filter_desc_pool.mutex);
+    for (auto desc : g_filter_desc_pool.active_descriptors) {
+      g_filter_desc_pool.available_descriptors.push(desc);
+      total_returned++;
+    }
+    g_filter_desc_pool.active_descriptors.clear();
+  }
+  
+  // 归还所有conv描述符
+  {
+    std::lock_guard<std::mutex> lock(g_conv_desc_pool.mutex);
+    for (auto desc : g_conv_desc_pool.active_descriptors) {
+      g_conv_desc_pool.available_descriptors.push(desc);
+      total_returned++;
+    }
+    g_conv_desc_pool.active_descriptors.clear();
+  }
+  
+  // 归还所有pooling描述符
+  {
+    std::lock_guard<std::mutex> lock(g_pooling_desc_pool.mutex);
+    for (auto desc : g_pooling_desc_pool.active_descriptors) {
+      g_pooling_desc_pool.available_descriptors.push(desc);
+      total_returned++;
+    }
+    g_pooling_desc_pool.active_descriptors.clear();
+  }
+  
+  // 归还所有op_tensor描述符
+  {
+    std::lock_guard<std::mutex> lock(g_op_tensor_desc_pool.mutex);
+    for (auto desc : g_op_tensor_desc_pool.active_descriptors) {
+      g_op_tensor_desc_pool.available_descriptors.push(desc);
+      total_returned++;
+    }
+    g_op_tensor_desc_pool.active_descriptors.clear();
+  }
+  
+  // fprintf(stderr, "[DESC POOL] Returned %d active descriptors to pools\n", total_returned);
+}
+
+
+//===----------------------------------------------------------------------===//
+// Workspace池数据结构定义
+//===----------------------------------------------------------------------===//
+
+struct PooledWorkspace {
+  CUdeviceptr ptr;
+  size_t size;
+  bool in_use;
+  int pool_index;
+  CUstream associated_stream;  // 记录关联的stream
+  std::chrono::steady_clock::time_point last_used;
+  
+  PooledWorkspace() : ptr(0), size(0), in_use(false), pool_index(-1), 
+                     associated_stream(nullptr) {}
+};
+
+// 全局Workspace池状态
+static std::vector<PooledWorkspace> g_workspace_pool;                     // 所有workspace的存储
+static std::queue<int> g_available_workspace_indices;                     // 可用workspace索引队列
+static std::unordered_set<int> g_active_workspace_indices;               // 活跃workspace索引集合
+static std::mutex g_workspace_pool_mutex;                                // 线程安全锁
+static bool g_workspace_pool_initialized = false;                        // 初始化标志
+static std::atomic<int> g_active_workspace_count{0};
+static size_t g_default_workspace_size = 128 * 1024 * 1024;             // 默认128MB
+
+//===----------------------------------------------------------------------===//
+// Workspace池初始化和销毁
+//===----------------------------------------------------------------------===//
+
+/**
+ * 初始化Workspace池
+ * @param pool_size 池中workspace的数量
+ * @param workspace_size_mb 每个workspace的大小(MB)，如果为0则使用默认大小
+ */
+extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuInitWorkspacePool(int pool_size, int workspace_size_mb) {
+  mgpuEnsureContext();
+  
+  std::lock_guard<std::mutex> lock(g_workspace_pool_mutex);
+  
+  if (g_workspace_pool_initialized) {
+    fprintf(stderr, "[WORKSPACE POOL] Already initialized with %d workspaces\n", 
+            (int)g_workspace_pool.size());
+    return;
+  }
+  
+  if (pool_size <= 0) {
+    fprintf(stderr, "[WORKSPACE POOL] ERROR: Invalid pool size: %d\n", pool_size);
+    return;
+  }
+  
+  // 设置workspace大小
+  size_t workspace_size;
+  if (workspace_size_mb > 0) {
+    workspace_size = workspace_size_mb * 1024 * 1024;  // 转换为字节
+  } else {
+    workspace_size = g_default_workspace_size;  // 使用默认大小
+  }
+  
+  fprintf(stderr, "[WORKSPACE POOL] Initializing pool with %d workspaces of %.2f MB each...\n", 
+          pool_size, workspace_size / (1024.0 * 1024.0));
+  
+  // 预分配存储空间
+  g_workspace_pool.reserve(pool_size);
+  g_workspace_pool.resize(pool_size);
+  
+  // 创建所有workspaces
+  for (int i = 0; i < pool_size; i++) {
+    PooledWorkspace& workspace = g_workspace_pool[i];
+    workspace.pool_index = i;
+    workspace.size = workspace_size;
+    
+    // 分配CUDA内存
+    CUresult result = cuMemAlloc(&workspace.ptr, workspace_size);
+    if (result != CUDA_SUCCESS) {
+      const char *name = nullptr;
+      cuGetErrorName(result, &name);
+      if (!name) name = "<unknown>";
+      
+      fprintf(stderr, "[WORKSPACE POOL] FATAL: Failed to allocate workspace %d (%.2f MB): %s\n", 
+              i, workspace_size / (1024.0 * 1024.0), name);
+      
+      // 清理已分配的workspaces
+      for (int j = 0; j < i; j++) {
+        if (g_workspace_pool[j].ptr) {
+          cuMemFree(g_workspace_pool[j].ptr);
+        }
+      }
+      g_workspace_pool.clear();
+      return;
+    }
+    
+    // 将索引加入可用队列
+    g_available_workspace_indices.push(i);
+    
+    // fprintf(stderr, "[WORKSPACE POOL] Created workspace %d: ptr=%p, size=%.2f MB\n", 
+    //         i, reinterpret_cast<void*>(workspace.ptr), workspace_size / (1024.0 * 1024.0));
+  }
+  
+  g_workspace_pool_initialized = true;
+  g_active_workspace_count = 0;
+  
+  fprintf(stderr, "[WORKSPACE POOL] Successfully initialized %d workspaces\n", pool_size);
+}
+
+/**
+ * 销毁Workspace池
+ */
+extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuDestroyWorkspacePool() {
+  mgpuEnsureContext();
+  
+  std::lock_guard<std::mutex> lock(g_workspace_pool_mutex);
+  
+  if (!g_workspace_pool_initialized) {
+    fprintf(stderr, "[WORKSPACE POOL] Pool not initialized, nothing to destroy\n");
+    return;
+  }
+  
+  fprintf(stderr, "[WORKSPACE POOL] Destroying pool with %d workspaces...\n", 
+          (int)g_workspace_pool.size());
+  
+  // 检查是否还有活跃的workspaces
+  if (g_active_workspace_count > 0) {
+    fprintf(stderr, "[WORKSPACE POOL] WARNING: %d workspaces still in use during destruction\n", 
+            g_active_workspace_count.load());
+  }
+  
+  // 销毁所有workspaces
+  int destroyed_count = 0;
+  for (size_t i = 0; i < g_workspace_pool.size(); i++) {
+    PooledWorkspace& workspace = g_workspace_pool[i];
+    
+    if (workspace.ptr) {
+      CUresult result = cuMemFree(workspace.ptr);
+      if (result != CUDA_SUCCESS) {
+        const char *name = nullptr;
+        cuGetErrorName(result, &name);
+        if (!name) name = "<unknown>";
+        fprintf(stderr, "[WORKSPACE POOL] Error destroying workspace %d: %s\n", 
+                (int)i, name);
+      }
+      workspace.ptr = 0;
+    }
+    
+    destroyed_count++;
+  }
+  
+  // 清理所有数据结构
+  g_workspace_pool.clear();
+  while (!g_available_workspace_indices.empty()) {
+    g_available_workspace_indices.pop();
+  }
+  g_active_workspace_indices.clear();
+  g_active_workspace_count = 0;
+  g_workspace_pool_initialized = false;
+  
+  fprintf(stderr, "[WORKSPACE POOL] Destroyed %d workspaces, pool cleanup complete\n", 
+          destroyed_count);
+}
+
+//===----------------------------------------------------------------------===//
+// Workspace获取和释放函数
+//===----------------------------------------------------------------------===//
+
+/**
+ * 从池中获取workspace
+ * @param required_size 需要的最小大小
+ * @param stream 关联的CUDA stream
+ * @return workspace指针，失败返回nullptr
+ */
+static void* acquirePooledWorkspace(size_t required_size, CUstream stream) {
+  std::lock_guard<std::mutex> lock(g_workspace_pool_mutex);
+  
+  if (!g_workspace_pool_initialized) {
+    // 如果池未初始化，回退到动态分配
+    CUdeviceptr ptr = 0;
+    CUresult result = cuMemAlloc(&ptr, required_size);
+    if (result == CUDA_SUCCESS) {
+      return reinterpret_cast<void*>(ptr);
+    }
+    return nullptr;
+  }
+  
+  // 检查是否有可用的workspace
+  if (g_available_workspace_indices.empty()) {
+    fprintf(stderr, "[WORKSPACE POOL] WARNING: No available workspaces! Active: %d, Total: %d\n", 
+            g_active_workspace_count.load(), (int)g_workspace_pool.size());
+    
+    // 回退到动态分配
+    CUdeviceptr ptr = 0;
+    CUresult result = cuMemAlloc(&ptr, required_size);
+    if (result == CUDA_SUCCESS) {
+      return reinterpret_cast<void*>(ptr);
+    }
+    return nullptr;
+  }
+  
+  // 寻找合适大小的workspace
+  std::queue<int> temp_queue;
+  int workspace_index = -1;
+  
+  while (!g_available_workspace_indices.empty()) {
+    int idx = g_available_workspace_indices.front();
+    g_available_workspace_indices.pop();
+    
+    if (g_workspace_pool[idx].size >= required_size) {
+      workspace_index = idx;
+      // 将其他的索引放回队列
+      while (!temp_queue.empty()) {
+        g_available_workspace_indices.push(temp_queue.front());
+        temp_queue.pop();
+      }
+      break;
+    } else {
+      temp_queue.push(idx);
+    }
+  }
+  
+  // 如果没找到合适的，将临时队列中的索引放回
+  while (!temp_queue.empty()) {
+    g_available_workspace_indices.push(temp_queue.front());
+    temp_queue.pop();
+  }
+  
+  if (workspace_index == -1) {
+    fprintf(stderr, "[WORKSPACE POOL] WARNING: No workspace large enough for %zu bytes\n", 
+            required_size);
+    
+    // 回退到动态分配
+    CUdeviceptr ptr = 0;
+    CUresult result = cuMemAlloc(&ptr, required_size);
+    if (result == CUDA_SUCCESS) {
+      return reinterpret_cast<void*>(ptr);
+    }
+    return nullptr;
+  }
+  
+  // 获取workspace
+  PooledWorkspace& workspace = g_workspace_pool[workspace_index];
+  
+  // 更新状态
+  workspace.in_use = true;
+  workspace.associated_stream = stream;
+  workspace.last_used = std::chrono::steady_clock::now();
+  g_active_workspace_indices.insert(workspace_index);
+  g_active_workspace_count++;
+  
+  // fprintf(stderr, "[WORKSPACE POOL] Acquired workspace %d for stream %p (Active: %d/%d)\n", 
+  //         workspace_index, stream, g_active_workspace_count.load(), (int)g_workspace_pool.size());
+  
+  return reinterpret_cast<void*>(workspace.ptr);
+}
+
+/**
+ * 将workspace退还到池中
+ * @param ptr workspace指针
+ */
+static void releasePooledWorkspace(void* ptr) {
+  if (ptr == nullptr) {
+    return;
+  }
+  
+  std::lock_guard<std::mutex> lock(g_workspace_pool_mutex);
+  
+  if (!g_workspace_pool_initialized) {
+    // 如果池未初始化，这可能是动态分配的内存，直接释放
+    CUresult result = cuMemFree(reinterpret_cast<CUdeviceptr>(ptr));
+    if (result != CUDA_SUCCESS) {
+      fprintf(stderr, "[WORKSPACE POOL] Warning: Failed to free dynamic workspace\n");
+    }
+    return;
+  }
+  
+  // 查找workspace在池中的索引
+  int workspace_index = -1;
+  for (size_t i = 0; i < g_workspace_pool.size(); i++) {
+    if (g_workspace_pool[i].ptr == reinterpret_cast<CUdeviceptr>(ptr)) {
+      workspace_index = (int)i;
+      break;
+    }
+  }
+  
+  if (workspace_index == -1) {
+    // 这可能是动态分配的workspace，直接释放
+    CUresult result = cuMemFree(reinterpret_cast<CUdeviceptr>(ptr));
+    if (result != CUDA_SUCCESS) {
+      fprintf(stderr, "[WORKSPACE POOL] Warning: Failed to free dynamic workspace\n");
+    }
+    return;
+  }
+  
+  PooledWorkspace& workspace = g_workspace_pool[workspace_index];
+  
+  if (!workspace.in_use) {
+    fprintf(stderr, "[WORKSPACE POOL] WARNING: Workspace %d is not marked as in use\n", workspace_index);
+    return;
+  }
+  
+  // 更新状态
+  workspace.in_use = false;
+  workspace.associated_stream = nullptr;
+  g_available_workspace_indices.push(workspace_index);
+  g_active_workspace_indices.erase(workspace_index);
+  g_active_workspace_count--;
+  
+  // fprintf(stderr, "[WORKSPACE POOL] Released workspace %d (Active: %d/%d)\n", 
+  //         workspace_index, g_active_workspace_count.load(), (int)g_workspace_pool.size());
+}
+
+//===----------------------------------------------------------------------===//
+// 核心功能：一键归还所有活跃workspace
+//===----------------------------------------------------------------------===//
+
+/**
+ * 一键归还所有当前正在使用的workspace到池中
+ * 用于并行组边界调用，确保GPU操作完成后统一归还
+ */
+extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuReturnAllActiveWorkspaces() {
+  if (!g_workspace_pool_initialized) {
+    // fprintf(stderr, "[WORKSPACE POOL] Pool not initialized\n");
+    return;
+  }
+  
+  mgpuEnsureContext();
+  
+  std::lock_guard<std::mutex> lock(g_workspace_pool_mutex);
+  
+  int total_returned = 0;
+  
+  // 归还所有活跃的workspaces
+  for (int index : g_active_workspace_indices) {
+    PooledWorkspace& workspace = g_workspace_pool[index];
+    
+    if (workspace.in_use) {
+      workspace.in_use = false;
+      workspace.associated_stream = nullptr;
+      g_available_workspace_indices.push(index);
+      g_active_workspace_count--;
+      total_returned++;
+    }
+  }
+  
+  g_active_workspace_indices.clear();
+  
+  // fprintf(stderr, "[WORKSPACE POOL] Returned %d active workspaces to pool\n", total_returned);
+}
+
+
+// 简单的全局算法缓存
+static cudnnConvolutionFwdAlgo_t g_cached_algo = CUDNN_CONVOLUTION_FWD_ALGO_COUNT; // 无效值表示未初始化
+static bool g_algo_cached = false;
+
 // fp32
 // 支持transB的全连接层实现
 extern "C" MLIR_CUDA_WRAPPERS_EXPORT void
@@ -1144,10 +2030,14 @@ mgpuCulibsFullyConnectedForward(
   if (bias_data != nullptr) {
     cudnnHandle_t cudnnHandle = handles.cudnn_handle;
     
-    // 创建张量描述符
-    cudnnTensorDescriptor_t outputDesc, biasDesc;
-    CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&outputDesc));
-    CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&biasDesc));
+    // // 创建张量描述符
+    // cudnnTensorDescriptor_t outputDesc, biasDesc;
+    // CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&outputDesc));
+    // CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&biasDesc));
+
+    // 从池中获取描述符
+    cudnnTensorDescriptor_t outputDesc = acquireTensorDescriptor();
+    cudnnTensorDescriptor_t biasDesc = acquireTensorDescriptor();
     
     // 设置输出描述符
     CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
@@ -1167,9 +2057,9 @@ mgpuCulibsFullyConnectedForward(
         cudnnHandle, &alpha_bias, biasDesc, bias_data, 
         &beta_bias, outputDesc, output_data));
     
-    // 清理描述符
-    CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(outputDesc));
-    CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(biasDesc));
+    // // 清理描述符
+    // CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(outputDesc));
+    // CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(biasDesc));
   }
 }
 
@@ -1226,11 +2116,15 @@ mgpuCulibsFlattenFullyConnectedForward(
   if (bias_data != nullptr) {
     cudnnHandle_t cudnnHandle = handles.cudnn_handle;
     
-    // Create tensor descriptors
-    cudnnTensorDescriptor_t outputDesc, biasDesc;
-    CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&outputDesc));
-    CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&biasDesc));
+    // // Create tensor descriptors
+    // cudnnTensorDescriptor_t outputDesc, biasDesc;
+    // CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&outputDesc));
+    // CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&biasDesc));
     
+    // 从池中获取描述符
+    cudnnTensorDescriptor_t outputDesc = acquireTensorDescriptor();
+    cudnnTensorDescriptor_t biasDesc = acquireTensorDescriptor();
+
     // Set output descriptor as a 4D tensor with H=W=1
     CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
         outputDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, 
@@ -1249,9 +2143,9 @@ mgpuCulibsFlattenFullyConnectedForward(
         cudnnHandle, &alpha_bias, biasDesc, bias_data, 
         &beta_bias, outputDesc, output_data));
     
-    // Clean up descriptors
-    CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(outputDesc));
-    CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(biasDesc));
+    // // Clean up descriptors
+    // CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(outputDesc));
+    // CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(biasDesc));
   }
 }
 
@@ -1267,18 +2161,6 @@ extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuCudnnConv2dForward(
     CUstream stream                             // CUDA流
     //bool createContext = true
 ) {
-  // fprintf(stderr, "Input data: %p, weight data: %p, bias data: %p, output data: %p\n", 
-  //   x_data, w_data, bias_data, y_data);
-  // // 验证每个指针是否有效
-  // if (x_data == nullptr || w_data == nullptr || y_data == nullptr) {
-  // fprintf(stderr, "Error: Invalid pointer detected in mgpuCudnnConv2dForward\n");
-  // return;
-  // }
-
-  // fprintf(stderr, "[START] mgpuCudnnConv2dForward\n");
-  
-  // ScopedContext scopedContext;
-
   // 确保使用全局上下文
   mgpuEnsureContext();
 
@@ -1290,22 +2172,33 @@ extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuCudnnConv2dForward(
     return; // 错误信息已在getHandlesForStream中打印
   }
   cudnnHandle_t handle = handles.cudnn_handle;
+  
+  // 获取算法（如果已缓存则直接使用，否则搜索并缓存）
+  cudnnConvolutionFwdAlgo_t algo;
+  bool need_search = !g_algo_cached;
+    
+  if (!need_search) {
+    algo = g_cached_algo;
+  }
+  
+  // // 创建描述符
+  // cudnnTensorDescriptor_t xDesc, yDesc, biasDesc;
+  // cudnnFilterDescriptor_t wDesc;
+  // cudnnConvolutionDescriptor_t convDesc;
+  
+  // CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&xDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnCreateFilterDescriptor(&wDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&yDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&biasDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnCreateConvolutionDescriptor(&convDesc));
 
-  // cudnnHandle_t handle = mgpuCudnnGetHandle(stream);
+  // 从池中获取描述符（自动追踪为活跃状态）
+  cudnnTensorDescriptor_t xDesc = acquireTensorDescriptor();
+  cudnnFilterDescriptor_t wDesc = acquireFilterDescriptor();
+  cudnnTensorDescriptor_t yDesc = acquireTensorDescriptor();
+  cudnnTensorDescriptor_t biasDesc = acquireTensorDescriptor();
+  cudnnConvolutionDescriptor_t convDesc = acquireConvolutionDescriptor();
 
-  // fprintf(stderr, "[HANDLE] Got handle: %p\n", handle);
-  
-  // 创建描述符
-  cudnnTensorDescriptor_t xDesc, yDesc, biasDesc;
-  cudnnFilterDescriptor_t wDesc;
-  cudnnConvolutionDescriptor_t convDesc;
-  
-  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&xDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnCreateFilterDescriptor(&wDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&yDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&biasDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnCreateConvolutionDescriptor(&convDesc));
-  
   // 设置输入描述符
   CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
       xDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, n, c, h, w_in));
@@ -1318,9 +2211,6 @@ extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuCudnnConv2dForward(
   CUDNN_REPORT_IF_ERROR(cudnnSetConvolution2dDescriptor(
       convDesc, pad_h, pad_w, stride_h, stride_w, dilation_h, dilation_w,
       CUDNN_CROSS_CORRELATION, CUDNN_DATA_FLOAT));
-  
-  // 添加这一行以启用Tensor Cores
-  // CUDNN_REPORT_IF_ERROR(cudnnSetConvolutionMathType(convDesc, CUDNN_TENSOR_OP_MATH));
 
   // 对于Amsere及更高架构，可以考虑使用以下替代方式获得更好性能
   CUDNN_REPORT_IF_ERROR(cudnnSetConvolutionMathType(convDesc, CUDNN_TENSOR_OP_MATH_ALLOW_CONVERSION));
@@ -1341,18 +2231,29 @@ extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuCudnnConv2dForward(
   CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
       biasDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, 1, k, 1, 1));
   
-  // // 自动选择最佳算法
-  // int requestedAlgoCount = 10;
-  // int returnedAlgoCount;
-  // cudnnConvolutionFwdAlgoPerf_t perfResults[10];
-  // CUDNN_REPORT_IF_ERROR(cudnnGetConvolutionForwardAlgorithm_v7(
-  //     handle, xDesc, wDesc, convDesc, yDesc,
-  //     requestedAlgoCount, &returnedAlgoCount, perfResults));
+    // 如果需要搜索算法
+    if (need_search) {
+        // 自动选择最佳算法
+        int requestedAlgoCount = 10;
+        int returnedAlgoCount;
+        cudnnConvolutionFwdAlgoPerf_t perfResults[10];
+        CUDNN_REPORT_IF_ERROR(cudnnGetConvolutionForwardAlgorithm_v7(
+            handle, xDesc, wDesc, convDesc, yDesc,
+            requestedAlgoCount, &returnedAlgoCount, perfResults));
+        
+        // 选择最快的且可用的算法
+        algo = perfResults[0].algo;
+        
+        // 缓存算法供后续使用
+        if (!g_algo_cached) {
+            g_cached_algo = algo;
+            g_algo_cached = true;
+            // 可选：打印日志
+            // printf("Cached conv algorithm: %d\n", static_cast<int>(algo));
+        }
+    }
   
-  // // 选择最快的且可用的算法
-  // cudnnConvolutionFwdAlgo_t algo = perfResults[0].algo;
-  
-  cudnnConvolutionFwdAlgo_t algo = CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_GEMM; // 或其他适合你计算的预定义算法
+  // cudnnConvolutionFwdAlgo_t algo = CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_GEMM; // 或其他适合你计算的预定义算法
   // cudnnConvolutionFwdAlgo_t algo = CUDNN_CONVOLUTION_FWD_ALGO_WINOGRAD;
   // cudnnConvolutionFwdAlgo_t algo = CUDNN_CONVOLUTION_FWD_ALGO_WINOGRAD_NONFUSED;
   // cudnnConvolutionFwdAlgo_t algo = CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM;
@@ -1362,46 +2263,49 @@ extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuCudnnConv2dForward(
   size_t workspaceSize = 0;
   CUDNN_REPORT_IF_ERROR(cudnnGetConvolutionForwardWorkspaceSize(
       handle, xDesc, wDesc, convDesc, yDesc, algo, &workspaceSize));
-  
-  // 分配工作空间
-  void* workspace = nullptr;
-  if (workspaceSize > 0) {
-    CUdeviceptr wsPtr = 0;
-    CUDA_REPORT_IF_ERROR(cuMemAlloc(&wsPtr, workspaceSize));
-    workspace = reinterpret_cast<void*>(wsPtr);
-  }
+    // printf("Workspace size: %zu bytes\n", workspaceSize);
+  // // 分配工作空间
+  // void* workspace = nullptr;
+  // if (workspaceSize > 0) {
+  //   CUdeviceptr wsPtr = 0;
+  //   CUDA_REPORT_IF_ERROR(cuMemAlloc(&wsPtr, workspaceSize));
+  //   workspace = reinterpret_cast<void*>(wsPtr);
+  // }
+
+    
+    // ========== 使用Workspace Pool ==========
+    void* workspace = nullptr;
+    bool using_pool = false;
+    
+    if (workspaceSize > 0) {
+        // 尝试从pool获取workspace
+        workspace = acquirePooledWorkspace(workspaceSize, stream);
+        
+        if (workspace != nullptr) {
+            using_pool = true;
+            // fprintf(stderr, "[CONV] Using pooled workspace (size: %zu bytes)\n", workspaceSize);
+        } else {
+            // 回退到动态分配
+            CUdeviceptr wsPtr = 0;
+            CUresult result = cuMemAlloc(&wsPtr, workspaceSize);
+            if (result == CUDA_SUCCESS) {
+                workspace = reinterpret_cast<void*>(wsPtr);
+                // fprintf(stderr, "[CONV] Using dynamic workspace (size: %zu bytes)\n", workspaceSize);
+            } else {
+                fprintf(stderr, "[CONV] ERROR: Failed to allocate workspace of size %zu bytes\n", workspaceSize);
+                return;
+            }
+        }
+    }
+
 
   // 执行卷积
   const float alpha = 1.0f;
   const float beta = 0.0f;
-  // CUDNN_REPORT_IF_ERROR(cudnnConvolutionForward(
-  //     handle, &alpha, xDesc, x_data, wDesc, w_data, convDesc, algo,
-  //     workspace, workspaceSize, &beta, yDesc, y_data));
-  
 
-  // // 在cudnnConvolutionForward之前打印关键参数的值
-  // fprintf(stderr, "[PRE-CONV] Input ptr: %p, Filter ptr: %p, Output ptr: %p\n", 
-  //   x_data, w_data, y_data);
-
-  // // 记录使用的CUDA流和cuDNN句柄
-  // fprintf(stderr, "[PRE-CONV] Using stream: %p, handle: %p\n", stream, handle);
-
-  // // 执行卷积操作
-  // fprintf(stderr, "[EXECUTING] cudnnConvolutionForward...\n");
   cudnnStatus_t status = cudnnConvolutionForward(
   handle, &alpha, xDesc, x_data, wDesc, w_data, convDesc, algo,
   workspace, workspaceSize, &beta, yDesc, y_data);
-
-  // // 打印卷积执行的结果状态
-  // fprintf(stderr, "[POST-CONV] Status: %d (%s)\n", status, 
-  //   cudnnGetErrorString(status));
-
-  // // 在cudnnConvolutionForward之后再次打印参数，检查是否有变化
-  // fprintf(stderr, "[POST-CONV] Input ptr: %p, Filter ptr: %p, Output ptr: %p\n", 
-  //   x_data, w_data, y_data);
-
-  // // 检查工作空间的状态
-  // fprintf(stderr, "[POST-CONV] Workspace ptr: %p, size: %zu\n", workspace, workspaceSize);
 
   // 报告错误（如果有）
   CUDNN_REPORT_IF_ERROR(status);
@@ -1415,19 +2319,25 @@ extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuCudnnConv2dForward(
         handle, &alpha_bias, biasDesc, bias_data, &beta_bias, yDesc, y_data));
   }
   
-  // 释放工作空间
-  if (workspace != nullptr) {
+  // // 释放工作空间
+  // if (workspace != nullptr) {
+  //   CUDA_REPORT_IF_ERROR(cuMemFree(reinterpret_cast<CUdeviceptr>(workspace)));
+  // }
+
+
+  if ((workspace != nullptr) && !using_pool) {
+    // 如果是动态分配的，直接释放
+    fprintf(stderr, "未使用workspace pool");
     CUDA_REPORT_IF_ERROR(cuMemFree(reinterpret_cast<CUdeviceptr>(workspace)));
   }
-  
-  // 清理描述符
-  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(xDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnDestroyFilterDescriptor(wDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(yDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(biasDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnDestroyConvolutionDescriptor(convDesc));
 
-  // fprintf(stderr, "[END] mgpuCudnnConv2dForward\n");
+  
+  // // 清理描述符
+  // CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(xDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnDestroyFilterDescriptor(wDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(yDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(biasDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnDestroyConvolutionDescriptor(convDesc));
 }
 
 // MaxPool implementation using cuDNN
@@ -1455,14 +2365,20 @@ mgpuCudnnMaxPoolForward(
   // 获取此流的cuDNN句柄
   // cudnnHandle_t handle = mgpuCudnnGetHandle(stream);
   
-  // 创建描述符
-  cudnnTensorDescriptor_t inputDesc, outputDesc;
-  cudnnPoolingDescriptor_t poolDesc;
+  // // 创建描述符
+  // cudnnTensorDescriptor_t inputDesc, outputDesc;
+  // cudnnPoolingDescriptor_t poolDesc;
   
-  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&inputDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&outputDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnCreatePoolingDescriptor(&poolDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&inputDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&outputDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnCreatePoolingDescriptor(&poolDesc));
   
+  // 从池中获取描述符
+  cudnnTensorDescriptor_t inputDesc = acquireTensorDescriptor();
+  cudnnTensorDescriptor_t outputDesc = acquireTensorDescriptor();
+  cudnnPoolingDescriptor_t poolDesc = acquirePoolingDescriptor();
+
+
   // 设置输入描述符
   CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
       inputDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, n, c, h, w));
@@ -1500,10 +2416,10 @@ mgpuCudnnMaxPoolForward(
   CUDNN_REPORT_IF_ERROR(cudnnPoolingForward(
       handle, poolDesc, &alpha, inputDesc, input_data, &beta, outputDesc, output_data));
   
-  // 清理描述符
-  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(inputDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(outputDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnDestroyPoolingDescriptor(poolDesc));
+  // // 清理描述符
+  // CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(inputDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(outputDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnDestroyPoolingDescriptor(poolDesc));
 }
 
 
@@ -1524,12 +2440,18 @@ mgpuCudnnMul(void* inputA, void* inputB, void* output,
   // 获取此流的cuDNN句柄
   // cudnnHandle_t handle = mgpuCudnnGetHandle(stream);
   
-  // 创建张量描述符
-  cudnnTensorDescriptor_t aDesc, bDesc, cDesc;
-  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&aDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&bDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&cDesc));
+  // // 创建张量描述符
+  // cudnnTensorDescriptor_t aDesc, bDesc, cDesc;
+  // CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&aDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&bDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&cDesc));
   
+  // 从池中获取描述符
+  cudnnTensorDescriptor_t aDesc = acquireTensorDescriptor();
+  cudnnTensorDescriptor_t bDesc = acquireTensorDescriptor();
+  cudnnTensorDescriptor_t cDesc = acquireTensorDescriptor();
+  cudnnOpTensorDescriptor_t opDesc = acquireOpTensorDescriptor();
+
   // 设置张量描述符
   CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
       aDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, n, c, h, w));
@@ -1538,9 +2460,9 @@ mgpuCudnnMul(void* inputA, void* inputB, void* output,
   CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
       cDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, n, c, h, w));
   
-  // 创建操作描述符
-  cudnnOpTensorDescriptor_t opDesc;
-  CUDNN_REPORT_IF_ERROR(cudnnCreateOpTensorDescriptor(&opDesc));
+  // // 创建操作描述符
+  // cudnnOpTensorDescriptor_t opDesc;
+  // CUDNN_REPORT_IF_ERROR(cudnnCreateOpTensorDescriptor(&opDesc));
   
   // 设置为乘法操作
   CUDNN_REPORT_IF_ERROR(cudnnSetOpTensorDescriptor(
@@ -1558,11 +2480,11 @@ mgpuCudnnMul(void* inputA, void* inputB, void* output,
       &alpha2, bDesc, inputB,
       &beta, cDesc, output));
   
-  // 清理描述符
-  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(aDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(bDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(cDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnDestroyOpTensorDescriptor(opDesc));
+  // // 清理描述符
+  // CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(aDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(bDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(cDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnDestroyOpTensorDescriptor(opDesc));
 }
 
 // 张量加法操作: C = A + B
@@ -1584,12 +2506,18 @@ mgpuCudnnAdd(void* inputA, void* inputB, void* output,
   // 获取此流的cuDNN句柄
   // cudnnHandle_t handle = mgpuCudnnGetHandle(stream);
   
-  // 创建张量描述符
-  cudnnTensorDescriptor_t aDesc, bDesc, cDesc;
-  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&aDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&bDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&cDesc));
+  // // 创建张量描述符
+  // cudnnTensorDescriptor_t aDesc, bDesc, cDesc;
+  // CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&aDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&bDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&cDesc));
   
+  // 从池中获取描述符
+  cudnnTensorDescriptor_t aDesc = acquireTensorDescriptor();
+  cudnnTensorDescriptor_t bDesc = acquireTensorDescriptor();
+  cudnnTensorDescriptor_t cDesc = acquireTensorDescriptor();
+  cudnnOpTensorDescriptor_t opDesc = acquireOpTensorDescriptor();
+
   // 设置张量描述符
   CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
       aDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, n, c, h, w));
@@ -1598,9 +2526,9 @@ mgpuCudnnAdd(void* inputA, void* inputB, void* output,
   CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
       cDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, n, c, h, w));
   
-  // 创建操作描述符
-  cudnnOpTensorDescriptor_t opDesc;
-  CUDNN_REPORT_IF_ERROR(cudnnCreateOpTensorDescriptor(&opDesc));
+  // // 创建操作描述符
+  // cudnnOpTensorDescriptor_t opDesc;
+  // CUDNN_REPORT_IF_ERROR(cudnnCreateOpTensorDescriptor(&opDesc));
   
   // 设置为加法操作
   CUDNN_REPORT_IF_ERROR(cudnnSetOpTensorDescriptor(
@@ -1618,11 +2546,11 @@ mgpuCudnnAdd(void* inputA, void* inputB, void* output,
       &alpha2, bDesc, inputB,
       &beta, cDesc, output));
   
-  // 清理描述符
-  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(aDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(bDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(cDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnDestroyOpTensorDescriptor(opDesc));
+  // // 清理描述符
+  // CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(aDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(bDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(cDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnDestroyOpTensorDescriptor(opDesc));
 }
 
 extern "C" MLIR_CUDA_WRAPPERS_EXPORT void 
@@ -1641,12 +2569,18 @@ mgpuCudnnSub(void* inputA, void* inputB, void* output,
   // 获取此流的cuDNN句柄
   // cudnnHandle_t handle = mgpuCudnnGetHandle(stream);
   
-  // 创建张量描述符
-  cudnnTensorDescriptor_t aDesc, bDesc, cDesc;
-  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&aDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&bDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&cDesc));
+  // // 创建张量描述符
+  // cudnnTensorDescriptor_t aDesc, bDesc, cDesc;
+  // CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&aDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&bDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&cDesc));
   
+  // 从池中获取描述符
+  cudnnTensorDescriptor_t aDesc = acquireTensorDescriptor();
+  cudnnTensorDescriptor_t bDesc = acquireTensorDescriptor();
+  cudnnTensorDescriptor_t cDesc = acquireTensorDescriptor();
+  cudnnOpTensorDescriptor_t opDesc = acquireOpTensorDescriptor();
+
   // 设置张量描述符
   CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
       aDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, n, c, h, w));
@@ -1655,9 +2589,9 @@ mgpuCudnnSub(void* inputA, void* inputB, void* output,
   CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
       cDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, n, c, h, w));
   
-  // 创建操作描述符
-  cudnnOpTensorDescriptor_t opDesc;
-  CUDNN_REPORT_IF_ERROR(cudnnCreateOpTensorDescriptor(&opDesc));
+  // // 创建操作描述符
+  // cudnnOpTensorDescriptor_t opDesc;
+  // CUDNN_REPORT_IF_ERROR(cudnnCreateOpTensorDescriptor(&opDesc));
   
   // 设置为加法操作
   CUDNN_REPORT_IF_ERROR(cudnnSetOpTensorDescriptor(
@@ -1675,11 +2609,11 @@ mgpuCudnnSub(void* inputA, void* inputB, void* output,
       &alpha2, bDesc, inputB,
       &beta, cDesc, output));
   
-  // 清理描述符
-  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(aDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(bDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(cDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnDestroyOpTensorDescriptor(opDesc));
+  // // 清理描述符
+  // CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(aDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(bDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(cDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnDestroyOpTensorDescriptor(opDesc));
 }
 
 // 张量取反操作: B = -A
@@ -1699,11 +2633,17 @@ mgpuCudnnNeg(void* input, void* output,
   // 获取此流的cuDNN句柄
   // cudnnHandle_t handle = mgpuCudnnGetHandle(stream);
   
-  // 创建张量描述符
-  cudnnTensorDescriptor_t aDesc, cDesc;
-  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&aDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&cDesc));
+  // // 创建张量描述符
+  // cudnnTensorDescriptor_t aDesc, cDesc;
+  // CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&aDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&cDesc));
   
+  // 从池中获取描述符
+  cudnnTensorDescriptor_t aDesc = acquireTensorDescriptor();
+  cudnnTensorDescriptor_t cDesc = acquireTensorDescriptor();
+  cudnnTensorDescriptor_t dummyDesc = acquireTensorDescriptor();
+  cudnnOpTensorDescriptor_t opDesc = acquireOpTensorDescriptor();
+
   // 设置张量描述符
   CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
       aDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, n, c, h, w));
@@ -1711,14 +2651,14 @@ mgpuCudnnNeg(void* input, void* output,
       cDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, n, c, h, w));
   
   // 为第二个操作数创建一个虚拟张量描述符（实际不会使用）
-  cudnnTensorDescriptor_t dummyDesc;
-  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&dummyDesc));
+  // cudnnTensorDescriptor_t dummyDesc;
+  // CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&dummyDesc));
   CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
       dummyDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, 1, 1, 1, 1));
   
-  // 创建操作描述符
-  cudnnOpTensorDescriptor_t opDesc;
-  CUDNN_REPORT_IF_ERROR(cudnnCreateOpTensorDescriptor(&opDesc));
+  // // 创建操作描述符
+  // cudnnOpTensorDescriptor_t opDesc;
+  // CUDNN_REPORT_IF_ERROR(cudnnCreateOpTensorDescriptor(&opDesc));
   
   // 使用加法操作实现取反: -A = -1.0 * A + 0 * dummy
   CUDNN_REPORT_IF_ERROR(cudnnSetOpTensorDescriptor(
@@ -1739,11 +2679,11 @@ mgpuCudnnNeg(void* input, void* output,
       &alpha2, dummyDesc, &dummyValue,
       &beta, cDesc, output));
   
-  // 清理描述符
-  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(aDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(cDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(dummyDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnDestroyOpTensorDescriptor(opDesc));
+  // // 清理描述符
+  // CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(aDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(cDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(dummyDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnDestroyOpTensorDescriptor(opDesc));
 }
 
 // 标量乘法操作: C = A * scalar
@@ -1759,12 +2699,19 @@ mgpuCudnnMulScalar(void* input, void* scalar, void* output,
   }
   cudnnHandle_t handle = handles.cudnn_handle;
   
-  // 创建张量描述符
-  cudnnTensorDescriptor_t inputDesc, scalarDesc, outputDesc;
-  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&inputDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&scalarDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&outputDesc));
+  // // 创建张量描述符
+  // cudnnTensorDescriptor_t inputDesc, scalarDesc, outputDesc;
+  // CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&inputDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&scalarDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&outputDesc));
   
+  // 从池中获取描述符
+  cudnnTensorDescriptor_t inputDesc = acquireTensorDescriptor();
+  cudnnTensorDescriptor_t scalarDesc = acquireTensorDescriptor();
+  cudnnTensorDescriptor_t outputDesc = acquireTensorDescriptor();
+  cudnnOpTensorDescriptor_t opDesc = acquireOpTensorDescriptor();
+
+
   // 设置张量描述符
   CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
       inputDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, n, c, h, w));
@@ -1773,9 +2720,9 @@ mgpuCudnnMulScalar(void* input, void* scalar, void* output,
   CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
       outputDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, n, c, h, w));
   
-  // 创建操作描述符
-  cudnnOpTensorDescriptor_t opDesc;
-  CUDNN_REPORT_IF_ERROR(cudnnCreateOpTensorDescriptor(&opDesc));
+  // // 创建操作描述符
+  // cudnnOpTensorDescriptor_t opDesc;
+  // CUDNN_REPORT_IF_ERROR(cudnnCreateOpTensorDescriptor(&opDesc));
   
   // 设置为乘法操作
   CUDNN_REPORT_IF_ERROR(cudnnSetOpTensorDescriptor(
@@ -1793,11 +2740,11 @@ mgpuCudnnMulScalar(void* input, void* scalar, void* output,
       &alpha2, scalarDesc, scalar,
       &beta, outputDesc, output));
   
-  // 清理描述符
-  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(inputDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(scalarDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(outputDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnDestroyOpTensorDescriptor(opDesc));
+  // // 清理描述符
+  // CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(inputDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(scalarDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(outputDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnDestroyOpTensorDescriptor(opDesc));
 }
 
 // 标量加法操作: C = A + scalar
@@ -1813,11 +2760,17 @@ mgpuCudnnAddScalar(void* input, void* scalar, void* output,
   }
   cudnnHandle_t handle = handles.cudnn_handle;
   
-  // 创建张量描述符
-  cudnnTensorDescriptor_t inputDesc, scalarDesc, outputDesc;
-  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&inputDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&scalarDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&outputDesc));
+  // // 创建张量描述符
+  // cudnnTensorDescriptor_t inputDesc, scalarDesc, outputDesc;
+  // CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&inputDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&scalarDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&outputDesc));
+  
+  // 从池中获取描述符
+  cudnnTensorDescriptor_t inputDesc = acquireTensorDescriptor();
+  cudnnTensorDescriptor_t scalarDesc = acquireTensorDescriptor();
+  cudnnTensorDescriptor_t outputDesc = acquireTensorDescriptor();
+  cudnnOpTensorDescriptor_t opDesc = acquireOpTensorDescriptor();
   
   // 设置张量描述符
   CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
@@ -1827,9 +2780,9 @@ mgpuCudnnAddScalar(void* input, void* scalar, void* output,
   CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
       outputDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, n, c, h, w));
   
-  // 创建操作描述符
-  cudnnOpTensorDescriptor_t opDesc;
-  CUDNN_REPORT_IF_ERROR(cudnnCreateOpTensorDescriptor(&opDesc));
+  // // 创建操作描述符
+  // cudnnOpTensorDescriptor_t opDesc;
+  // CUDNN_REPORT_IF_ERROR(cudnnCreateOpTensorDescriptor(&opDesc));
   
   // 设置为加法操作
   CUDNN_REPORT_IF_ERROR(cudnnSetOpTensorDescriptor(
@@ -1847,11 +2800,11 @@ mgpuCudnnAddScalar(void* input, void* scalar, void* output,
       &alpha2, scalarDesc, scalar,
       &beta, outputDesc, output));
   
-  // 清理描述符
-  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(inputDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(scalarDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(outputDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnDestroyOpTensorDescriptor(opDesc));
+  // // 清理描述符
+  // CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(inputDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(scalarDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(outputDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnDestroyOpTensorDescriptor(opDesc));
 }
 
 // 标量减法操作: C = A - scalar
@@ -1867,12 +2820,18 @@ mgpuCudnnSubScalar(void* input, void* scalar, void* output,
   }
   cudnnHandle_t handle = handles.cudnn_handle;
   
-  // 创建张量描述符
-  cudnnTensorDescriptor_t inputDesc, scalarDesc, outputDesc;
-  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&inputDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&scalarDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&outputDesc));
-  
+  // // 创建张量描述符
+  // cudnnTensorDescriptor_t inputDesc, scalarDesc, outputDesc;
+  // CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&inputDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&scalarDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&outputDesc));
+
+  // 从池中获取描述符
+  cudnnTensorDescriptor_t inputDesc = acquireTensorDescriptor();
+  cudnnTensorDescriptor_t scalarDesc = acquireTensorDescriptor();
+  cudnnTensorDescriptor_t outputDesc = acquireTensorDescriptor();
+  cudnnOpTensorDescriptor_t opDesc = acquireOpTensorDescriptor();
+
   // 设置张量描述符
   CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
       inputDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, n, c, h, w));
@@ -1881,9 +2840,9 @@ mgpuCudnnSubScalar(void* input, void* scalar, void* output,
   CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
       outputDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, n, c, h, w));
   
-  // 创建操作描述符
-  cudnnOpTensorDescriptor_t opDesc;
-  CUDNN_REPORT_IF_ERROR(cudnnCreateOpTensorDescriptor(&opDesc));
+  // // 创建操作描述符
+  // cudnnOpTensorDescriptor_t opDesc;
+  // CUDNN_REPORT_IF_ERROR(cudnnCreateOpTensorDescriptor(&opDesc));
   
   // 设置为加法操作 (通过负系数实现减法)
   CUDNN_REPORT_IF_ERROR(cudnnSetOpTensorDescriptor(
@@ -1902,11 +2861,11 @@ mgpuCudnnSubScalar(void* input, void* scalar, void* output,
       &alpha2, scalarDesc, scalar,
       &beta, outputDesc, output));
   
-  // 清理描述符
-  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(inputDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(scalarDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(outputDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnDestroyOpTensorDescriptor(opDesc));
+  // // 清理描述符
+  // CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(inputDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(scalarDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(outputDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnDestroyOpTensorDescriptor(opDesc));
 }
 
 // 反向标量减法操作: C = scalar - A
@@ -1922,12 +2881,18 @@ mgpuCudnnRSubScalar(void* input, void* scalar, void* output,
   }
   cudnnHandle_t handle = handles.cudnn_handle;
   
-  // 创建张量描述符
-  cudnnTensorDescriptor_t inputDesc, scalarDesc, outputDesc;
-  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&inputDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&scalarDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&outputDesc));
+  // // 创建张量描述符
+  // cudnnTensorDescriptor_t inputDesc, scalarDesc, outputDesc;
+  // CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&inputDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&scalarDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&outputDesc));
   
+  // 从池中获取描述符
+  cudnnTensorDescriptor_t inputDesc = acquireTensorDescriptor();
+  cudnnTensorDescriptor_t scalarDesc = acquireTensorDescriptor();
+  cudnnTensorDescriptor_t outputDesc = acquireTensorDescriptor();
+  cudnnOpTensorDescriptor_t opDesc = acquireOpTensorDescriptor();
+
   // 设置张量描述符
   CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
       inputDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, n, c, h, w));
@@ -1936,9 +2901,9 @@ mgpuCudnnRSubScalar(void* input, void* scalar, void* output,
   CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
       outputDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, n, c, h, w));
   
-  // 创建操作描述符
-  cudnnOpTensorDescriptor_t opDesc;
-  CUDNN_REPORT_IF_ERROR(cudnnCreateOpTensorDescriptor(&opDesc));
+  // // 创建操作描述符
+  // cudnnOpTensorDescriptor_t opDesc;
+  // CUDNN_REPORT_IF_ERROR(cudnnCreateOpTensorDescriptor(&opDesc));
   
   // 设置为加法操作 (通过负系数实现反向减法)
   CUDNN_REPORT_IF_ERROR(cudnnSetOpTensorDescriptor(
@@ -1957,11 +2922,11 @@ mgpuCudnnRSubScalar(void* input, void* scalar, void* output,
       &alpha2, scalarDesc, scalar,
       &beta, outputDesc, output));
   
-  // 清理描述符
-  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(inputDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(scalarDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(outputDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnDestroyOpTensorDescriptor(opDesc));
+  // // 清理描述符
+  // CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(inputDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(scalarDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(outputDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnDestroyOpTensorDescriptor(opDesc));
 }
 
 // fp16
@@ -1978,12 +2943,18 @@ mgpuCudnnMul_fp16(void* inputA, void* inputB, void* output,
   }
   cudnnHandle_t handle = handles.cudnn_handle;
   
-  // 创建张量描述符
-  cudnnTensorDescriptor_t aDesc, bDesc, cDesc;
-  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&aDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&bDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&cDesc));
+  // // 创建张量描述符
+  // cudnnTensorDescriptor_t aDesc, bDesc, cDesc;
+  // CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&aDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&bDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&cDesc));
   
+  // 从池中获取描述符
+  cudnnTensorDescriptor_t aDesc = acquireTensorDescriptor();
+  cudnnTensorDescriptor_t bDesc = acquireTensorDescriptor();
+  cudnnTensorDescriptor_t cDesc = acquireTensorDescriptor();
+  cudnnOpTensorDescriptor_t opDesc = acquireOpTensorDescriptor();
+
   // 设置张量描述符 - 修改为FP16
   CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
       aDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_HALF, n, c, h, w));
@@ -1992,9 +2963,9 @@ mgpuCudnnMul_fp16(void* inputA, void* inputB, void* output,
   CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
       cDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_HALF, n, c, h, w));
   
-  // 创建操作描述符
-  cudnnOpTensorDescriptor_t opDesc;
-  CUDNN_REPORT_IF_ERROR(cudnnCreateOpTensorDescriptor(&opDesc));
+  // // 创建操作描述符
+  // cudnnOpTensorDescriptor_t opDesc;
+  // CUDNN_REPORT_IF_ERROR(cudnnCreateOpTensorDescriptor(&opDesc));
   
   // 设置为乘法操作
   CUDNN_REPORT_IF_ERROR(cudnnSetOpTensorDescriptor(
@@ -2012,11 +2983,11 @@ mgpuCudnnMul_fp16(void* inputA, void* inputB, void* output,
       &alpha2, bDesc, inputB,
       &beta, cDesc, output));
   
-  // 清理描述符
-  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(aDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(bDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(cDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnDestroyOpTensorDescriptor(opDesc));
+  // // 清理描述符
+  // CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(aDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(bDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(cDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnDestroyOpTensorDescriptor(opDesc));
 }
 
 // 张量加法操作: C = A + B (FP16 + Tensor Core)
@@ -2034,11 +3005,17 @@ mgpuCudnnAdd_fp16(void* inputA, void* inputB, void* output,
   
   cudnnHandle_t handle = handles.cudnn_handle;
   
-  // 创建张量描述符
-  cudnnTensorDescriptor_t aDesc, bDesc, cDesc;
-  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&aDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&bDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&cDesc));
+  // // 创建张量描述符
+  // cudnnTensorDescriptor_t aDesc, bDesc, cDesc;
+  // CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&aDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&bDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&cDesc));
+
+  // 从池中获取描述符
+  cudnnTensorDescriptor_t aDesc = acquireTensorDescriptor();
+  cudnnTensorDescriptor_t bDesc = acquireTensorDescriptor();
+  cudnnTensorDescriptor_t cDesc = acquireTensorDescriptor();
+  cudnnOpTensorDescriptor_t opDesc = acquireOpTensorDescriptor();
   
   // 设置张量描述符 - 修改为FP16
   CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
@@ -2048,9 +3025,9 @@ mgpuCudnnAdd_fp16(void* inputA, void* inputB, void* output,
   CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
       cDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_HALF, n, c, h, w));
   
-  // 创建操作描述符
-  cudnnOpTensorDescriptor_t opDesc;
-  CUDNN_REPORT_IF_ERROR(cudnnCreateOpTensorDescriptor(&opDesc));
+  // // 创建操作描述符
+  // cudnnOpTensorDescriptor_t opDesc;
+  // CUDNN_REPORT_IF_ERROR(cudnnCreateOpTensorDescriptor(&opDesc));
   
   // 设置为加法操作
   CUDNN_REPORT_IF_ERROR(cudnnSetOpTensorDescriptor(
@@ -2068,11 +3045,11 @@ mgpuCudnnAdd_fp16(void* inputA, void* inputB, void* output,
       &alpha2, bDesc, inputB,
       &beta, cDesc, output));
   
-  // 清理描述符
-  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(aDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(bDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(cDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnDestroyOpTensorDescriptor(opDesc));
+  // // 清理描述符
+  // CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(aDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(bDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(cDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnDestroyOpTensorDescriptor(opDesc));
 }
 
 extern "C" MLIR_CUDA_WRAPPERS_EXPORT void 
@@ -2087,11 +3064,18 @@ mgpuCudnnSub_fp16(void* inputA, void* inputB, void* output,
   }
   cudnnHandle_t handle = handles.cudnn_handle;
   
-  // 创建张量描述符
-  cudnnTensorDescriptor_t aDesc, bDesc, cDesc;
-  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&aDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&bDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&cDesc));
+  // // 创建张量描述符
+  // cudnnTensorDescriptor_t aDesc, bDesc, cDesc;
+  // CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&aDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&bDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&cDesc));
+
+  // 从池中获取描述符
+  cudnnTensorDescriptor_t aDesc = acquireTensorDescriptor();
+  cudnnTensorDescriptor_t bDesc = acquireTensorDescriptor();
+  cudnnTensorDescriptor_t cDesc = acquireTensorDescriptor();
+  cudnnOpTensorDescriptor_t opDesc = acquireOpTensorDescriptor();
+
   
   // 设置张量描述符 - 修改为FP16
   CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
@@ -2101,9 +3085,9 @@ mgpuCudnnSub_fp16(void* inputA, void* inputB, void* output,
   CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
       cDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_HALF, n, c, h, w));
   
-  // 创建操作描述符
-  cudnnOpTensorDescriptor_t opDesc;
-  CUDNN_REPORT_IF_ERROR(cudnnCreateOpTensorDescriptor(&opDesc));
+  // // 创建操作描述符
+  // cudnnOpTensorDescriptor_t opDesc;
+  // CUDNN_REPORT_IF_ERROR(cudnnCreateOpTensorDescriptor(&opDesc));
   
   // 设置为加法操作
   CUDNN_REPORT_IF_ERROR(cudnnSetOpTensorDescriptor(
@@ -2121,11 +3105,11 @@ mgpuCudnnSub_fp16(void* inputA, void* inputB, void* output,
       &alpha2, bDesc, inputB,
       &beta, cDesc, output));
   
-  // 清理描述符
-  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(aDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(bDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(cDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnDestroyOpTensorDescriptor(opDesc));
+  // // 清理描述符
+  // CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(aDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(bDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(cDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnDestroyOpTensorDescriptor(opDesc));
 }
 
 // 张量取反操作: B = -A (FP16 + Tensor Core)
@@ -2141,11 +3125,17 @@ mgpuCudnnNeg_fp16(void* input, void* output,
   }
   cudnnHandle_t handle = handles.cudnn_handle;
   
-  // 创建张量描述符
-  cudnnTensorDescriptor_t aDesc, cDesc;
-  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&aDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&cDesc));
+  // // 创建张量描述符
+  // cudnnTensorDescriptor_t aDesc, cDesc;
+  // CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&aDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&cDesc));
   
+  // 从池中获取描述符
+  cudnnTensorDescriptor_t aDesc = acquireTensorDescriptor();
+  cudnnTensorDescriptor_t dummyDesc = acquireTensorDescriptor();
+  cudnnTensorDescriptor_t cDesc = acquireTensorDescriptor();
+  cudnnOpTensorDescriptor_t opDesc = acquireOpTensorDescriptor();
+
   // 设置张量描述符 - 修改为FP16
   CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
       aDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_HALF, n, c, h, w));
@@ -2153,14 +3143,14 @@ mgpuCudnnNeg_fp16(void* input, void* output,
       cDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_HALF, n, c, h, w));
   
   // 为第二个操作数创建一个虚拟张量描述符（实际不会使用）
-  cudnnTensorDescriptor_t dummyDesc;
-  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&dummyDesc));
+  // cudnnTensorDescriptor_t dummyDesc;
+  // CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&dummyDesc));
   CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
       dummyDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_HALF, 1, 1, 1, 1));
   
-  // 创建操作描述符
-  cudnnOpTensorDescriptor_t opDesc;
-  CUDNN_REPORT_IF_ERROR(cudnnCreateOpTensorDescriptor(&opDesc));
+  // // 创建操作描述符
+  // cudnnOpTensorDescriptor_t opDesc;
+  // CUDNN_REPORT_IF_ERROR(cudnnCreateOpTensorDescriptor(&opDesc));
   
   // 使用加法操作实现取反: -A = -1.0 * A + 0 * dummy
   CUDNN_REPORT_IF_ERROR(cudnnSetOpTensorDescriptor(
@@ -2181,11 +3171,11 @@ mgpuCudnnNeg_fp16(void* input, void* output,
       &alpha2, dummyDesc, &dummyValue,
       &beta, cDesc, output));
   
-  // 清理描述符
-  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(aDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(cDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(dummyDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnDestroyOpTensorDescriptor(opDesc));
+  // // 清理描述符
+  // CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(aDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(cDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(dummyDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnDestroyOpTensorDescriptor(opDesc));
 }
 
 // 标量乘法操作: C = A * scalar (FP16 + Tensor Core)
@@ -2201,12 +3191,19 @@ mgpuCudnnMulScalar_fp16(void* input, void* scalar, void* output,
   }
   cudnnHandle_t handle = handles.cudnn_handle;
   
-  // 创建张量描述符
-  cudnnTensorDescriptor_t inputDesc, scalarDesc, outputDesc;
-  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&inputDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&scalarDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&outputDesc));
+  // // 创建张量描述符
+  // cudnnTensorDescriptor_t inputDesc, scalarDesc, outputDesc;
+  // CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&inputDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&scalarDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&outputDesc));
   
+  // 从池中获取描述符
+  cudnnTensorDescriptor_t inputDesc = acquireTensorDescriptor();
+  cudnnTensorDescriptor_t scalarDesc = acquireTensorDescriptor();
+  cudnnTensorDescriptor_t outputDesc = acquireTensorDescriptor();
+  cudnnOpTensorDescriptor_t opDesc = acquireOpTensorDescriptor();
+
+
   // 设置张量描述符 - 修改为FP16
   CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
       inputDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_HALF, n, c, h, w));
@@ -2215,9 +3212,9 @@ mgpuCudnnMulScalar_fp16(void* input, void* scalar, void* output,
   CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
       outputDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_HALF, n, c, h, w));
   
-  // 创建操作描述符
-  cudnnOpTensorDescriptor_t opDesc;
-  CUDNN_REPORT_IF_ERROR(cudnnCreateOpTensorDescriptor(&opDesc));
+  // // 创建操作描述符
+  // cudnnOpTensorDescriptor_t opDesc;
+  // CUDNN_REPORT_IF_ERROR(cudnnCreateOpTensorDescriptor(&opDesc));
   
   // 设置为乘法操作
   CUDNN_REPORT_IF_ERROR(cudnnSetOpTensorDescriptor(
@@ -2235,11 +3232,11 @@ mgpuCudnnMulScalar_fp16(void* input, void* scalar, void* output,
       &alpha2, scalarDesc, scalar,
       &beta, outputDesc, output));
   
-  // 清理描述符
-  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(inputDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(scalarDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(outputDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnDestroyOpTensorDescriptor(opDesc));
+  // // 清理描述符
+  // CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(inputDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(scalarDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(outputDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnDestroyOpTensorDescriptor(opDesc));
 }
 
 // 标量加法操作: C = A + scalar (FP16 + Tensor Core)
@@ -2255,12 +3252,18 @@ mgpuCudnnAddScalar_fp16(void* input, void* scalar, void* output,
   }
   cudnnHandle_t handle = handles.cudnn_handle;
   
-  // 创建张量描述符
-  cudnnTensorDescriptor_t inputDesc, scalarDesc, outputDesc;
-  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&inputDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&scalarDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&outputDesc));
+  // // 创建张量描述符
+  // cudnnTensorDescriptor_t inputDesc, scalarDesc, outputDesc;
+  // CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&inputDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&scalarDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&outputDesc));
   
+  // 从池中获取描述符
+  cudnnTensorDescriptor_t inputDesc = acquireTensorDescriptor();
+  cudnnTensorDescriptor_t scalarDesc = acquireTensorDescriptor();
+  cudnnTensorDescriptor_t outputDesc = acquireTensorDescriptor();
+  cudnnOpTensorDescriptor_t opDesc = acquireOpTensorDescriptor();
+
   // 设置张量描述符 - 修改为FP16
   CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
       inputDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_HALF, n, c, h, w));
@@ -2269,9 +3272,9 @@ mgpuCudnnAddScalar_fp16(void* input, void* scalar, void* output,
   CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
       outputDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_HALF, n, c, h, w));
   
-  // 创建操作描述符
-  cudnnOpTensorDescriptor_t opDesc;
-  CUDNN_REPORT_IF_ERROR(cudnnCreateOpTensorDescriptor(&opDesc));
+  // // 创建操作描述符
+  // cudnnOpTensorDescriptor_t opDesc;
+  // CUDNN_REPORT_IF_ERROR(cudnnCreateOpTensorDescriptor(&opDesc));
   
   // 设置为加法操作
   CUDNN_REPORT_IF_ERROR(cudnnSetOpTensorDescriptor(
@@ -2289,11 +3292,11 @@ mgpuCudnnAddScalar_fp16(void* input, void* scalar, void* output,
       &alpha2, scalarDesc, scalar,
       &beta, outputDesc, output));
   
-  // 清理描述符
-  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(inputDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(scalarDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(outputDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnDestroyOpTensorDescriptor(opDesc));
+  // // 清理描述符
+  // CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(inputDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(scalarDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(outputDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnDestroyOpTensorDescriptor(opDesc));
 }
 
 // 标量减法操作: C = A - scalar (FP16 + Tensor Core)
@@ -2309,12 +3312,19 @@ mgpuCudnnSubScalar_fp16(void* input, void* scalar, void* output,
   }
   cudnnHandle_t handle = handles.cudnn_handle;
   
-  // 创建张量描述符
-  cudnnTensorDescriptor_t inputDesc, scalarDesc, outputDesc;
-  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&inputDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&scalarDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&outputDesc));
+  // // 创建张量描述符
+  // cudnnTensorDescriptor_t inputDesc, scalarDesc, outputDesc;
+  // CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&inputDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&scalarDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&outputDesc));
   
+  // 从池中获取描述符
+  cudnnTensorDescriptor_t inputDesc = acquireTensorDescriptor();
+  cudnnTensorDescriptor_t scalarDesc = acquireTensorDescriptor();
+  cudnnTensorDescriptor_t outputDesc = acquireTensorDescriptor();
+  cudnnOpTensorDescriptor_t opDesc = acquireOpTensorDescriptor();
+
+
   // 设置张量描述符 - 修改为FP16
   CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
       inputDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_HALF, n, c, h, w));
@@ -2323,9 +3333,9 @@ mgpuCudnnSubScalar_fp16(void* input, void* scalar, void* output,
   CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
       outputDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_HALF, n, c, h, w));
   
-  // 创建操作描述符
-  cudnnOpTensorDescriptor_t opDesc;
-  CUDNN_REPORT_IF_ERROR(cudnnCreateOpTensorDescriptor(&opDesc));
+  // // 创建操作描述符
+  // cudnnOpTensorDescriptor_t opDesc;
+  // CUDNN_REPORT_IF_ERROR(cudnnCreateOpTensorDescriptor(&opDesc));
   
   // 设置为加法操作 (通过负系数实现减法)
   CUDNN_REPORT_IF_ERROR(cudnnSetOpTensorDescriptor(
@@ -2344,11 +3354,11 @@ mgpuCudnnSubScalar_fp16(void* input, void* scalar, void* output,
       &alpha2, scalarDesc, scalar,
       &beta, outputDesc, output));
   
-  // 清理描述符
-  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(inputDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(scalarDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(outputDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnDestroyOpTensorDescriptor(opDesc));
+  // // 清理描述符
+  // CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(inputDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(scalarDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(outputDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnDestroyOpTensorDescriptor(opDesc));
 }
 
 // 反向标量减法操作: C = scalar - A (FP16 + Tensor Core)
@@ -2364,12 +3374,18 @@ mgpuCudnnRSubScalar_fp16(void* input, void* scalar, void* output,
   }
   cudnnHandle_t handle = handles.cudnn_handle;
   
-  // 创建张量描述符
-  cudnnTensorDescriptor_t inputDesc, scalarDesc, outputDesc;
-  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&inputDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&scalarDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&outputDesc));
+  // // 创建张量描述符
+  // cudnnTensorDescriptor_t inputDesc, scalarDesc, outputDesc;
+  // CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&inputDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&scalarDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&outputDesc));
   
+  // 从池中获取描述符
+  cudnnTensorDescriptor_t inputDesc = acquireTensorDescriptor();
+  cudnnTensorDescriptor_t scalarDesc = acquireTensorDescriptor();
+  cudnnTensorDescriptor_t outputDesc = acquireTensorDescriptor();
+  cudnnOpTensorDescriptor_t opDesc = acquireOpTensorDescriptor();
+
   // 设置张量描述符 - 修改为FP16
   CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
       inputDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_HALF, n, c, h, w));
@@ -2378,9 +3394,9 @@ mgpuCudnnRSubScalar_fp16(void* input, void* scalar, void* output,
   CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
       outputDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_HALF, n, c, h, w));
   
-  // 创建操作描述符
-  cudnnOpTensorDescriptor_t opDesc;
-  CUDNN_REPORT_IF_ERROR(cudnnCreateOpTensorDescriptor(&opDesc));
+  // // 创建操作描述符
+  // cudnnOpTensorDescriptor_t opDesc;
+  // CUDNN_REPORT_IF_ERROR(cudnnCreateOpTensorDescriptor(&opDesc));
   
   // 设置为加法操作 (通过负系数实现反向减法)
   CUDNN_REPORT_IF_ERROR(cudnnSetOpTensorDescriptor(
@@ -2399,11 +3415,11 @@ mgpuCudnnRSubScalar_fp16(void* input, void* scalar, void* output,
       &alpha2, scalarDesc, scalar,
       &beta, outputDesc, output));
   
-  // 清理描述符
-  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(inputDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(scalarDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(outputDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnDestroyOpTensorDescriptor(opDesc));
+  // // 清理描述符
+  // CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(inputDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(scalarDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(outputDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnDestroyOpTensorDescriptor(opDesc));
 }
 
 // MaxPool implementation using cuDNN (FP16 + Tensor Core)
@@ -2428,14 +3444,20 @@ mgpuCudnnMaxPoolForward_fp16(
   }
   cudnnHandle_t handle = handles.cudnn_handle;
   
-  // 创建描述符
-  cudnnTensorDescriptor_t inputDesc, outputDesc;
-  cudnnPoolingDescriptor_t poolDesc;
+  // // 创建描述符
+  // cudnnTensorDescriptor_t inputDesc, outputDesc;
+  // cudnnPoolingDescriptor_t poolDesc;
   
-  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&inputDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&outputDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnCreatePoolingDescriptor(&poolDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&inputDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&outputDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnCreatePoolingDescriptor(&poolDesc));
   
+  // 从池中获取描述符
+  cudnnTensorDescriptor_t inputDesc = acquireTensorDescriptor();
+  cudnnTensorDescriptor_t outputDesc = acquireTensorDescriptor();
+  cudnnPoolingDescriptor_t poolDesc = acquirePoolingDescriptor();
+
+
   // 设置输入描述符 - 修改为FP16
   CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
       inputDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_HALF, n, c, h, w));
@@ -2473,10 +3495,10 @@ mgpuCudnnMaxPoolForward_fp16(
   CUDNN_REPORT_IF_ERROR(cudnnPoolingForward(
       handle, poolDesc, &alpha, inputDesc, input_data, &beta, outputDesc, output_data));
   
-  // 清理描述符
-  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(inputDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(outputDesc));
-  CUDNN_REPORT_IF_ERROR(cudnnDestroyPoolingDescriptor(poolDesc));
+  // // 清理描述符
+  // CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(inputDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(outputDesc));
+  // CUDNN_REPORT_IF_ERROR(cudnnDestroyPoolingDescriptor(poolDesc));
 }
 
 // 支持transB的全连接层实现 (FP16 + Tensor Core)
@@ -2531,11 +3553,15 @@ mgpuCulibsFullyConnectedForward_fp16(
   if (bias_data != nullptr) {
     cudnnHandle_t cudnnHandle = handles.cudnn_handle;
     
-    // 创建张量描述符
-    cudnnTensorDescriptor_t outputDesc, biasDesc;
-    CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&outputDesc));
-    CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&biasDesc));
+    // // 创建张量描述符
+    // cudnnTensorDescriptor_t outputDesc, biasDesc;
+    // CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&outputDesc));
+    // CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&biasDesc));
     
+    // 从池中获取描述符
+    cudnnTensorDescriptor_t outputDesc = acquireTensorDescriptor();
+    cudnnTensorDescriptor_t biasDesc = acquireTensorDescriptor();
+
     // 设置输出描述符 - 修改为FP16
     CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
         outputDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_HALF, 
@@ -2554,9 +3580,9 @@ mgpuCulibsFullyConnectedForward_fp16(
         cudnnHandle, &alpha_bias, biasDesc, bias_data, 
         &beta_bias, outputDesc, output_data));
     
-    // 清理描述符
-    CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(outputDesc));
-    CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(biasDesc));
+    // // 清理描述符
+    // CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(outputDesc));
+    // CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(biasDesc));
   }
 }
 
@@ -2614,11 +3640,15 @@ mgpuCulibsFlattenFullyConnectedForward_fp16(
   if (bias_data != nullptr) {
     cudnnHandle_t cudnnHandle = handles.cudnn_handle;
     
-    // Create tensor descriptors
-    cudnnTensorDescriptor_t outputDesc, biasDesc;
-    CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&outputDesc));
-    CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&biasDesc));
+    // // Create tensor descriptors
+    // cudnnTensorDescriptor_t outputDesc, biasDesc;
+    // CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&outputDesc));
+    // CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&biasDesc));
     
+    // 从池中获取描述符
+    cudnnTensorDescriptor_t outputDesc = acquireTensorDescriptor();
+    cudnnTensorDescriptor_t biasDesc = acquireTensorDescriptor();
+
     // Set output descriptor as a 4D tensor with H=W=1 - 修改为FP16
     CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
         outputDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_HALF, 
@@ -2637,9 +3667,9 @@ mgpuCulibsFlattenFullyConnectedForward_fp16(
         cudnnHandle, &alpha_bias, biasDesc, bias_data, 
         &beta_bias, outputDesc, output_data));
     
-    // Clean up descriptors
-    CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(outputDesc));
-    CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(biasDesc));
+    // // Clean up descriptors
+    // CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(outputDesc));
+    // CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(biasDesc));
   }
 }
 
@@ -2766,10 +3796,6 @@ mgpuCulibsFlattenFullyConnectedForward_fp16(
 //   CUDNN_REPORT_IF_ERROR(cudnnDestroyConvolutionDescriptor(convDesc));
 // }
 
-// 简单的全局算法缓存
-static cudnnConvolutionFwdAlgo_t g_cached_algo = CUDNN_CONVOLUTION_FWD_ALGO_COUNT; // 无效值表示未初始化
-static bool g_algo_cached = false;
-
 // fp16 conv
 extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuCudnnConv2dForward_fp16(
     int n, int c, int h, int w_in,              // 输入尺寸
@@ -2799,16 +3825,23 @@ extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuCudnnConv2dForward_fp16(
         algo = g_cached_algo;
     }
     
-    // 创建描述符
-    cudnnTensorDescriptor_t xDesc, yDesc, biasDesc;
-    cudnnFilterDescriptor_t wDesc;
-    cudnnConvolutionDescriptor_t convDesc;
+    // // 创建描述符
+    // cudnnTensorDescriptor_t xDesc, yDesc, biasDesc;
+    // cudnnFilterDescriptor_t wDesc;
+    // cudnnConvolutionDescriptor_t convDesc;
     
-    CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&xDesc));
-    CUDNN_REPORT_IF_ERROR(cudnnCreateFilterDescriptor(&wDesc));
-    CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&yDesc));
-    CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&biasDesc));
-    CUDNN_REPORT_IF_ERROR(cudnnCreateConvolutionDescriptor(&convDesc));
+    // CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&xDesc));
+    // CUDNN_REPORT_IF_ERROR(cudnnCreateFilterDescriptor(&wDesc));
+    // CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&yDesc));
+    // CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&biasDesc));
+    // CUDNN_REPORT_IF_ERROR(cudnnCreateConvolutionDescriptor(&convDesc));
+
+    // 从池中获取描述符（自动追踪为活跃状态）
+    cudnnTensorDescriptor_t xDesc = acquireTensorDescriptor();
+    cudnnFilterDescriptor_t wDesc = acquireFilterDescriptor();
+    cudnnTensorDescriptor_t yDesc = acquireTensorDescriptor();
+    cudnnTensorDescriptor_t biasDesc = acquireTensorDescriptor();
+    cudnnConvolutionDescriptor_t convDesc = acquireConvolutionDescriptor();
     
     // 设置输入描述符 - 修改为FP16
     CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
@@ -2865,14 +3898,38 @@ extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuCudnnConv2dForward_fp16(
     size_t workspaceSize = 0;
     CUDNN_REPORT_IF_ERROR(cudnnGetConvolutionForwardWorkspaceSize(
         handle, xDesc, wDesc, convDesc, yDesc, algo, &workspaceSize));
-    
-    // 分配工作空间
+    // ========== 使用Workspace Pool ==========
     void* workspace = nullptr;
+    bool using_pool = false;
+    
     if (workspaceSize > 0) {
-        CUdeviceptr wsPtr = 0;
-        CUDA_REPORT_IF_ERROR(cuMemAlloc(&wsPtr, workspaceSize));
-        workspace = reinterpret_cast<void*>(wsPtr);
+        // 尝试从pool获取workspace
+        workspace = acquirePooledWorkspace(workspaceSize, stream);
+        
+        if (workspace != nullptr) {
+            using_pool = true;
+            // fprintf(stderr, "[CONV] Using pooled workspace (size: %zu bytes)\n", workspaceSize);
+        } else {
+            // 回退到动态分配
+            CUdeviceptr wsPtr = 0;
+            CUresult result = cuMemAlloc(&wsPtr, workspaceSize);
+            if (result == CUDA_SUCCESS) {
+                workspace = reinterpret_cast<void*>(wsPtr);
+                // fprintf(stderr, "[CONV] Using dynamic workspace (size: %zu bytes)\n", workspaceSize);
+            } else {
+                fprintf(stderr, "[CONV] ERROR: Failed to allocate workspace of size %zu bytes\n", workspaceSize);
+                return;
+            }
+        }
     }
+
+    // // 分配工作空间
+    // void* workspace = nullptr;
+    // if (workspaceSize > 0) {
+    //     CUdeviceptr wsPtr = 0;
+    //     CUDA_REPORT_IF_ERROR(cuMemAlloc(&wsPtr, workspaceSize));
+    //     workspace = reinterpret_cast<void*>(wsPtr);
+    // }
 
     // 执行卷积 - 修改alpha/beta为FP16类型
     const __half alpha = __float2half(1.0f);
@@ -2893,17 +3950,23 @@ extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuCudnnConv2dForward_fp16(
             handle, &alpha_bias, biasDesc, bias_data, &beta_bias, yDesc, y_data));
     }
     
-    // 释放工作空间
-    if (workspace != nullptr) {
-        CUDA_REPORT_IF_ERROR(cuMemFree(reinterpret_cast<CUdeviceptr>(workspace)));
-    }
+    // // 释放工作空间
+    // if (workspace != nullptr) {
+    //     CUDA_REPORT_IF_ERROR(cuMemFree(reinterpret_cast<CUdeviceptr>(workspace)));
+    // }
     
-    // 清理描述符
-    CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(xDesc));
-    CUDNN_REPORT_IF_ERROR(cudnnDestroyFilterDescriptor(wDesc));
-    CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(yDesc));
-    CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(biasDesc));
-    CUDNN_REPORT_IF_ERROR(cudnnDestroyConvolutionDescriptor(convDesc));
+  if ((workspace != nullptr) && !using_pool) {
+    // 如果是动态分配的，直接释放
+    fprintf(stderr, "未使用workspace pool");
+    CUDA_REPORT_IF_ERROR(cuMemFree(reinterpret_cast<CUdeviceptr>(workspace)));
+  }
+
+    // // 清理描述符
+    // CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(xDesc));
+    // CUDNN_REPORT_IF_ERROR(cudnnDestroyFilterDescriptor(wDesc));
+    // CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(yDesc));
+    // CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(biasDesc));
+    // CUDNN_REPORT_IF_ERROR(cudnnDestroyConvolutionDescriptor(convDesc));
 }
 
 // 操作类型定义
