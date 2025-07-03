@@ -1625,48 +1625,432 @@ extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuReturnAllActiveDescriptors() {
 }
 
 
+// //===----------------------------------------------------------------------===//
+// // Workspace池数据结构定义
+// //===----------------------------------------------------------------------===//
+
+// struct PooledWorkspace {
+//   CUdeviceptr ptr;
+//   size_t size;
+//   bool in_use;
+//   int pool_index;
+//   CUstream associated_stream;  // 记录关联的stream
+//   std::chrono::steady_clock::time_point last_used;
+  
+//   PooledWorkspace() : ptr(0), size(0), in_use(false), pool_index(-1), 
+//                      associated_stream(nullptr) {}
+// };
+
+// // 全局Workspace池状态
+// static std::vector<PooledWorkspace> g_workspace_pool;                     // 所有workspace的存储
+// static std::queue<int> g_available_workspace_indices;                     // 可用workspace索引队列
+// static std::unordered_set<int> g_active_workspace_indices;               // 活跃workspace索引集合
+// static std::mutex g_workspace_pool_mutex;                                // 线程安全锁
+// static bool g_workspace_pool_initialized = false;                        // 初始化标志
+// static std::atomic<int> g_active_workspace_count{0};
+// static size_t g_default_workspace_size = 128 * 1024 * 1024;             // 默认128MB
+
+// //===----------------------------------------------------------------------===//
+// // Workspace池初始化和销毁
+// //===----------------------------------------------------------------------===//
+
+// /**
+//  * 初始化Workspace池
+//  * @param pool_size 池中workspace的数量
+//  * @param workspace_size_mb 每个workspace的大小(MB)，如果为0则使用默认大小
+//  */
+// extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuInitWorkspacePool(int pool_size, int workspace_size_mb) {
+//   mgpuEnsureContext();
+  
+//   std::lock_guard<std::mutex> lock(g_workspace_pool_mutex);
+  
+//   if (g_workspace_pool_initialized) {
+//     fprintf(stderr, "[WORKSPACE POOL] Already initialized with %d workspaces\n", 
+//             (int)g_workspace_pool.size());
+//     return;
+//   }
+  
+//   if (pool_size <= 0) {
+//     fprintf(stderr, "[WORKSPACE POOL] ERROR: Invalid pool size: %d\n", pool_size);
+//     return;
+//   }
+  
+//   // 设置workspace大小
+//   size_t workspace_size;
+//   if (workspace_size_mb > 0) {
+//     workspace_size = workspace_size_mb * 1024 * 1024;  // 转换为字节
+//   } else {
+//     workspace_size = g_default_workspace_size;  // 使用默认大小
+//   }
+  
+//   fprintf(stderr, "[WORKSPACE POOL] Initializing pool with %d workspaces of %.2f MB each...\n", 
+//           pool_size, workspace_size / (1024.0 * 1024.0));
+  
+//   // 预分配存储空间
+//   g_workspace_pool.reserve(pool_size);
+//   g_workspace_pool.resize(pool_size);
+  
+//   // 创建所有workspaces
+//   for (int i = 0; i < pool_size; i++) {
+//     PooledWorkspace& workspace = g_workspace_pool[i];
+//     workspace.pool_index = i;
+//     workspace.size = workspace_size;
+    
+//     // 分配CUDA内存
+//     CUresult result = cuMemAlloc(&workspace.ptr, workspace_size);
+//     if (result != CUDA_SUCCESS) {
+//       const char *name = nullptr;
+//       cuGetErrorName(result, &name);
+//       if (!name) name = "<unknown>";
+      
+//       fprintf(stderr, "[WORKSPACE POOL] FATAL: Failed to allocate workspace %d (%.2f MB): %s\n", 
+//               i, workspace_size / (1024.0 * 1024.0), name);
+      
+//       // 清理已分配的workspaces
+//       for (int j = 0; j < i; j++) {
+//         if (g_workspace_pool[j].ptr) {
+//           cuMemFree(g_workspace_pool[j].ptr);
+//         }
+//       }
+//       g_workspace_pool.clear();
+//       return;
+//     }
+    
+//     // 将索引加入可用队列
+//     g_available_workspace_indices.push(i);
+    
+//     // fprintf(stderr, "[WORKSPACE POOL] Created workspace %d: ptr=%p, size=%.2f MB\n", 
+//     //         i, reinterpret_cast<void*>(workspace.ptr), workspace_size / (1024.0 * 1024.0));
+//   }
+  
+//   g_workspace_pool_initialized = true;
+//   g_active_workspace_count = 0;
+  
+//   fprintf(stderr, "[WORKSPACE POOL] Successfully initialized %d workspaces\n", pool_size);
+// }
+
+// /**
+//  * 销毁Workspace池
+//  */
+// extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuDestroyWorkspacePool() {
+//   mgpuEnsureContext();
+  
+//   std::lock_guard<std::mutex> lock(g_workspace_pool_mutex);
+  
+//   if (!g_workspace_pool_initialized) {
+//     fprintf(stderr, "[WORKSPACE POOL] Pool not initialized, nothing to destroy\n");
+//     return;
+//   }
+  
+//   fprintf(stderr, "[WORKSPACE POOL] Destroying pool with %d workspaces...\n", 
+//           (int)g_workspace_pool.size());
+  
+//   // 检查是否还有活跃的workspaces
+//   if (g_active_workspace_count > 0) {
+//     fprintf(stderr, "[WORKSPACE POOL] WARNING: %d workspaces still in use during destruction\n", 
+//             g_active_workspace_count.load());
+//   }
+  
+//   // 销毁所有workspaces
+//   int destroyed_count = 0;
+//   for (size_t i = 0; i < g_workspace_pool.size(); i++) {
+//     PooledWorkspace& workspace = g_workspace_pool[i];
+    
+//     if (workspace.ptr) {
+//       CUresult result = cuMemFree(workspace.ptr);
+//       if (result != CUDA_SUCCESS) {
+//         const char *name = nullptr;
+//         cuGetErrorName(result, &name);
+//         if (!name) name = "<unknown>";
+//         fprintf(stderr, "[WORKSPACE POOL] Error destroying workspace %d: %s\n", 
+//                 (int)i, name);
+//       }
+//       workspace.ptr = 0;
+//     }
+    
+//     destroyed_count++;
+//   }
+  
+//   // 清理所有数据结构
+//   g_workspace_pool.clear();
+//   while (!g_available_workspace_indices.empty()) {
+//     g_available_workspace_indices.pop();
+//   }
+//   g_active_workspace_indices.clear();
+//   g_active_workspace_count = 0;
+//   g_workspace_pool_initialized = false;
+  
+//   fprintf(stderr, "[WORKSPACE POOL] Destroyed %d workspaces, pool cleanup complete\n", 
+//           destroyed_count);
+// }
+
+// //===----------------------------------------------------------------------===//
+// // Workspace获取和释放函数
+// //===----------------------------------------------------------------------===//
+
+// /**
+//  * 从池中获取workspace
+//  * @param required_size 需要的最小大小
+//  * @param stream 关联的CUDA stream
+//  * @return workspace指针，失败返回nullptr
+//  */
+// static void* acquirePooledWorkspace(size_t required_size, CUstream stream) {
+//   std::lock_guard<std::mutex> lock(g_workspace_pool_mutex);
+  
+//   if (!g_workspace_pool_initialized) {
+//     // 如果池未初始化，回退到动态分配
+//     CUdeviceptr ptr = 0;
+//     CUresult result = cuMemAlloc(&ptr, required_size);
+//     if (result == CUDA_SUCCESS) {
+//       return reinterpret_cast<void*>(ptr);
+//     }
+//     return nullptr;
+//   }
+  
+//   // 检查是否有可用的workspace
+//   if (g_available_workspace_indices.empty()) {
+//     fprintf(stderr, "[WORKSPACE POOL] WARNING: No available workspaces! Active: %d, Total: %d\n", 
+//             g_active_workspace_count.load(), (int)g_workspace_pool.size());
+    
+//     // 回退到动态分配
+//     CUdeviceptr ptr = 0;
+//     CUresult result = cuMemAlloc(&ptr, required_size);
+//     if (result == CUDA_SUCCESS) {
+//       return reinterpret_cast<void*>(ptr);
+//     }
+//     return nullptr;
+//   }
+  
+//   // 寻找合适大小的workspace
+//   std::queue<int> temp_queue;
+//   int workspace_index = -1;
+  
+//   while (!g_available_workspace_indices.empty()) {
+//     int idx = g_available_workspace_indices.front();
+//     g_available_workspace_indices.pop();
+    
+//     if (g_workspace_pool[idx].size >= required_size) {
+//       workspace_index = idx;
+//       // 将其他的索引放回队列
+//       while (!temp_queue.empty()) {
+//         g_available_workspace_indices.push(temp_queue.front());
+//         temp_queue.pop();
+//       }
+//       break;
+//     } else {
+//       temp_queue.push(idx);
+//     }
+//   }
+  
+//   // 如果没找到合适的，将临时队列中的索引放回
+//   while (!temp_queue.empty()) {
+//     g_available_workspace_indices.push(temp_queue.front());
+//     temp_queue.pop();
+//   }
+  
+//   if (workspace_index == -1) {
+//     fprintf(stderr, "[WORKSPACE POOL] WARNING: No workspace large enough for %zu bytes\n", 
+//             required_size);
+    
+//     // 回退到动态分配
+//     CUdeviceptr ptr = 0;
+//     CUresult result = cuMemAlloc(&ptr, required_size);
+//     if (result == CUDA_SUCCESS) {
+//       return reinterpret_cast<void*>(ptr);
+//     }
+//     return nullptr;
+//   }
+  
+//   // 获取workspace
+//   PooledWorkspace& workspace = g_workspace_pool[workspace_index];
+  
+//   // 更新状态
+//   workspace.in_use = true;
+//   workspace.associated_stream = stream;
+//   workspace.last_used = std::chrono::steady_clock::now();
+//   g_active_workspace_indices.insert(workspace_index);
+//   g_active_workspace_count++;
+  
+//   // fprintf(stderr, "[WORKSPACE POOL] Acquired workspace %d for stream %p (Active: %d/%d)\n", 
+//   //         workspace_index, stream, g_active_workspace_count.load(), (int)g_workspace_pool.size());
+  
+//   return reinterpret_cast<void*>(workspace.ptr);
+// }
+
+// /**
+//  * 将workspace退还到池中
+//  * @param ptr workspace指针
+//  */
+// static void releasePooledWorkspace(void* ptr) {
+//   if (ptr == nullptr) {
+//     return;
+//   }
+  
+//   std::lock_guard<std::mutex> lock(g_workspace_pool_mutex);
+  
+//   if (!g_workspace_pool_initialized) {
+//     // 如果池未初始化，这可能是动态分配的内存，直接释放
+//     CUresult result = cuMemFree(reinterpret_cast<CUdeviceptr>(ptr));
+//     if (result != CUDA_SUCCESS) {
+//       fprintf(stderr, "[WORKSPACE POOL] Warning: Failed to free dynamic workspace\n");
+//     }
+//     return;
+//   }
+  
+//   // 查找workspace在池中的索引
+//   int workspace_index = -1;
+//   for (size_t i = 0; i < g_workspace_pool.size(); i++) {
+//     if (g_workspace_pool[i].ptr == reinterpret_cast<CUdeviceptr>(ptr)) {
+//       workspace_index = (int)i;
+//       break;
+//     }
+//   }
+  
+//   if (workspace_index == -1) {
+//     // 这可能是动态分配的workspace，直接释放
+//     CUresult result = cuMemFree(reinterpret_cast<CUdeviceptr>(ptr));
+//     if (result != CUDA_SUCCESS) {
+//       fprintf(stderr, "[WORKSPACE POOL] Warning: Failed to free dynamic workspace\n");
+//     }
+//     return;
+//   }
+  
+//   PooledWorkspace& workspace = g_workspace_pool[workspace_index];
+  
+//   if (!workspace.in_use) {
+//     fprintf(stderr, "[WORKSPACE POOL] WARNING: Workspace %d is not marked as in use\n", workspace_index);
+//     return;
+//   }
+  
+//   // 更新状态
+//   workspace.in_use = false;
+//   workspace.associated_stream = nullptr;
+//   g_available_workspace_indices.push(workspace_index);
+//   g_active_workspace_indices.erase(workspace_index);
+//   g_active_workspace_count--;
+  
+//   // fprintf(stderr, "[WORKSPACE POOL] Released workspace %d (Active: %d/%d)\n", 
+//   //         workspace_index, g_active_workspace_count.load(), (int)g_workspace_pool.size());
+// }
+
+// //===----------------------------------------------------------------------===//
+// // 核心功能：一键归还所有活跃workspace
+// //===----------------------------------------------------------------------===//
+
+// /**
+//  * 一键归还所有当前正在使用的workspace到池中
+//  * 用于并行组边界调用，确保GPU操作完成后统一归还
+//  */
+// extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuReturnAllActiveWorkspaces() {
+//   if (!g_workspace_pool_initialized) {
+//     // fprintf(stderr, "[WORKSPACE POOL] Pool not initialized\n");
+//     return;
+//   }
+  
+//   mgpuEnsureContext();
+  
+//   std::lock_guard<std::mutex> lock(g_workspace_pool_mutex);
+  
+//   int total_returned = 0;
+  
+//   // 归还所有活跃的workspaces
+//   for (int index : g_active_workspace_indices) {
+//     PooledWorkspace& workspace = g_workspace_pool[index];
+    
+//     if (workspace.in_use) {
+//       workspace.in_use = false;
+//       workspace.associated_stream = nullptr;
+//       g_available_workspace_indices.push(index);
+//       g_active_workspace_count--;
+//       total_returned++;
+//     }
+//   }
+  
+//   g_active_workspace_indices.clear();
+  
+//   // fprintf(stderr, "[WORKSPACE POOL] Returned %d active workspaces to pool\n", total_returned);
+// }
+
+
 //===----------------------------------------------------------------------===//
-// Workspace池数据结构定义
+// 改进的Workspace池 - 集成内存对齐优化
 //===----------------------------------------------------------------------===//
 
-struct PooledWorkspace {
+// 对齐常量定义
+static const size_t TENSOR_CORE_ALIGNMENT = 256; // 256字节对齐，适合Tensor Core
+static const size_t MEMORY_ALIGNMENT = 512;      // 512字节对齐，适合高性能访问
+static const size_t DEFAULT_ALIGNMENT = 256;     // 默认对齐
+
+// 对齐的内存分配函数
+static CUdeviceptr allocateAlignedMemory(size_t size, size_t alignment = DEFAULT_ALIGNMENT) {
+  // 计算对齐后的大小
+  size_t aligned_size = (size + alignment - 1) & ~(alignment - 1);
+  
+  CUdeviceptr ptr = 0;
+  CUresult result = cuMemAlloc(&ptr, aligned_size);
+  
+  if (result != CUDA_SUCCESS) {
+    const char *name = nullptr;
+    cuGetErrorName(result, &name);
+    if (!name) name = "<unknown>";
+    fprintf(stderr, "[MEMORY] Failed to allocate %zu bytes (aligned to %zu): %s\n", 
+            aligned_size, alignment, name);
+    return 0;
+  }
+  
+  // 验证对齐（GPU内存通常自动对齐，但我们检查一下）
+  if (ptr % alignment != 0) {
+    fprintf(stderr, "[MEMORY] Warning: Allocated memory %p not aligned to %zu bytes\n", 
+            (void*)ptr, alignment);
+  }
+  
+  return ptr;
+}
+
+// 改进的PooledWorkspace结构，增加对齐信息
+struct AlignedPooledWorkspace {
   CUdeviceptr ptr;
   size_t size;
+  size_t alignment;                    // 新增：记录对齐要求
   bool in_use;
   int pool_index;
-  CUstream associated_stream;  // 记录关联的stream
+  CUstream associated_stream;
   std::chrono::steady_clock::time_point last_used;
   
-  PooledWorkspace() : ptr(0), size(0), in_use(false), pool_index(-1), 
-                     associated_stream(nullptr) {}
+  AlignedPooledWorkspace() : ptr(0), size(0), alignment(DEFAULT_ALIGNMENT),
+                            in_use(false), pool_index(-1), 
+                            associated_stream(nullptr) {}
 };
 
-// 全局Workspace池状态
-static std::vector<PooledWorkspace> g_workspace_pool;                     // 所有workspace的存储
-static std::queue<int> g_available_workspace_indices;                     // 可用workspace索引队列
-static std::unordered_set<int> g_active_workspace_indices;               // 活跃workspace索引集合
-static std::mutex g_workspace_pool_mutex;                                // 线程安全锁
-static bool g_workspace_pool_initialized = false;                        // 初始化标志
-static std::atomic<int> g_active_workspace_count{0};
-static size_t g_default_workspace_size = 128 * 1024 * 1024;             // 默认128MB
+// 全局Workspace池状态 - 替换原有的全局变量
+static std::vector<AlignedPooledWorkspace> g_aligned_workspace_pool;     // 替换g_workspace_pool
+static std::queue<int> g_available_aligned_workspace_indices;            // 替换g_available_workspace_indices  
+static std::unordered_set<int> g_active_aligned_workspace_indices;       // 替换g_active_workspace_indices
+static std::mutex g_aligned_workspace_pool_mutex;                        // 替换g_workspace_pool_mutex
+static bool g_aligned_workspace_pool_initialized = false;                // 替换g_workspace_pool_initialized
+static std::atomic<int> g_active_aligned_workspace_count{0};             // 替换g_active_workspace_count
+static size_t g_default_aligned_workspace_size = 128 * 1024 * 1024;     // 默认128MB
 
 //===----------------------------------------------------------------------===//
-// Workspace池初始化和销毁
+// 对齐的Workspace池初始化和销毁
 //===----------------------------------------------------------------------===//
 
 /**
- * 初始化Workspace池
+ * 初始化对齐的Workspace池（替换原有的mgpuInitWorkspacePool）
  * @param pool_size 池中workspace的数量
  * @param workspace_size_mb 每个workspace的大小(MB)，如果为0则使用默认大小
+ * @param alignment 内存对齐字节数，默认256字节
  */
-extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuInitWorkspacePool(int pool_size, int workspace_size_mb) {
+extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuInitWorkspacePool(
+    int pool_size, int workspace_size_mb, size_t alignment = TENSOR_CORE_ALIGNMENT) {
+  
   mgpuEnsureContext();
   
-  std::lock_guard<std::mutex> lock(g_workspace_pool_mutex);
+  std::lock_guard<std::mutex> lock(g_aligned_workspace_pool_mutex);
   
-  if (g_workspace_pool_initialized) {
+  if (g_aligned_workspace_pool_initialized) {
     fprintf(stderr, "[WORKSPACE POOL] Already initialized with %d workspaces\n", 
-            (int)g_workspace_pool.size());
+            (int)g_aligned_workspace_pool.size());
     return;
   }
   
@@ -1680,81 +2064,83 @@ extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuInitWorkspacePool(int pool_size, i
   if (workspace_size_mb > 0) {
     workspace_size = workspace_size_mb * 1024 * 1024;  // 转换为字节
   } else {
-    workspace_size = g_default_workspace_size;  // 使用默认大小
+    workspace_size = g_default_aligned_workspace_size;  // 使用默认大小
   }
   
-  fprintf(stderr, "[WORKSPACE POOL] Initializing pool with %d workspaces of %.2f MB each...\n", 
-          pool_size, workspace_size / (1024.0 * 1024.0));
+  // 确保workspace大小也是对齐的
+  workspace_size = (workspace_size + alignment - 1) & ~(alignment - 1);
+  
+  fprintf(stderr, "[WORKSPACE POOL] Initializing aligned pool: %d × %.2f MB (alignment: %zu bytes)\n", 
+          pool_size, workspace_size / (1024.0 * 1024.0), alignment);
   
   // 预分配存储空间
-  g_workspace_pool.reserve(pool_size);
-  g_workspace_pool.resize(pool_size);
+  g_aligned_workspace_pool.reserve(pool_size);
+  g_aligned_workspace_pool.resize(pool_size);
   
   // 创建所有workspaces
+  int successful_allocations = 0;
   for (int i = 0; i < pool_size; i++) {
-    PooledWorkspace& workspace = g_workspace_pool[i];
+    AlignedPooledWorkspace& workspace = g_aligned_workspace_pool[i];
     workspace.pool_index = i;
     workspace.size = workspace_size;
+    workspace.alignment = alignment;
     
-    // 分配CUDA内存
-    CUresult result = cuMemAlloc(&workspace.ptr, workspace_size);
-    if (result != CUDA_SUCCESS) {
-      const char *name = nullptr;
-      cuGetErrorName(result, &name);
-      if (!name) name = "<unknown>";
-      
-      fprintf(stderr, "[WORKSPACE POOL] FATAL: Failed to allocate workspace %d (%.2f MB): %s\n", 
-              i, workspace_size / (1024.0 * 1024.0), name);
+    // 分配对齐的CUDA内存
+    workspace.ptr = allocateAlignedMemory(workspace_size, alignment);
+    if (workspace.ptr == 0) {
+      fprintf(stderr, "[WORKSPACE POOL] Failed to allocate aligned workspace %d\n", i);
       
       // 清理已分配的workspaces
       for (int j = 0; j < i; j++) {
-        if (g_workspace_pool[j].ptr) {
-          cuMemFree(g_workspace_pool[j].ptr);
+        if (g_aligned_workspace_pool[j].ptr) {
+          cuMemFree(g_aligned_workspace_pool[j].ptr);
         }
       }
-      g_workspace_pool.clear();
+      g_aligned_workspace_pool.clear();
       return;
     }
     
     // 将索引加入可用队列
-    g_available_workspace_indices.push(i);
+    g_available_aligned_workspace_indices.push(i);
+    successful_allocations++;
     
-    // fprintf(stderr, "[WORKSPACE POOL] Created workspace %d: ptr=%p, size=%.2f MB\n", 
-    //         i, reinterpret_cast<void*>(workspace.ptr), workspace_size / (1024.0 * 1024.0));
+    // 详细日志（可选，用于调试）
+    // fprintf(stderr, "[WORKSPACE POOL] Created aligned workspace %d: ptr=%p, size=%.2f MB, alignment=%zu\n", 
+    //         i, (void*)workspace.ptr, workspace_size / (1024.0 * 1024.0), alignment);
   }
   
-  g_workspace_pool_initialized = true;
-  g_active_workspace_count = 0;
+  g_aligned_workspace_pool_initialized = true;
+  g_active_aligned_workspace_count = 0;
   
-  fprintf(stderr, "[WORKSPACE POOL] Successfully initialized %d workspaces\n", pool_size);
+  fprintf(stderr, "[WORKSPACE POOL] Successfully initialized %d aligned workspaces\n", successful_allocations);
 }
 
 /**
- * 销毁Workspace池
+ * 销毁对齐的Workspace池（替换原有的mgpuDestroyWorkspacePool）
  */
 extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuDestroyWorkspacePool() {
   mgpuEnsureContext();
   
-  std::lock_guard<std::mutex> lock(g_workspace_pool_mutex);
+  std::lock_guard<std::mutex> lock(g_aligned_workspace_pool_mutex);
   
-  if (!g_workspace_pool_initialized) {
+  if (!g_aligned_workspace_pool_initialized) {
     fprintf(stderr, "[WORKSPACE POOL] Pool not initialized, nothing to destroy\n");
     return;
   }
   
-  fprintf(stderr, "[WORKSPACE POOL] Destroying pool with %d workspaces...\n", 
-          (int)g_workspace_pool.size());
+  fprintf(stderr, "[WORKSPACE POOL] Destroying aligned pool with %d workspaces...\n", 
+          (int)g_aligned_workspace_pool.size());
   
   // 检查是否还有活跃的workspaces
-  if (g_active_workspace_count > 0) {
+  if (g_active_aligned_workspace_count > 0) {
     fprintf(stderr, "[WORKSPACE POOL] WARNING: %d workspaces still in use during destruction\n", 
-            g_active_workspace_count.load());
+            g_active_aligned_workspace_count.load());
   }
   
   // 销毁所有workspaces
   int destroyed_count = 0;
-  for (size_t i = 0; i < g_workspace_pool.size(); i++) {
-    PooledWorkspace& workspace = g_workspace_pool[i];
+  for (size_t i = 0; i < g_aligned_workspace_pool.size(); i++) {
+    AlignedPooledWorkspace& workspace = g_aligned_workspace_pool[i];
     
     if (workspace.ptr) {
       CUresult result = cuMemFree(workspace.ptr);
@@ -1772,68 +2158,70 @@ extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuDestroyWorkspacePool() {
   }
   
   // 清理所有数据结构
-  g_workspace_pool.clear();
-  while (!g_available_workspace_indices.empty()) {
-    g_available_workspace_indices.pop();
+  g_aligned_workspace_pool.clear();
+  while (!g_available_aligned_workspace_indices.empty()) {
+    g_available_aligned_workspace_indices.pop();
   }
-  g_active_workspace_indices.clear();
-  g_active_workspace_count = 0;
-  g_workspace_pool_initialized = false;
+  g_active_aligned_workspace_indices.clear();
+  g_active_aligned_workspace_count = 0;
+  g_aligned_workspace_pool_initialized = false;
   
-  fprintf(stderr, "[WORKSPACE POOL] Destroyed %d workspaces, pool cleanup complete\n", 
+  fprintf(stderr, "[WORKSPACE POOL] Destroyed %d aligned workspaces, pool cleanup complete\n", 
           destroyed_count);
 }
 
 //===----------------------------------------------------------------------===//
-// Workspace获取和释放函数
+// 对齐的Workspace获取和释放函数（替换原有实现）
 //===----------------------------------------------------------------------===//
 
 /**
- * 从池中获取workspace
+ * 从池中获取对齐的workspace（替换原有的acquirePooledWorkspace）
  * @param required_size 需要的最小大小
  * @param stream 关联的CUDA stream
+ * @param preferred_alignment 期望的对齐字节数
  * @return workspace指针，失败返回nullptr
  */
-static void* acquirePooledWorkspace(size_t required_size, CUstream stream) {
-  std::lock_guard<std::mutex> lock(g_workspace_pool_mutex);
+static void* acquirePooledWorkspace(size_t required_size, CUstream stream, 
+                                   size_t preferred_alignment = TENSOR_CORE_ALIGNMENT) {
+  std::lock_guard<std::mutex> lock(g_aligned_workspace_pool_mutex);
   
-  if (!g_workspace_pool_initialized) {
+  if (!g_aligned_workspace_pool_initialized) {
+    fprintf(stderr, "[WORKSPACE POOL] Pool not initialized, using dynamic allocation\n");
     // 如果池未初始化，回退到动态分配
-    CUdeviceptr ptr = 0;
-    CUresult result = cuMemAlloc(&ptr, required_size);
-    if (result == CUDA_SUCCESS) {
-      return reinterpret_cast<void*>(ptr);
-    }
-    return nullptr;
+    CUdeviceptr ptr = allocateAlignedMemory(required_size, preferred_alignment);
+    return reinterpret_cast<void*>(ptr);
   }
   
   // 检查是否有可用的workspace
-  if (g_available_workspace_indices.empty()) {
+  if (g_available_aligned_workspace_indices.empty()) {
     fprintf(stderr, "[WORKSPACE POOL] WARNING: No available workspaces! Active: %d, Total: %d\n", 
-            g_active_workspace_count.load(), (int)g_workspace_pool.size());
+            g_active_aligned_workspace_count.load(), (int)g_aligned_workspace_pool.size());
     
     // 回退到动态分配
-    CUdeviceptr ptr = 0;
-    CUresult result = cuMemAlloc(&ptr, required_size);
-    if (result == CUDA_SUCCESS) {
-      return reinterpret_cast<void*>(ptr);
-    }
-    return nullptr;
+    CUdeviceptr ptr = allocateAlignedMemory(required_size, preferred_alignment);
+    return reinterpret_cast<void*>(ptr);
   }
   
-  // 寻找合适大小的workspace
+  // 寻找合适大小和对齐的workspace
   std::queue<int> temp_queue;
   int workspace_index = -1;
   
-  while (!g_available_workspace_indices.empty()) {
-    int idx = g_available_workspace_indices.front();
-    g_available_workspace_indices.pop();
+  while (!g_available_aligned_workspace_indices.empty()) {
+    int idx = g_available_aligned_workspace_indices.front();
+    g_available_aligned_workspace_indices.pop();
     
-    if (g_workspace_pool[idx].size >= required_size) {
+    const AlignedPooledWorkspace& workspace = g_aligned_workspace_pool[idx];
+    
+    // 检查大小和对齐是否满足要求
+    bool size_ok = (workspace.size >= required_size);
+    bool alignment_ok = (workspace.alignment >= preferred_alignment) || 
+                       (preferred_alignment % workspace.alignment == 0);
+    
+    if (size_ok && alignment_ok) {
       workspace_index = idx;
       // 将其他的索引放回队列
       while (!temp_queue.empty()) {
-        g_available_workspace_indices.push(temp_queue.front());
+        g_available_aligned_workspace_indices.push(temp_queue.front());
         temp_queue.pop();
       }
       break;
@@ -1844,41 +2232,40 @@ static void* acquirePooledWorkspace(size_t required_size, CUstream stream) {
   
   // 如果没找到合适的，将临时队列中的索引放回
   while (!temp_queue.empty()) {
-    g_available_workspace_indices.push(temp_queue.front());
+    g_available_aligned_workspace_indices.push(temp_queue.front());
     temp_queue.pop();
   }
   
   if (workspace_index == -1) {
-    fprintf(stderr, "[WORKSPACE POOL] WARNING: No workspace large enough for %zu bytes\n", 
-            required_size);
+    fprintf(stderr, "[WORKSPACE POOL] WARNING: No suitable workspace for size=%zu, alignment=%zu\n", 
+            required_size, preferred_alignment);
     
     // 回退到动态分配
-    CUdeviceptr ptr = 0;
-    CUresult result = cuMemAlloc(&ptr, required_size);
-    if (result == CUDA_SUCCESS) {
-      return reinterpret_cast<void*>(ptr);
-    }
-    return nullptr;
+    CUdeviceptr ptr = allocateAlignedMemory(required_size, preferred_alignment);
+    return reinterpret_cast<void*>(ptr);
   }
   
   // 获取workspace
-  PooledWorkspace& workspace = g_workspace_pool[workspace_index];
+  AlignedPooledWorkspace& workspace = g_aligned_workspace_pool[workspace_index];
   
   // 更新状态
   workspace.in_use = true;
   workspace.associated_stream = stream;
   workspace.last_used = std::chrono::steady_clock::now();
-  g_active_workspace_indices.insert(workspace_index);
-  g_active_workspace_count++;
+  g_active_aligned_workspace_indices.insert(workspace_index);
+  g_active_aligned_workspace_count++;
   
-  // fprintf(stderr, "[WORKSPACE POOL] Acquired workspace %d for stream %p (Active: %d/%d)\n", 
-  //         workspace_index, stream, g_active_workspace_count.load(), (int)g_workspace_pool.size());
+  // 详细日志（可选）
+  // fprintf(stderr, "[WORKSPACE POOL] Acquired aligned workspace %d for stream %p "
+  //                "(size: %.2f MB, alignment: %zu, Active: %d/%d)\n", 
+  //         workspace_index, stream, workspace.size / (1024.0 * 1024.0), workspace.alignment,
+  //         g_active_aligned_workspace_count.load(), (int)g_aligned_workspace_pool.size());
   
   return reinterpret_cast<void*>(workspace.ptr);
 }
 
 /**
- * 将workspace退还到池中
+ * 将workspace退还到池中（替换原有的releasePooledWorkspace）
  * @param ptr workspace指针
  */
 static void releasePooledWorkspace(void* ptr) {
@@ -1886,9 +2273,9 @@ static void releasePooledWorkspace(void* ptr) {
     return;
   }
   
-  std::lock_guard<std::mutex> lock(g_workspace_pool_mutex);
+  std::lock_guard<std::mutex> lock(g_aligned_workspace_pool_mutex);
   
-  if (!g_workspace_pool_initialized) {
+  if (!g_aligned_workspace_pool_initialized) {
     // 如果池未初始化，这可能是动态分配的内存，直接释放
     CUresult result = cuMemFree(reinterpret_cast<CUdeviceptr>(ptr));
     if (result != CUDA_SUCCESS) {
@@ -1899,8 +2286,8 @@ static void releasePooledWorkspace(void* ptr) {
   
   // 查找workspace在池中的索引
   int workspace_index = -1;
-  for (size_t i = 0; i < g_workspace_pool.size(); i++) {
-    if (g_workspace_pool[i].ptr == reinterpret_cast<CUdeviceptr>(ptr)) {
+  for (size_t i = 0; i < g_aligned_workspace_pool.size(); i++) {
+    if (g_aligned_workspace_pool[i].ptr == reinterpret_cast<CUdeviceptr>(ptr)) {
       workspace_index = (int)i;
       break;
     }
@@ -1915,7 +2302,7 @@ static void releasePooledWorkspace(void* ptr) {
     return;
   }
   
-  PooledWorkspace& workspace = g_workspace_pool[workspace_index];
+  AlignedPooledWorkspace& workspace = g_aligned_workspace_pool[workspace_index];
   
   if (!workspace.in_use) {
     fprintf(stderr, "[WORKSPACE POOL] WARNING: Workspace %d is not marked as in use\n", workspace_index);
@@ -1925,50 +2312,51 @@ static void releasePooledWorkspace(void* ptr) {
   // 更新状态
   workspace.in_use = false;
   workspace.associated_stream = nullptr;
-  g_available_workspace_indices.push(workspace_index);
-  g_active_workspace_indices.erase(workspace_index);
-  g_active_workspace_count--;
+  g_available_aligned_workspace_indices.push(workspace_index);
+  g_active_aligned_workspace_indices.erase(workspace_index);
+  g_active_aligned_workspace_count--;
   
-  // fprintf(stderr, "[WORKSPACE POOL] Released workspace %d (Active: %d/%d)\n", 
-  //         workspace_index, g_active_workspace_count.load(), (int)g_workspace_pool.size());
+  // 详细日志（可选）
+  // fprintf(stderr, "[WORKSPACE POOL] Released aligned workspace %d (Active: %d/%d)\n", 
+  //         workspace_index, g_active_aligned_workspace_count.load(), 
+  //         (int)g_aligned_workspace_pool.size());
 }
 
 //===----------------------------------------------------------------------===//
-// 核心功能：一键归还所有活跃workspace
+// 对齐的workspace统一归还函数（替换原有实现）
 //===----------------------------------------------------------------------===//
 
 /**
  * 一键归还所有当前正在使用的workspace到池中
- * 用于并行组边界调用，确保GPU操作完成后统一归还
  */
 extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuReturnAllActiveWorkspaces() {
-  if (!g_workspace_pool_initialized) {
+  if (!g_aligned_workspace_pool_initialized) {
     // fprintf(stderr, "[WORKSPACE POOL] Pool not initialized\n");
     return;
   }
   
   mgpuEnsureContext();
   
-  std::lock_guard<std::mutex> lock(g_workspace_pool_mutex);
+  std::lock_guard<std::mutex> lock(g_aligned_workspace_pool_mutex);
   
   int total_returned = 0;
   
   // 归还所有活跃的workspaces
-  for (int index : g_active_workspace_indices) {
-    PooledWorkspace& workspace = g_workspace_pool[index];
+  for (int index : g_active_aligned_workspace_indices) {
+    AlignedPooledWorkspace& workspace = g_aligned_workspace_pool[index];
     
     if (workspace.in_use) {
       workspace.in_use = false;
       workspace.associated_stream = nullptr;
-      g_available_workspace_indices.push(index);
-      g_active_workspace_count--;
+      g_available_aligned_workspace_indices.push(index);
+      g_active_aligned_workspace_count--;
       total_returned++;
     }
   }
   
-  g_active_workspace_indices.clear();
+  g_active_aligned_workspace_indices.clear();
   
-  // fprintf(stderr, "[WORKSPACE POOL] Returned %d active workspaces to pool\n", total_returned);
+  // fprintf(stderr, "[WORKSPACE POOL] Returned %d active aligned workspaces to pool\n", total_returned);
 }
 
 
@@ -2063,6 +2451,197 @@ mgpuCulibsFullyConnectedForward(
   }
 }
 
+extern "C" MLIR_CUDA_WRAPPERS_EXPORT void
+mgpuCulibsBatchedMatMulForward(
+    int batch_size, int m, int n, int k,        // 批量大小和矩阵维度
+    int stride_a, int stride_b, int stride_c,   // 各矩阵的batch stride
+    void* input_a, void* input_b,               // 输入矩阵指针
+    void* output_c,                             // 输出矩阵指针
+    CUstream stream                             // CUDA流
+) {
+    mgpuEnsureContext();
+    
+    StreamHandles handles;
+    if (!getHandlesForStream(stream, handles)) {
+        return;
+    }
+    cublasHandle_t handle = handles.cublas_handle;
+
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    
+    // 使用cuBLAS的strided batched GEMM
+    // 注意：cuBLAS使用列主序，我们需要调整参数顺序
+    // ONNX MatMul: C = A @ B
+    // cuBLAS计算: C = op(B) @ op(A)，我们交换A和B来匹配行主序
+    
+    CUBLAS_REPORT_IF_ERROR(cublasSgemmStridedBatched(
+        handle,
+        CUBLAS_OP_N,           // op(B): B不转置
+        CUBLAS_OP_N,           // op(A): A不转置  
+        n,                     // B的行数 (输出的列数)
+        m,                     // A的列数 (输出的行数)
+        k,                     // A的行数/B的列数 (内积维度)
+        &alpha,                // alpha系数
+        (const float*)input_b, // B矩阵 (第二个输入)
+        n,                     // B的leading dimension
+        stride_b,              // B的batch stride
+        (const float*)input_a, // A矩阵 (第一个输入)  
+        k,                     // A的leading dimension
+        stride_a,              // A的batch stride (stride=0表示广播)
+        &beta,                 // beta系数
+        (float*)output_c,      // C矩阵 (输出)
+        n,                     // C的leading dimension  
+        stride_c,              // C的batch stride
+        batch_size             // 批量大小
+    ));
+}
+
+extern "C" MLIR_CUDA_WRAPPERS_EXPORT void
+mgpuCulibsBatchedMatMulForward_fp16(
+    int batch_size, int m, int n, int k,
+    int stride_a, int stride_b, int stride_c,
+    void* input_a, void* input_b,
+    void* output_c,
+    CUstream stream
+) {
+    mgpuEnsureContext();
+    
+    StreamHandles handles;
+    if (!getHandlesForStream(stream, handles)) {
+        return;
+    }
+    cublasHandle_t handle = handles.cublas_handle;
+
+    const __half alpha = __float2half(1.0f);
+    const __half beta = __float2half(0.0f);
+    
+    CUBLAS_REPORT_IF_ERROR(cublasHgemmStridedBatched(
+        handle,
+        CUBLAS_OP_N, CUBLAS_OP_N,
+        n, m, k,
+        &alpha,
+        (const __half*)input_b, n, stride_b,
+        (const __half*)input_a, k, stride_a,  
+        &beta,
+        (__half*)output_c, n, stride_c,
+        batch_size
+    ));
+}
+
+extern "C" MLIR_CUDA_WRAPPERS_EXPORT void  
+mgpuCulibsBroadcast2DMatMulForward(
+    int batch_size, int m, int n, int k,
+    bool broadcast_a,                    // A是否广播
+    void* input_a, void* input_b,
+    void* output_c,
+    CUstream stream
+) {
+    mgpuEnsureContext();
+    
+    StreamHandles handles;
+    if (!getHandlesForStream(stream, handles)) {
+        return;
+    }
+    cublasHandle_t handle = handles.cublas_handle;
+
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    
+    if (broadcast_a) {
+        // A (2D) 广播到3D，B是3D
+        // A: (m, k), B: (batch, k, n) -> C: (batch, m, n)
+        int stride_a = 0;           // A重复使用，stride为0
+        int stride_b = k * n;       // B的batch stride
+        int stride_c = m * n;       // C的batch stride
+        
+        CUBLAS_REPORT_IF_ERROR(cublasSgemmStridedBatched(
+            handle,
+            CUBLAS_OP_N, CUBLAS_OP_N,
+            n, m, k,
+            &alpha,
+            (const float*)input_b, n, stride_b,  // B矩阵
+            (const float*)input_a, k, stride_a,  // A矩阵 (stride=0表示广播)
+            &beta, 
+            (float*)output_c, n, stride_c,
+            batch_size
+        ));
+    } else {
+        // B (2D) 广播到3D，A是3D  
+        // A: (batch, m, k), B: (k, n) -> C: (batch, m, n)
+        int stride_a = m * k;       // A的batch stride
+        int stride_b = 0;           // B重复使用，stride为0
+        int stride_c = m * n;       // C的batch stride
+        
+        CUBLAS_REPORT_IF_ERROR(cublasSgemmStridedBatched(
+            handle,
+            CUBLAS_OP_N, CUBLAS_OP_N,
+            n, m, k,
+            &alpha,
+            (const float*)input_b, n, stride_b,  // B矩阵 (stride=0表示广播)
+            (const float*)input_a, k, stride_a,  // A矩阵
+            &beta,
+            (float*)output_c, n, stride_c,
+            batch_size
+        ));
+    }
+}
+
+extern "C" MLIR_CUDA_WRAPPERS_EXPORT void  
+mgpuCulibsBroadcast2DMatMulForward_fp16(
+    int batch_size, int m, int n, int k,
+    bool broadcast_a,                    // A是否广播
+    void* input_a, void* input_b,
+    void* output_c,
+    CUstream stream
+) {
+    mgpuEnsureContext();
+    
+    StreamHandles handles;
+    if (!getHandlesForStream(stream, handles)) {
+        return;
+    }
+    cublasHandle_t handle = handles.cublas_handle;
+
+    const __half alpha = __float2half(1.0f);
+    const __half beta = __float2half(0.0f);
+    
+    if (broadcast_a) {
+        // A (2D) 广播到3D，B是3D
+        int stride_a = 0;           
+        int stride_b = k * n;       
+        int stride_c = m * n;       
+        
+        CUBLAS_REPORT_IF_ERROR(cublasHgemmStridedBatched(
+            handle,
+            CUBLAS_OP_N, CUBLAS_OP_N,
+            n, m, k,
+            &alpha,
+            (const __half*)input_b, n, stride_b,
+            (const __half*)input_a, k, stride_a,  // stride=0表示广播
+            &beta, 
+            (__half*)output_c, n, stride_c,
+            batch_size
+        ));
+    } else {
+        // B (2D) 广播到3D，A是3D  
+        int stride_a = m * k;       
+        int stride_b = 0;           
+        int stride_c = m * n;       
+        
+        CUBLAS_REPORT_IF_ERROR(cublasHgemmStridedBatched(
+            handle,
+            CUBLAS_OP_N, CUBLAS_OP_N,
+            n, m, k,
+            &alpha,
+            (const __half*)input_b, n, stride_b,  // stride=0表示广播
+            (const __half*)input_a, k, stride_a,
+            &beta,
+            (__half*)output_c, n, stride_c,
+            batch_size
+        ));
+    }
+}
 
 extern "C" MLIR_CUDA_WRAPPERS_EXPORT void
 mgpuCulibsFlattenFullyConnectedForward(
@@ -2341,6 +2920,87 @@ extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuCudnnConv2dForward(
 }
 
 // MaxPool implementation using cuDNN
+// extern "C" MLIR_CUDA_WRAPPERS_EXPORT void
+// mgpuCudnnMaxPoolForward(
+//     int n, int c, int h, int w,           // 输入维度 (NCHW)
+//     int kernel_h, int kernel_w,           // 核维度
+//     int pad_h_begin, int pad_w_begin,     // 填充 (开始)
+//     int pad_h_end, int pad_w_end,         // 填充 (结束)
+//     int stride_h, int stride_w,           // 步长
+//     int dilation_h, int dilation_w,       // 膨胀
+//     void* input_data,                     // 输入张量
+//     void* output_data,                    // 输出张量
+//     CUstream stream                       // CUDA流
+// ) {
+//   // 确保使用全局上下文
+//   mgpuEnsureContext();
+  
+//   StreamHandles handles;
+//   if (!getHandlesForStream(stream, handles)) {
+//     return; // 错误信息已在getHandlesForStream中打印
+//   }
+//   cudnnHandle_t handle = handles.cudnn_handle;
+
+//   // 获取此流的cuDNN句柄
+//   // cudnnHandle_t handle = mgpuCudnnGetHandle(stream);
+  
+//   // // 创建描述符
+//   // cudnnTensorDescriptor_t inputDesc, outputDesc;
+//   // cudnnPoolingDescriptor_t poolDesc;
+  
+//   // CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&inputDesc));
+//   // CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&outputDesc));
+//   // CUDNN_REPORT_IF_ERROR(cudnnCreatePoolingDescriptor(&poolDesc));
+  
+//   // 从池中获取描述符
+//   cudnnTensorDescriptor_t inputDesc = acquireTensorDescriptor();
+//   cudnnTensorDescriptor_t outputDesc = acquireTensorDescriptor();
+//   cudnnPoolingDescriptor_t poolDesc = acquirePoolingDescriptor();
+
+
+//   // 设置输入描述符
+//   CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
+//       inputDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, n, c, h, w));
+  
+//   // 检查是否为非对称填充
+//   bool asymmetricPadding = (pad_h_begin != pad_h_end) || (pad_w_begin != pad_w_end);
+  
+//   if (asymmetricPadding) {
+//     // 对于非对称填充，使用最大填充值
+//     fprintf(stderr, "Warning: Asymmetric padding in MaxPool (%d,%d,%d,%d) may not produce exact results\n",
+//             pad_h_begin, pad_w_begin, pad_h_end, pad_w_end);
+//   }
+  
+//   // cuDNN的pooling API要求对称填充，因此我们使用最大值
+//   int pad_h = std::max(pad_h_begin, pad_h_end);
+//   int pad_w = std::max(pad_w_begin, pad_w_end);
+  
+//   // 设置池化描述符
+//   CUDNN_REPORT_IF_ERROR(cudnnSetPooling2dDescriptor(
+//       poolDesc, CUDNN_POOLING_MAX, CUDNN_NOT_PROPAGATE_NAN,
+//       kernel_h, kernel_w, pad_h, pad_w, stride_h, stride_w));
+  
+//   // 计算输出维度
+//   int out_n, out_c, out_h, out_w;
+//   CUDNN_REPORT_IF_ERROR(cudnnGetPooling2dForwardOutputDim(
+//       poolDesc, inputDesc, &out_n, &out_c, &out_h, &out_w));
+  
+//   // 设置输出描述符
+//   CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
+//       outputDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, out_n, out_c, out_h, out_w));
+  
+//   // 执行最大池化
+//   const float alpha = 1.0f;
+//   const float beta = 0.0f;
+//   CUDNN_REPORT_IF_ERROR(cudnnPoolingForward(
+//       handle, poolDesc, &alpha, inputDesc, input_data, &beta, outputDesc, output_data));
+  
+//   // // 清理描述符
+//   // CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(inputDesc));
+//   // CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(outputDesc));
+//   // CUDNN_REPORT_IF_ERROR(cudnnDestroyPoolingDescriptor(poolDesc));
+// }
+
 extern "C" MLIR_CUDA_WRAPPERS_EXPORT void
 mgpuCudnnMaxPoolForward(
     int n, int c, int h, int w,           // 输入维度 (NCHW)
@@ -2349,6 +3009,7 @@ mgpuCudnnMaxPoolForward(
     int pad_h_end, int pad_w_end,         // 填充 (结束)
     int stride_h, int stride_w,           // 步长
     int dilation_h, int dilation_w,       // 膨胀
+    int ceil_mode,                        // ceil模式 (0=floor, 1=ceil)
     void* input_data,                     // 输入张量
     void* output_data,                    // 输出张量
     CUstream stream                       // CUDA流
@@ -2362,22 +3023,10 @@ mgpuCudnnMaxPoolForward(
   }
   cudnnHandle_t handle = handles.cudnn_handle;
 
-  // 获取此流的cuDNN句柄
-  // cudnnHandle_t handle = mgpuCudnnGetHandle(stream);
-  
-  // // 创建描述符
-  // cudnnTensorDescriptor_t inputDesc, outputDesc;
-  // cudnnPoolingDescriptor_t poolDesc;
-  
-  // CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&inputDesc));
-  // CUDNN_REPORT_IF_ERROR(cudnnCreateTensorDescriptor(&outputDesc));
-  // CUDNN_REPORT_IF_ERROR(cudnnCreatePoolingDescriptor(&poolDesc));
-  
   // 从池中获取描述符
   cudnnTensorDescriptor_t inputDesc = acquireTensorDescriptor();
   cudnnTensorDescriptor_t outputDesc = acquireTensorDescriptor();
   cudnnPoolingDescriptor_t poolDesc = acquirePoolingDescriptor();
-
 
   // 设置输入描述符
   CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
@@ -2401,27 +3050,48 @@ mgpuCudnnMaxPoolForward(
       poolDesc, CUDNN_POOLING_MAX, CUDNN_NOT_PROPAGATE_NAN,
       kernel_h, kernel_w, pad_h, pad_w, stride_h, stride_w));
   
-  // 计算输出维度
-  int out_n, out_c, out_h, out_w;
-  CUDNN_REPORT_IF_ERROR(cudnnGetPooling2dForwardOutputDim(
-      poolDesc, inputDesc, &out_n, &out_c, &out_h, &out_w));
+  // 根据ceil_mode手动计算输出维度
+  int out_n = n;
+  int out_c = c;
+  int out_h, out_w;
+  
+  if (ceil_mode == 1) {
+    // ceil模式：向上取整
+    out_h = static_cast<int>(std::ceil(static_cast<float>(h + pad_h_begin + pad_h_end - kernel_h) / stride_h)) + 1;
+    out_w = static_cast<int>(std::ceil(static_cast<float>(w + pad_w_begin + pad_w_end - kernel_w) / stride_w)) + 1;
+  } else {
+    // floor模式：向下取整（默认）
+    out_h = static_cast<int>(std::floor(static_cast<float>(h + pad_h_begin + pad_h_end - kernel_h) / stride_h)) + 1;
+    out_w = static_cast<int>(std::floor(static_cast<float>(w + pad_w_begin + pad_w_end - kernel_w) / stride_w)) + 1;
+  }
+  
+  // 确保输出维度不为负数
+  out_h = std::max(1, out_h);
+  out_w = std::max(1, out_w);
   
   // 设置输出描述符
   CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
       outputDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, out_n, out_c, out_h, out_w));
+  
+  // // 验证计算的输出维度（可选，用于调试）
+  // int cudnn_out_n, cudnn_out_c, cudnn_out_h, cudnn_out_w;
+  // CUDNN_REPORT_IF_ERROR(cudnnGetPooling2dForwardOutputDim(
+  //     poolDesc, inputDesc, &cudnn_out_n, &cudnn_out_c, &cudnn_out_h, &cudnn_out_w));
+  
+  // if (ceil_mode == 0) {
+  //   // 对于floor模式，我们的计算应该与cuDNN一致
+  //   if (out_h != cudnn_out_h || out_w != cudnn_out_w) {
+  //     fprintf(stderr, "Warning: Manual calculation (%d,%d) differs from cuDNN (%d,%d) for floor mode\n",
+  //             out_h, out_w, cudnn_out_h, cudnn_out_w);
+  //   }
+  // }
   
   // 执行最大池化
   const float alpha = 1.0f;
   const float beta = 0.0f;
   CUDNN_REPORT_IF_ERROR(cudnnPoolingForward(
       handle, poolDesc, &alpha, inputDesc, input_data, &beta, outputDesc, output_data));
-  
-  // // 清理描述符
-  // CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(inputDesc));
-  // CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(outputDesc));
-  // CUDNN_REPORT_IF_ERROR(cudnnDestroyPoolingDescriptor(poolDesc));
 }
-
 
 // 张量乘法操作: C = A * B
 extern "C" MLIR_CUDA_WRAPPERS_EXPORT void 
@@ -2551,6 +3221,129 @@ mgpuCudnnAdd(void* inputA, void* inputB, void* output,
   // CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(bDesc));
   // CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(cDesc));
   // CUDNN_REPORT_IF_ERROR(cudnnDestroyOpTensorDescriptor(opDesc));
+}
+
+// Optimized wrapper for Flatten + Add pattern
+// Avoids the intermediate flatten operation by directly working with 4D tensors
+extern "C" MLIR_CUDA_WRAPPERS_EXPORT void 
+mgpuCudnnAddWithFlatten(void* flattenInput, void* otherInput, void* output,
+                       int n, int c, int h, int w,
+                       int isInputAFlattened,  // 1 if inputA was flattened, 0 if inputB was flattened
+                       CUstream stream) {
+  mgpuEnsureContext();
+  
+  // 获取预创建的handle组
+  StreamHandles handles;
+  if (!getHandlesForStream(stream, handles)) {
+    return; // 错误信息已在getHandlesForStream中打印
+  }
+  
+  cudnnHandle_t handle = handles.cudnn_handle;
+  
+  // 从池中获取描述符
+  cudnnTensorDescriptor_t flattenInputDesc = acquireTensorDescriptor();
+  cudnnTensorDescriptor_t otherInputDesc = acquireTensorDescriptor();
+  cudnnTensorDescriptor_t outputDesc = acquireTensorDescriptor();
+  cudnnOpTensorDescriptor_t opDesc = acquireOpTensorDescriptor();
+
+  // 设置原始 4D 张量描述符 (flatten 的输入)
+  CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
+      flattenInputDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, n, c, h, w));
+  
+  // 计算 flattened 的特征数量
+  int features = c * h * w;
+  
+  // 设置另一个输入的描述符 (2D 张量重塑为 4D)
+  // 将 [batch, features] 重塑为 [batch, features, 1, 1]
+  CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
+      otherInputDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, n, features, 1, 1));
+  
+  // 设置输出描述符 (2D 张量重塑为 4D)
+  CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
+      outputDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, n, features, 1, 1));
+  
+  // 设置为加法操作
+  CUDNN_REPORT_IF_ERROR(cudnnSetOpTensorDescriptor(
+      opDesc, CUDNN_OP_TENSOR_ADD, CUDNN_DATA_FLOAT, CUDNN_NOT_PROPAGATE_NAN));
+  
+  // 设置缩放因子
+  float alpha1 = 1.0f;
+  float alpha2 = 1.0f;
+  float beta = 0.0f;
+  
+  // 根据哪个输入被 flatten 了来决定参数顺序
+  if (isInputAFlattened) {
+    // inputA 被 flatten: output = flattenInput + otherInput
+    CUDNN_REPORT_IF_ERROR(cudnnOpTensor(
+        handle, opDesc,
+        &alpha1, flattenInputDesc, flattenInput,
+        &alpha2, otherInputDesc, otherInput,
+        &beta, outputDesc, output));
+  } else {
+    // inputB 被 flatten: output = otherInput + flattenInput
+    CUDNN_REPORT_IF_ERROR(cudnnOpTensor(
+        handle, opDesc,
+        &alpha1, otherInputDesc, otherInput,
+        &alpha2, flattenInputDesc, flattenInput,
+        &beta, outputDesc, output));
+  }
+  
+  // 描述符会自动返回到池中，无需手动释放
+}
+
+// FP16 版本
+extern "C" MLIR_CUDA_WRAPPERS_EXPORT void 
+mgpuCudnnAddWithFlatten_fp16(void* flattenInput, void* otherInput, void* output,
+                            int n, int c, int h, int w,
+                            int isInputAFlattened,
+                            CUstream stream) {
+  mgpuEnsureContext();
+  
+  StreamHandles handles;
+  if (!getHandlesForStream(stream, handles)) {
+    return;
+  }
+  
+  cudnnHandle_t handle = handles.cudnn_handle;
+  
+  cudnnTensorDescriptor_t flattenInputDesc = acquireTensorDescriptor();
+  cudnnTensorDescriptor_t otherInputDesc = acquireTensorDescriptor();
+  cudnnTensorDescriptor_t outputDesc = acquireTensorDescriptor();
+  cudnnOpTensorDescriptor_t opDesc = acquireOpTensorDescriptor();
+
+  // 使用 FP16 数据类型
+  CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
+      flattenInputDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_HALF, n, c, h, w));
+  
+  int features = c * h * w;
+  
+  CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
+      otherInputDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_HALF, n, features, 1, 1));
+  
+  CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
+      outputDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_HALF, n, features, 1, 1));
+  
+  CUDNN_REPORT_IF_ERROR(cudnnSetOpTensorDescriptor(
+      opDesc, CUDNN_OP_TENSOR_ADD, CUDNN_DATA_HALF, CUDNN_NOT_PROPAGATE_NAN));
+  
+  // FP16 使用 half 类型的缩放因子
+  __half alpha1 = __float2half(1.0f);
+  __half alpha2 = __float2half(1.0f);
+  __half beta = __float2half(0.0f);
+  
+  if (isInputAFlattened) {
+    CUDNN_REPORT_IF_ERROR(cudnnOpTensor(
+        handle, opDesc,
+        &alpha1, flattenInputDesc, flattenInput,
+        &alpha2, otherInputDesc, otherInput,
+        &beta, outputDesc, output));
+  } else {
+    CUDNN_REPORT_IF_ERROR(cudnnOpTensor(
+        handle, opDesc,
+        &alpha1, otherInputDesc, otherInput,
+        &alpha2, flattenInputDesc, flattenInput,
+        &beta, outputDesc, output));
+  }
 }
 
 extern "C" MLIR_CUDA_WRAPPERS_EXPORT void 
@@ -3967,1168 +4760,6 @@ extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuCudnnConv2dForward_fp16(
     // CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(yDesc));
     // CUDNN_REPORT_IF_ERROR(cudnnDestroyTensorDescriptor(biasDesc));
     // CUDNN_REPORT_IF_ERROR(cudnnDestroyConvolutionDescriptor(convDesc));
-}
-
-// 操作类型定义
-enum MGPUGraphOpType {
-    MGPU_GRAPH_OP_CONV2D = 0,
-    MGPU_GRAPH_OP_MAXPOOL = 1,
-    MGPU_GRAPH_OP_ADD = 2,
-    MGPU_GRAPH_OP_MUL = 3,
-    MGPU_GRAPH_OP_SUB = 4,
-    MGPU_GRAPH_OP_NEG = 5,
-    MGPU_GRAPH_OP_MATMUL = 6,
-    MGPU_GRAPH_OP_ADDSCALAR = 7,
-    MGPU_GRAPH_OP_MULSCALAR = 8
-};
-
-// 操作参数结构
-struct MGPUConv2dParams {
-    int n, c, h, w;           // 输入维度
-    int k, r, s;              // 卷积核参数
-    int pad_h, pad_w;         // 填充
-    int stride_h, stride_w;   // 步长
-    int dilation_h, dilation_w; // 膨胀
-};
-
-struct MGPUPoolParams {
-    int n, c, h, w;           // 输入维度
-    int kernel_h, kernel_w;   // 核大小
-    int pad_h_begin, pad_w_begin;
-    int pad_h_end, pad_w_end; // 填充
-    int stride_h, stride_w;   // 步长
-    int dilation_h, dilation_w; // 膨胀
-};
-
-struct MGPUElementwiseParams {
-    int n, c, h, w;           // 张量维度
-};
-
-struct MGPUMatmulParams {
-    int batch_size;
-    int input_features;
-    int output_features;
-};
-
-// 并行组图管理器 - 使用group_id而不是stream
-struct ParallelGroupGraph {
-    CudnnGraphBuilder* builder;
-    std::unordered_map<void*, int64_t> ptr_to_tensor_id;  // 数据指针到张量ID的映射
-    std::vector<void*> input_ptrs;   // 输入数据指针
-    std::vector<void*> output_ptrs;  // 输出数据指针
-    bool is_compiled;
-    
-    ParallelGroupGraph() : builder(nullptr), is_compiled(false) {}
-};
-
-static std::mutex g_graph_manager_mutex;
-static std::unordered_map<int, ParallelGroupGraph> g_group_graphs;
-static int g_next_group_id = 1;
-
-//===----------------------------------------------------------------------===//
-// 阶段1: 图构建接口 (不需要stream)
-//===----------------------------------------------------------------------===//
-
-extern "C" MLIR_CUDA_WRAPPERS_EXPORT int mgpuCreateParallelGroupGraph(cudnnHandle_t handle) {
-    mgpuEnsureContext();
-    
-    std::lock_guard<std::mutex> lock(g_graph_manager_mutex);
-    
-    int group_id = g_next_group_id++;
-    
-    auto& graph = g_group_graphs[group_id];
-    graph.builder = new CudnnGraphBuilder(handle);
-    graph.is_compiled = false;
-    
-    fprintf(stderr, "[GRAPH] Created graph builder for group %d\n", group_id);
-    
-    return group_id;
-}
-
-extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuDestroyParallelGroupGraph(int group_id) {
-    mgpuEnsureContext();
-    
-    std::lock_guard<std::mutex> lock(g_graph_manager_mutex);
-    
-    auto it = g_group_graphs.find(group_id);
-    if (it != g_group_graphs.end()) {
-        delete it->second.builder;
-        g_group_graphs.erase(it);
-        fprintf(stderr, "[GRAPH] Destroyed graph builder for group %d\n", group_id);
-    }
-}
-
-// 添加卷积操作到图中 (构建阶段 - 不需要stream)
-extern "C" MLIR_CUDA_WRAPPERS_EXPORT int64_t mgpuParallelGroupAddConv2d(
-    int group_id,
-    void* input_data, void* weight_data, void* bias_data, void* output_data,
-    int n, int c, int h, int w,      // 输入维度
-    int k, int r, int s,             // 卷积核参数  
-    int pad_h, int pad_w,            // 填充
-    int stride_h, int stride_w,      // 步长
-    int dilation_h, int dilation_w   // 膨胀
-) {
-    std::lock_guard<std::mutex> lock(g_graph_manager_mutex);
-    
-    auto it = g_group_graphs.find(group_id);
-    if (it == g_group_graphs.end()) {
-        fprintf(stderr, "[GRAPH] ERROR: No graph builder found for group %d\n", group_id);
-        return -1;
-    }
-    
-    auto& graph = it->second;
-    
-    // 计算输出维度
-    int out_h = (h + 2 * pad_h - (dilation_h * (r - 1) + 1)) / stride_h + 1;
-    int out_w = (w + 2 * pad_w - (dilation_w * (s - 1) + 1)) / stride_w + 1;
-    
-    // 添加张量（不设置数据指针，只定义结构）
-    std::vector<int> input_dims = {n, c, h, w};
-    std::vector<int> weight_dims = {k, c, r, s};
-    // std::vector<int> bias_dims = {1, k, 1, 1};
-    std::vector<int> output_dims = {n, k, out_h, out_w};
-    
-    int64_t input_id = graph.builder->AddTensor(input_dims, CUDNN_DATA_FLOAT);
-    int64_t weight_id = graph.builder->AddTensor(weight_dims, CUDNN_DATA_FLOAT);
-    // int64_t bias_id = bias_data ? graph.builder->AddTensor(bias_dims, CUDNN_DATA_FLOAT) : -1;
-    int64_t output_id = graph.builder->AddTensor(output_dims, CUDNN_DATA_FLOAT);
-    
-    // 记录数据指针映射关系（稍后执行时会用到）
-    graph.ptr_to_tensor_id[input_data] = input_id;
-    graph.ptr_to_tensor_id[weight_data] = weight_id;
-    // if (bias_data) {
-    //     graph.ptr_to_tensor_id[bias_data] = bias_id;
-    // }
-    graph.ptr_to_tensor_id[output_data] = output_id;
-    
-    // 添加卷积节点
-    std::vector<int> pads = {pad_h, pad_w};
-    std::vector<int> strides = {stride_h, stride_w};
-    std::vector<int> dilations = {dilation_h, dilation_w};
-    
-    // int64_t node_id = graph.builder->AddConvolutionNode(input_id, weight_id, bias_id, output_id, 
-    //                                                    pads, strides, dilations);
-    int64_t node_id = graph.builder->AddConvolutionNode(input_id, weight_id, -1, output_id, 
-                                                       pads, strides, dilations);
-    
-    fprintf(stderr, "[GRAPH] Added Conv2d node %ld to group %d\n", node_id, group_id);
-    return node_id;
-}
-
-// 添加池化操作到图中 (构建阶段 - 不需要stream)
-extern "C" MLIR_CUDA_WRAPPERS_EXPORT int64_t mgpuParallelGroupAddMaxPool(
-    int group_id,
-    void* input_data, void* output_data,
-    int n, int c, int h, int w,           // 输入维度
-    int kernel_h, int kernel_w,           // 核大小
-    int pad_h_begin, int pad_w_begin,     // 填充
-    int pad_h_end, int pad_w_end,
-    int stride_h, int stride_w,           // 步长
-    int dilation_h, int dilation_w        // 膨胀
-) {
-    std::lock_guard<std::mutex> lock(g_graph_manager_mutex);
-    
-    auto it = g_group_graphs.find(group_id);
-    if (it == g_group_graphs.end()) {
-        fprintf(stderr, "[GRAPH] ERROR: No graph builder found for group %d\n", group_id);
-        return -1;
-    }
-    
-    auto& graph = it->second;
-    
-    // 计算输出维度
-    int pad_h = std::max(pad_h_begin, pad_h_end);
-    int pad_w = std::max(pad_w_begin, pad_w_end);
-    int out_h = (h + 2 * pad_h - kernel_h) / stride_h + 1;
-    int out_w = (w + 2 * pad_w - kernel_w) / stride_w + 1;
-    
-    // 添加张量
-    std::vector<int> input_dims = {n, c, h, w};
-    std::vector<int> output_dims = {n, c, out_h, out_w};
-    
-    int64_t input_id = graph.builder->AddTensor(input_dims, CUDNN_DATA_FLOAT);
-    int64_t output_id = graph.builder->AddTensor(output_dims, CUDNN_DATA_FLOAT);
-    
-    // 记录数据指针映射关系
-    graph.ptr_to_tensor_id[input_data] = input_id;
-    graph.ptr_to_tensor_id[output_data] = output_id;
-    
-    // 添加池化节点
-    std::vector<int> window_dims = {kernel_h, kernel_w};
-    std::vector<int> pads = {pad_h, pad_w};
-    std::vector<int> strides = {stride_h, stride_w};
-    
-    int64_t node_id = graph.builder->AddPoolingNode(input_id, output_id, CUDNN_POOLING_MAX,
-                                                   window_dims, pads, strides);
-    
-    fprintf(stderr, "[GRAPH] Added MaxPool node %ld to group %d\n", node_id, group_id);
-    return node_id;
-}
-
-// 添加逐元素操作到图中 (构建阶段 - 不需要stream)
-extern "C" MLIR_CUDA_WRAPPERS_EXPORT int64_t mgpuParallelGroupAddElementwise(
-    int group_id,
-    void* input_a, void* input_b, void* output,
-    int n, int c, int h, int w,
-    int op_type  // 0=ADD, 1=MUL, 2=SUB
-) {
-    std::lock_guard<std::mutex> lock(g_graph_manager_mutex);
-    
-    auto it = g_group_graphs.find(group_id);
-    if (it == g_group_graphs.end()) {
-        fprintf(stderr, "[GRAPH] ERROR: No graph builder found for group %d\n", group_id);
-        return -1;
-    }
-    
-    auto& graph = it->second;
-    
-    // 添加张量
-    std::vector<int> dims = {n, c, h, w};
-    
-    int64_t input_a_id = graph.builder->AddTensor(dims, CUDNN_DATA_FLOAT);
-    int64_t input_b_id = graph.builder->AddTensor(dims, CUDNN_DATA_FLOAT);
-    int64_t output_id = graph.builder->AddTensor(dims, CUDNN_DATA_FLOAT);
-    
-    // 记录数据指针映射关系
-    graph.ptr_to_tensor_id[input_a] = input_a_id;
-    graph.ptr_to_tensor_id[input_b] = input_b_id;
-    graph.ptr_to_tensor_id[output] = output_id;
-    
-    // 添加逐元素操作节点
-    int64_t node_id = graph.builder->AddElementwiseNode(input_a_id, input_b_id, output_id,
-                                                       CUDNN_BACKEND_OPERATION_POINTWISE_DESCRIPTOR);
-    
-    const char* op_name = (op_type == 0) ? "ADD" : (op_type == 1) ? "MUL" : "SUB";
-    fprintf(stderr, "[GRAPH] Added %s node %ld to group %d\n", op_name, node_id, group_id);
-    return node_id;
-}
-
-// 添加矩阵乘法操作到图中 (构建阶段 - 不需要stream)
-extern "C" MLIR_CUDA_WRAPPERS_EXPORT int64_t mgpuParallelGroupAddMatmul(
-    int group_id,
-    void* input_data, void* weight_data, void* bias_data, void* output_data,
-    int batch_size, int input_features, int output_features
-) {
-    std::lock_guard<std::mutex> lock(g_graph_manager_mutex);
-    
-    auto it = g_group_graphs.find(group_id);
-    if (it == g_group_graphs.end()) {
-        fprintf(stderr, "[GRAPH] ERROR: No graph builder found for group %d\n", group_id);
-        return -1;
-    }
-    
-    auto& graph = it->second;
-    
-    // 添加张量
-    std::vector<int> input_dims = {batch_size, input_features};
-    std::vector<int> weight_dims = {output_features, input_features};
-    std::vector<int> bias_dims = {1, output_features};
-    std::vector<int> output_dims = {batch_size, output_features};
-    
-    int64_t input_id = graph.builder->AddTensor(input_dims, CUDNN_DATA_FLOAT);
-    int64_t weight_id = graph.builder->AddTensor(weight_dims, CUDNN_DATA_FLOAT);
-    int64_t bias_id = bias_data ? graph.builder->AddTensor(bias_dims, CUDNN_DATA_FLOAT) : -1;
-    int64_t output_id = graph.builder->AddTensor(output_dims, CUDNN_DATA_FLOAT);
-    
-    // 记录数据指针映射关系
-    graph.ptr_to_tensor_id[input_data] = input_id;
-    graph.ptr_to_tensor_id[weight_data] = weight_id;
-    if (bias_data) {
-        graph.ptr_to_tensor_id[bias_data] = bias_id;
-    }
-    graph.ptr_to_tensor_id[output_data] = output_id;
-    
-    // 添加矩阵乘法节点
-    int64_t node_id = graph.builder->AddMatmulNode(input_id, weight_id, output_id);
-    
-    fprintf(stderr, "[GRAPH] Added Matmul node %ld to group %d\n", node_id, group_id);
-    return node_id;
-}
-
-//===----------------------------------------------------------------------===//
-// 阶段2: 图编译接口 (不需要stream)
-//===----------------------------------------------------------------------===//
-
-extern "C" MLIR_CUDA_WRAPPERS_EXPORT bool mgpuParallelGroupCompile(int group_id) {
-    mgpuEnsureContext();
-    
-    std::lock_guard<std::mutex> lock(g_graph_manager_mutex);
-    
-    auto it = g_group_graphs.find(group_id);
-    if (it == g_group_graphs.end()) {
-        fprintf(stderr, "[GRAPH] ERROR: No graph builder found for group %d\n", group_id);
-        return false;
-    }
-    
-    auto& graph = it->second;
-    
-    if (graph.is_compiled) {
-        return true;  // 已经编译过了
-    }
-    
-    fprintf(stderr, "[GRAPH] Compiling graph for group %d...\n", group_id);
-    
-    // 最终化图
-    if (!graph.builder->FinalizeGraph()) {
-        fprintf(stderr, "[GRAPH] ERROR: Failed to finalize graph for group %d\n", group_id);
-        return false;
-    }
-    
-    // 编译图
-    if (!graph.builder->CompileGraph()) {
-        fprintf(stderr, "[GRAPH] ERROR: Failed to compile graph for group %d\n", group_id);
-        return false;
-    }
-    
-    graph.is_compiled = true;
-    
-    // 打印图信息
-    graph.builder->PrintGraphInfo();
-    
-    fprintf(stderr, "[GRAPH] Successfully compiled graph for group %d\n", group_id);
-    return true;
-}
-
-//===----------------------------------------------------------------------===//
-// 阶段3: 图执行接口 (需要stream和实际数据)
-//===----------------------------------------------------------------------===//
-
-extern "C" MLIR_CUDA_WRAPPERS_EXPORT bool mgpuParallelGroupExecute(int group_id, CUstream stream) {
-    mgpuEnsureContext();
-    
-    std::lock_guard<std::mutex> lock(g_graph_manager_mutex);
-    
-    auto it = g_group_graphs.find(group_id);
-    if (it == g_group_graphs.end()) {
-        fprintf(stderr, "[GRAPH] ERROR: No graph builder found for group %d\n", group_id);
-        return false;
-    }
-    
-    auto& graph = it->second;
-    
-    // 确保图已编译
-    if (!graph.is_compiled) {
-        if (!mgpuParallelGroupCompile(group_id)) {
-            return false;
-        }
-    }
-    
-    // 设置所有张量的实际数据指针
-    for (const auto& pair : graph.ptr_to_tensor_id) {
-        void* data_ptr = pair.first;
-        int64_t tensor_id = pair.second;
-        graph.builder->SetTensorData(tensor_id, data_ptr);
-    }
-    
-    fprintf(stderr, "[GRAPH] Executing graph for group %d on stream %p...\n", group_id, stream);
-    
-    // 执行图（现在才需要stream）
-    if (!graph.builder->ExecuteGraph(stream)) {
-        fprintf(stderr, "[GRAPH] ERROR: Failed to execute graph for group %d\n", group_id);
-        return false;
-    }
-    
-    fprintf(stderr, "[GRAPH] Successfully executed graph for group %d\n", group_id);
-    return true;
-}
-
-//===----------------------------------------------------------------------===//
-// 便利接口 - 一次性编译和执行
-//===----------------------------------------------------------------------===//
-
-extern "C" MLIR_CUDA_WRAPPERS_EXPORT bool mgpuParallelGroupCompileAndExecute(int group_id, CUstream stream) {
-    // 先编译（如果还没编译）
-    if (!mgpuParallelGroupCompile(group_id)) {
-        return false;
-    }
-    
-    // 再执行
-    return mgpuParallelGroupExecute(group_id, stream);
-}
-
-//===----------------------------------------------------------------------===//
-// 向后兼容的接口 (保持原有的stream-based接口以便渐进迁移)
-//===----------------------------------------------------------------------===//
-
-// 这些函数保持为了向后兼容，但内部使用新的group-based实现
-static std::mutex g_stream_to_group_mutex;
-static std::unordered_map<CUstream, int> g_stream_to_group_id;
-
-extern "C" MLIR_CUDA_WRAPPERS_EXPORT void* mgpuCreateParallelGroupGraphLegacy(CUstream stream) {
-    mgpuEnsureContext();
-    
-    // 获取此流的cuDNN句柄
-    cudnnHandle_t handle = mgpuCudnnGetHandle(stream);
-    
-    // 创建新的组
-    int group_id = mgpuCreateParallelGroupGraph(handle);
-    
-    // 建立stream到group的映射
-    std::lock_guard<std::mutex> lock(g_stream_to_group_mutex);
-    g_stream_to_group_id[stream] = group_id;
-    
-    fprintf(stderr, "[GRAPH] Created legacy graph builder for stream %p (group %d)\n", stream, group_id);
-    
-    // 返回group_id作为void*（为了兼容）
-    return reinterpret_cast<void*>(static_cast<intptr_t>(group_id));
-}
-
-extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuDestroyParallelGroupGraphLegacy(CUstream stream) {
-    std::lock_guard<std::mutex> lock(g_stream_to_group_mutex);
-    
-    auto it = g_stream_to_group_id.find(stream);
-    if (it != g_stream_to_group_id.end()) {
-        int group_id = it->second;
-        mgpuDestroyParallelGroupGraph(group_id);
-        g_stream_to_group_id.erase(it);
-        fprintf(stderr, "[GRAPH] Destroyed legacy graph builder for stream %p (group %d)\n", stream, group_id);
-    }
-}
-
-extern "C" MLIR_CUDA_WRAPPERS_EXPORT bool mgpuGraphCompileAndExecuteLegacy(CUstream stream) {
-    std::lock_guard<std::mutex> lock(g_stream_to_group_mutex);
-    
-    auto it = g_stream_to_group_id.find(stream);
-    if (it == g_stream_to_group_id.end()) {
-        fprintf(stderr, "[GRAPH] ERROR: No graph group found for stream %p\n", stream);
-        return false;
-    }
-    
-    int group_id = it->second;
-    return mgpuParallelGroupCompileAndExecute(group_id, stream);
-}
-
-//===----------------------------------------------------------------------===//
-// 原有API的图替代版本 (向后兼容)
-//===----------------------------------------------------------------------===//
-
-// 这些函数现在将操作添加到与stream关联的图组中
-extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuCudnnConv2dForwardGraph(
-    int n, int c, int h, int w_in,
-    int k, int r, int s,
-    int pad_h, int pad_w,
-    int stride_h, int stride_w,
-    int dilation_h, int dilation_w,
-    void* x_data, void* w_data, void* bias_data,
-    void* y_data,
-    CUstream stream
-) {
-    std::lock_guard<std::mutex> lock(g_stream_to_group_mutex);
-    
-    auto it = g_stream_to_group_id.find(stream);
-    if (it != g_stream_to_group_id.end()) {
-        int group_id = it->second;
-        mgpuParallelGroupAddConv2d(group_id, x_data, w_data, bias_data, y_data,
-                                  n, c, h, w_in, k, r, s, pad_h, pad_w, 
-                                  stride_h, stride_w, dilation_h, dilation_w);
-    }
-}
-
-extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuCudnnMaxPoolForwardGraph(
-    int n, int c, int h, int w,
-    int kernel_h, int kernel_w,
-    int pad_h_begin, int pad_w_begin,
-    int pad_h_end, int pad_w_end,
-    int stride_h, int stride_w,
-    int dilation_h, int dilation_w,
-    void* input_data,
-    void* output_data,
-    CUstream stream
-) {
-    std::lock_guard<std::mutex> lock(g_stream_to_group_mutex);
-    
-    auto it = g_stream_to_group_id.find(stream);
-    if (it != g_stream_to_group_id.end()) {
-        int group_id = it->second;
-        mgpuParallelGroupAddMaxPool(group_id, input_data, output_data,
-                                   n, c, h, w, kernel_h, kernel_w,
-                                   pad_h_begin, pad_w_begin, pad_h_end, pad_w_end,
-                                   stride_h, stride_w, dilation_h, dilation_w);
-    }
-}
-
-extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuCudnnAddGraph(
-    void* inputA, void* inputB, void* output,
-    int n, int c, int h, int w,
-    CUstream stream
-) {
-    std::lock_guard<std::mutex> lock(g_stream_to_group_mutex);
-    
-    auto it = g_stream_to_group_id.find(stream);
-    if (it != g_stream_to_group_id.end()) {
-        int group_id = it->second;
-        mgpuParallelGroupAddElementwise(group_id, inputA, inputB, output, n, c, h, w, 0); // 0 = ADD
-    }
-}
-
-extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuCudnnMulGraph(
-    void* inputA, void* inputB, void* output,
-    int n, int c, int h, int w,
-    CUstream stream
-) {
-    std::lock_guard<std::mutex> lock(g_stream_to_group_mutex);
-    
-    auto it = g_stream_to_group_id.find(stream);
-    if (it != g_stream_to_group_id.end()) {
-        int group_id = it->second;
-        mgpuParallelGroupAddElementwise(group_id, inputA, inputB, output, n, c, h, w, 1); // 1 = MUL
-    }
-}
-
-extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuCudnnSubGraph(
-    void* inputA, void* inputB, void* output,
-    int n, int c, int h, int w,
-    CUstream stream
-) {
-    std::lock_guard<std::mutex> lock(g_stream_to_group_mutex);
-    
-    auto it = g_stream_to_group_id.find(stream);
-    if (it != g_stream_to_group_id.end()) {
-        int group_id = it->second;
-        mgpuParallelGroupAddElementwise(group_id, inputA, inputB, output, n, c, h, w, 2); // 2 = SUB
-    }
-}
-
-// 清理所有图
-extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuCleanupAllGraphs() {
-    {
-        std::lock_guard<std::mutex> lock(g_graph_manager_mutex);
-        
-        for (auto& pair : g_group_graphs) {
-            delete pair.second.builder;
-        }
-        g_group_graphs.clear();
-    }
-    
-    {
-        std::lock_guard<std::mutex> lock(g_stream_to_group_mutex);
-        g_stream_to_group_id.clear();
-    }
-    
-    fprintf(stderr, "[GRAPH] Cleaned up all graphs\n");
-}
-
-
-// 清理所有 matmul (op5) 相关逻辑的测试函数
-extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuCudnnGraphTest() {
-    printf("=== Starting cuDNN Graph Parallel Operations Test ===\n");
-    
-    // 1. 在函数开始处声明所有变量
-    CUstream stream = nullptr;
-    CUevent start = nullptr, stop = nullptr;
-    cudnnHandle_t handle = nullptr;
-    int group_id = 0;
-    
-    // 操作参数变量 (移除 op3, op5 相关)
-    int op1_n = 2, op1_c_in = 3, op1_h = 16, op1_w = 16;
-    int op1_c_out = 8, op1_k = 3, op1_pad = 1, op1_stride = 1;
-    
-    int op2_n = 1, op2_c_in = 16, op2_h = 32, op2_w = 32;
-    int op2_c_out = 32, op2_k = 3, op2_pad = 1, op2_stride = 1;
-    
-    // 注释掉 op3 相关变量
-    // int op3_n = 4, op3_c = 64, op3_h = 28, op3_w = 28;
-    // int op3_pool_k = 2, op3_pool_stride = 2;
-    // int op3_out_h = op3_h / op3_pool_stride, op3_out_w = op3_w / op3_pool_stride;
-    
-    int op4_n = 3, op4_c = 32, op4_h = 24, op4_w = 24;
-    
-    // 注释掉 op5 相关变量
-    // int op5_batch = 8, op5_in_features = 512, op5_out_features = 256;
-    
-    // 内存大小变量 (移除 op3, op5 相关)
-    size_t op1_input_size, op1_weight_size, op1_bias_size, op1_output_size;
-    size_t op2_input_size, op2_weight_size, op2_bias_size, op2_output_size;
-    // size_t op3_input_size, op3_output_size;
-    size_t op4_tensor_size;
-    // size_t op5_input_size, op5_weight_size, op5_bias_size, op5_output_size;
-    
-    // 设备指针变量 (移除 op3, op5 相关)
-    CUdeviceptr d_op1_input = 0, d_op1_weight = 0, d_op1_bias = 0, d_op1_output = 0;
-    CUdeviceptr d_op2_input = 0, d_op2_weight = 0, d_op2_bias = 0, d_op2_output = 0;
-    // CUdeviceptr d_op3_input = 0, d_op3_output = 0;
-    CUdeviceptr d_op4_inputA = 0, d_op4_inputB = 0, d_op4_output = 0;
-    // CUdeviceptr d_op5_input = 0, d_op5_weight = 0, d_op5_bias = 0, d_op5_output = 0;
-    
-    // void*指针变量 (移除 op3, op5 相关)
-    void* op1_input_ptr = nullptr; void* op1_weight_ptr = nullptr;
-    void* op1_bias_ptr = nullptr; void* op1_output_ptr = nullptr;
-    void* op2_input_ptr = nullptr; void* op2_weight_ptr = nullptr;
-    void* op2_bias_ptr = nullptr; void* op2_output_ptr = nullptr;
-    // void* op3_input_ptr = nullptr; void* op3_output_ptr = nullptr;
-    void* op4_inputA_ptr = nullptr; void* op4_inputB_ptr = nullptr; void* op4_output_ptr = nullptr;
-    // void* op5_input_ptr = nullptr; void* op5_weight_ptr = nullptr;
-    // void* op5_bias_ptr = nullptr; void* op5_output_ptr = nullptr;
-    
-    // 节点ID变量 (移除 op3, op5 相关)
-    int64_t op1_node = -1, op2_node = -1, /* op3_node = -1, */ op4_node = -1; // , op5_node = -1;
-    
-    // 其他变量
-    bool compile_success = false;
-    bool exec_success = false;
-    int num_iterations = 20;
-    float milliseconds = 0.0f;
-    bool all_valid = true;
-    
-    // 主机内存指针（移除 op3, op5 相关）
-    float* host_op1_output = nullptr;
-    float* host_op2_output = nullptr;
-    // float* host_op3_output = nullptr;
-    float* host_op4_output = nullptr;
-    // float* host_op5_output = nullptr;
-    
-    // 2. 初始化CUDA环境
-    mgpuEnsureContext();
-    
-    CUDA_REPORT_IF_ERROR(cuStreamCreate(&stream, CU_STREAM_NON_BLOCKING));
-    CUDA_REPORT_IF_ERROR(cuEventCreate(&start, CU_EVENT_DEFAULT));
-    CUDA_REPORT_IF_ERROR(cuEventCreate(&stop, CU_EVENT_DEFAULT));
-    
-    // 3. 获取cuDNN句柄并创建图
-    handle = mgpuCudnnGetHandle(stream);
-    group_id = mgpuCreateParallelGroupGraph(handle);
-    if (group_id <= 0) {
-        printf("ERROR: Failed to create graph group\n");
-        goto cleanup;
-    }
-    printf("Created graph group: %d\n", group_id);
-    
-    // 4. 定义操作参数 (移除 op3, op5 相关)
-    printf("Defining independent parallel operations:\n");
-    printf("  Op1 - Conv2d: [%d,%d,%d,%d] -> [%d,%d,%d,%d]\n", 
-           op1_n, op1_c_in, op1_h, op1_w, op1_n, op1_c_out, op1_h, op1_w);
-    printf("  Op2 - Conv2d: [%d,%d,%d,%d] -> [%d,%d,%d,%d]\n", 
-           op2_n, op2_c_in, op2_h, op2_w, op2_n, op2_c_out, op2_h, op2_w);
-    // printf("  Op3 - MaxPool: [%d,%d,%d,%d] -> [%d,%d,%d,%d]\n", 
-    //        op3_n, op3_c, op3_h, op3_w, op3_n, op3_c, op3_out_h, op3_out_w);
-    printf("  Op4 - ElementwiseAdd: [%d,%d,%d,%d] + [%d,%d,%d,%d] -> [%d,%d,%d,%d]\n", 
-           op4_n, op4_c, op4_h, op4_w, op4_n, op4_c, op4_h, op4_w, op4_n, op4_c, op4_h, op4_w);
-    // printf("  Op5 - Matmul: [%d,%d] x [%d,%d] -> [%d,%d]\n", 
-    //        op5_batch, op5_in_features, op5_out_features, op5_in_features, op5_batch, op5_out_features);
-    
-    // 5. 计算内存大小 (移除 op3, op5 相关)
-    op1_input_size = op1_n * op1_c_in * op1_h * op1_w * sizeof(float);
-    op1_weight_size = op1_c_out * op1_c_in * op1_k * op1_k * sizeof(float);
-    op1_bias_size = op1_c_out * sizeof(float);
-    op1_output_size = op1_n * op1_c_out * op1_h * op1_w * sizeof(float);
-    
-    op2_input_size = op2_n * op2_c_in * op2_h * op2_w * sizeof(float);
-    op2_weight_size = op2_c_out * op2_c_in * op2_k * op2_k * sizeof(float);
-    op2_bias_size = op2_c_out * sizeof(float);
-    op2_output_size = op2_n * op2_c_out * op2_h * op2_w * sizeof(float);
-    
-    // op3_input_size = op3_n * op3_c * op3_h * op3_w * sizeof(float);
-    // op3_output_size = op3_n * op3_c * op3_out_h * op3_out_w * sizeof(float);
-    
-    op4_tensor_size = op4_n * op4_c * op4_h * op4_w * sizeof(float);
-    
-    // op5_input_size = op5_batch * op5_in_features * sizeof(float);
-    // op5_weight_size = op5_out_features * op5_in_features * sizeof(float);
-    // op5_bias_size = op5_out_features * sizeof(float);
-    // op5_output_size = op5_batch * op5_out_features * sizeof(float);
-    
-    // 6. 分配内存 (移除 op3, op5 相关)
-    printf("Allocating independent memory buffers...\n");
-    
-    // 操作1内存
-    CUDA_REPORT_IF_ERROR(cuMemAlloc(&d_op1_input, op1_input_size));
-    CUDA_REPORT_IF_ERROR(cuMemAlloc(&d_op1_weight, op1_weight_size));
-    CUDA_REPORT_IF_ERROR(cuMemAlloc(&d_op1_bias, op1_bias_size));
-    CUDA_REPORT_IF_ERROR(cuMemAlloc(&d_op1_output, op1_output_size));
-    
-    // 操作2内存
-    CUDA_REPORT_IF_ERROR(cuMemAlloc(&d_op2_input, op2_input_size));
-    CUDA_REPORT_IF_ERROR(cuMemAlloc(&d_op2_weight, op2_weight_size));
-    CUDA_REPORT_IF_ERROR(cuMemAlloc(&d_op2_bias, op2_bias_size));
-    CUDA_REPORT_IF_ERROR(cuMemAlloc(&d_op2_output, op2_output_size));
-    
-    // 操作3内存 (注释掉)
-    // CUDA_REPORT_IF_ERROR(cuMemAlloc(&d_op3_input, op3_input_size));
-    // CUDA_REPORT_IF_ERROR(cuMemAlloc(&d_op3_output, op3_output_size));
-    
-    // 操作4内存
-    CUDA_REPORT_IF_ERROR(cuMemAlloc(&d_op4_inputA, op4_tensor_size));
-    CUDA_REPORT_IF_ERROR(cuMemAlloc(&d_op4_inputB, op4_tensor_size));
-    CUDA_REPORT_IF_ERROR(cuMemAlloc(&d_op4_output, op4_tensor_size));
-    
-    // 操作5内存 (注释掉)
-    // CUDA_REPORT_IF_ERROR(cuMemAlloc(&d_op5_input, op5_input_size));
-    // CUDA_REPORT_IF_ERROR(cuMemAlloc(&d_op5_weight, op5_weight_size));
-    // CUDA_REPORT_IF_ERROR(cuMemAlloc(&d_op5_bias, op5_bias_size));
-    // CUDA_REPORT_IF_ERROR(cuMemAlloc(&d_op5_output, op5_output_size));
-    
-    // 转换为void*指针 (移除 op3, op5 相关)
-    op1_input_ptr = reinterpret_cast<void*>(d_op1_input);
-    op1_weight_ptr = reinterpret_cast<void*>(d_op1_weight);
-    op1_bias_ptr = reinterpret_cast<void*>(d_op1_bias);
-    op1_output_ptr = reinterpret_cast<void*>(d_op1_output);
-    
-    op2_input_ptr = reinterpret_cast<void*>(d_op2_input);
-    op2_weight_ptr = reinterpret_cast<void*>(d_op2_weight);
-    op2_bias_ptr = reinterpret_cast<void*>(d_op2_bias);
-    op2_output_ptr = reinterpret_cast<void*>(d_op2_output);
-    
-    // op3_input_ptr = reinterpret_cast<void*>(d_op3_input);
-    // op3_output_ptr = reinterpret_cast<void*>(d_op3_output);
-    
-    op4_inputA_ptr = reinterpret_cast<void*>(d_op4_inputA);
-    op4_inputB_ptr = reinterpret_cast<void*>(d_op4_inputB);
-    op4_output_ptr = reinterpret_cast<void*>(d_op4_output);
-    
-    // op5_input_ptr = reinterpret_cast<void*>(d_op5_input);
-    // op5_weight_ptr = reinterpret_cast<void*>(d_op5_weight);
-    // op5_bias_ptr = reinterpret_cast<void*>(d_op5_bias);
-    // op5_output_ptr = reinterpret_cast<void*>(d_op5_output);
-    
-    // 7. 初始化数据 (移除 op3, op5 相关)
-    printf("Initializing independent test data...\n");
-    
-    CUDA_REPORT_IF_ERROR(cuMemsetD32Async(d_op1_input, 0x3f800000, op1_input_size / 4, stream));  // 1.0f
-    CUDA_REPORT_IF_ERROR(cuMemsetD32Async(d_op1_weight, 0x3f000000, op1_weight_size / 4, stream)); // 0.5f
-    CUDA_REPORT_IF_ERROR(cuMemsetD32Async(d_op1_bias, 0x3f800000, op1_bias_size / 4, stream));     // 1.0f
-    
-    CUDA_REPORT_IF_ERROR(cuMemsetD32Async(d_op2_input, 0x3f400000, op2_input_size / 4, stream));  // 0.75f
-    CUDA_REPORT_IF_ERROR(cuMemsetD32Async(d_op2_weight, 0x3e800000, op2_weight_size / 4, stream)); // 0.25f
-    CUDA_REPORT_IF_ERROR(cuMemsetD32Async(d_op2_bias, 0x3f000000, op2_bias_size / 4, stream));     // 0.5f
-    
-    // CUDA_REPORT_IF_ERROR(cuMemsetD32Async(d_op3_input, 0x40000000, op3_input_size / 4, stream));  // 2.0f
-    
-    CUDA_REPORT_IF_ERROR(cuMemsetD32Async(d_op4_inputA, 0x40400000, op4_tensor_size / 4, stream)); // 3.0f
-    CUDA_REPORT_IF_ERROR(cuMemsetD32Async(d_op4_inputB, 0x40800000, op4_tensor_size / 4, stream)); // 4.0f
-    
-    // 注释掉 op5 数据初始化
-    // CUDA_REPORT_IF_ERROR(cuMemsetD32Async(d_op5_input, 0x3f800000, op5_input_size / 4, stream));  // 1.0f
-    // CUDA_REPORT_IF_ERROR(cuMemsetD32Async(d_op5_weight, 0x3dcccccd, op5_weight_size / 4, stream)); // 0.1f
-    // CUDA_REPORT_IF_ERROR(cuMemsetD32Async(d_op5_bias, 0x3f800000, op5_bias_size / 4, stream));     // 1.0f
-    
-    CUDA_REPORT_IF_ERROR(cuStreamSynchronize(stream));
-    
-    // 8. 构建计算图 (保持 op3, op5 注释)
-    printf("Building parallel computation graph with independent operations...\n");
-    
-    op1_node = mgpuParallelGroupAddConv2d(
-        group_id, op1_input_ptr, op1_weight_ptr, op1_bias_ptr, op1_output_ptr,
-        op1_n, op1_c_in, op1_h, op1_w, op1_c_out, op1_k, op1_k,
-        op1_pad, op1_pad, op1_stride, op1_stride, 1, 1
-    );
-    if (op1_node < 0) {
-        printf("ERROR: Failed to add Conv2d operation 1\n");
-        goto cleanup;
-    }
-    printf("Added Op1 - Conv2d node: %ld\n", op1_node);
-    
-    op2_node = mgpuParallelGroupAddConv2d(
-        group_id, op2_input_ptr, op2_weight_ptr, op2_bias_ptr, op2_output_ptr,
-        op2_n, op2_c_in, op2_h, op2_w, op2_c_out, op2_k, op2_k,
-        op2_pad, op2_pad, op2_stride, op2_stride, 1, 1
-    );
-    if (op2_node < 0) {
-        printf("ERROR: Failed to add Conv2d operation 2\n");
-        goto cleanup;
-    }
-    printf("Added Op2 - Conv2d node: %ld\n", op2_node);
-    
-    // op3 节点添加 (已注释)
-    // op3_node = mgpuParallelGroupAddMaxPool(
-    //     group_id, op3_input_ptr, op3_output_ptr,
-    //     op3_n, op3_c, op3_h, op3_w, op3_pool_k, op3_pool_k,
-    //     0, 0, 0, 0, op3_pool_stride, op3_pool_stride, 1, 1
-    // );
-    // if (op3_node < 0) {
-    //     printf("ERROR: Failed to add MaxPool operation 3\n");
-    //     goto cleanup;
-    // }
-    // printf("Added Op3 - MaxPool node: %ld\n", op3_node);
-    
-    op4_node = mgpuParallelGroupAddElementwise(
-        group_id, op4_inputA_ptr, op4_inputB_ptr, op4_output_ptr,
-        op4_n, op4_c, op4_h, op4_w, 0
-    );
-    if (op4_node < 0) {
-        printf("ERROR: Failed to add ElementwiseAdd operation 4\n");
-        goto cleanup;
-    }
-    printf("Added Op4 - ElementwiseAdd node: %ld\n", op4_node);
-    
-    // op5 节点添加 (已注释)
-    // op5_node = mgpuParallelGroupAddMatmul(
-    //     group_id, op5_input_ptr, op5_weight_ptr, op5_bias_ptr, op5_output_ptr,
-    //     op5_batch, op5_in_features, op5_out_features
-    // );
-    // if (op5_node < 0) {
-    //     printf("ERROR: Failed to add Matmul operation 5\n");
-    //     goto cleanup;
-    // }
-    // printf("Added Op5 - Matmul node: %ld\n", op5_node);
-    
-    printf("Successfully added 3 independent parallel operations to graph\n");
-    
-    // 9. 编译图
-    printf("Compiling parallel computation graph...\n");
-    compile_success = mgpuParallelGroupCompile(group_id);
-    if (!compile_success) {
-        printf("ERROR: Failed to compile parallel graph\n");
-        goto cleanup;
-    }
-    printf("Parallel graph compilation successful!\n");
-    
-    // 10. 执行图并计时
-    printf("Executing parallel computation graph...\n");
-    
-    // Warm-up
-    printf("Performing warm-up execution...\n");
-    exec_success = mgpuParallelGroupExecute(group_id, stream);
-    if (!exec_success) {
-        printf("ERROR: Failed to execute parallel graph (warm-up)\n");
-        goto cleanup;
-    }
-    CUDA_REPORT_IF_ERROR(cuStreamSynchronize(stream));
-    
-    // Timed execution
-    printf("Performing timed parallel execution...\n");
-    
-    CUDA_REPORT_IF_ERROR(cuEventRecord(start, stream));
-    
-    {
-        int i;
-        for (i = 0; i < num_iterations; i++) {
-            exec_success = mgpuParallelGroupExecute(group_id, stream);
-            if (!exec_success) {
-                printf("ERROR: Failed to execute parallel graph (iteration %d)\n", i);
-                goto cleanup;
-            }
-        }
-    }
-    
-    CUDA_REPORT_IF_ERROR(cuEventRecord(stop, stream));
-    CUDA_REPORT_IF_ERROR(cuEventSynchronize(stop));
-    
-    // 计算性能
-    CUDA_REPORT_IF_ERROR(cuEventElapsedTime(&milliseconds, start, stop));
-    
-    printf("Parallel Execution Performance Results:\n");
-    printf("  Total time for %d iterations: %.3f ms\n", num_iterations, milliseconds);
-    printf("  Average time per iteration: %.3f ms\n", milliseconds / num_iterations);
-    printf("  Throughput: %.2f executions/sec\n", (num_iterations * 1000.0f) / milliseconds);
-    printf("  Estimated parallel speedup benefit: 3 operations executed simultaneously\n");
-    
-    // 11. 结果验证 (移除 op3, op5 相关)
-    printf("Validating parallel operation results...\n");
-    
-    // 验证操作1输出
-    host_op1_output = new float[op1_n * op1_c_out * op1_h * op1_w];
-    CUDA_REPORT_IF_ERROR(cuMemcpyDtoH(host_op1_output, d_op1_output, op1_output_size));
-    {
-        float expected_op1 = 9 * 0.5f + 1.0f; // 5.5f
-        if (std::abs(host_op1_output[0] - expected_op1) < 1e-3) {
-            printf("  Op1 (Conv2d) validation: PASSED (%.3f ≈ %.3f)\n", host_op1_output[0], expected_op1);
-        } else {
-            printf("  Op1 (Conv2d) validation: FAILED (%.3f ≠ %.3f)\n", host_op1_output[0], expected_op1);
-            all_valid = false;
-        }
-    }
-    
-    // 验证操作2输出
-    host_op2_output = new float[op2_n * op2_c_out * op2_h * op2_w];
-    CUDA_REPORT_IF_ERROR(cuMemcpyDtoH(host_op2_output, d_op2_output, op2_output_size));
-    {
-        float expected_op2 = 9 * 0.75f * 0.25f + 0.5f; // 2.1875f
-        if (std::abs(host_op2_output[0] - expected_op2) < 1e-3) {
-            printf("  Op2 (Conv2d) validation: PASSED (%.3f ≈ %.3f)\n", host_op2_output[0], expected_op2);
-        } else {
-            printf("  Op2 (Conv2d) validation: FAILED (%.3f ≠ %.3f)\n", host_op2_output[0], expected_op2);
-            all_valid = false;
-        }
-    }
-    
-    // 验证操作3输出 (注释掉)
-    // host_op3_output = new float[op3_n * op3_c * op3_out_h * op3_out_w];
-    // CUDA_REPORT_IF_ERROR(cuMemcpyDtoH(host_op3_output, d_op3_output, op3_output_size));
-    // {
-    //     float expected_op3 = 2.0f;
-    //     if (std::abs(host_op3_output[0] - expected_op3) < 1e-3) {
-    //         printf("  Op3 (MaxPool) validation: PASSED (%.3f ≈ %.3f)\n", host_op3_output[0], expected_op3);
-    //     } else {
-    //         printf("  Op3 (MaxPool) validation: FAILED (%.3f ≠ %.3f)\n", host_op3_output[0], expected_op3);
-    //         all_valid = false;
-    //     }
-    // }
-    
-    // 验证操作4输出
-    host_op4_output = new float[op4_n * op4_c * op4_h * op4_w];
-    CUDA_REPORT_IF_ERROR(cuMemcpyDtoH(host_op4_output, d_op4_output, op4_tensor_size));
-    {
-        float expected_op4 = 3.0f + 4.0f; // 7.0f
-        if (std::abs(host_op4_output[0] - expected_op4) < 1e-3) {
-            printf("  Op4 (ElementwiseAdd) validation: PASSED (%.3f ≈ %.3f)\n", host_op4_output[0], expected_op4);
-        } else {
-            printf("  Op4 (ElementwiseAdd) validation: FAILED (%.3f ≠ %.3f)\n", host_op4_output[0], expected_op4);
-            all_valid = false;
-        }
-    }
-    
-    // 验证操作5输出 (注释掉)
-    // host_op5_output = new float[op5_batch * op5_out_features];
-    // CUDA_REPORT_IF_ERROR(cuMemcpyDtoH(host_op5_output, d_op5_output, op5_output_size));
-    // {
-    //     float expected_op5 = op5_in_features * 1.0f * 0.1f + 1.0f; // 52.2f
-    //     if (std::abs(host_op5_output[0] - expected_op5) < 1e-2) {
-    //         printf("  Op5 (Matmul) validation: PASSED (%.3f ≈ %.3f)\n", host_op5_output[0], expected_op5);
-    //     } else {
-    //         printf("  Op5 (Matmul) validation: FAILED (%.3f ≠ %.3f)\n", host_op5_output[0], expected_op5);
-    //         all_valid = false;
-    //     }
-    // }
-    
-    printf("Overall parallel operations validation: %s\n", all_valid ? "PASSED" : "FAILED");
-    printf("=== cuDNN Graph Parallel Operations Test Completed Successfully ===\n");
-
-cleanup:
-    // 12. 清理资源 (移除 op3, op5 相关)
-    printf("Cleaning up parallel operations resources...\n");
-    
-    // 释放主机内存 (移除 op3, op5 相关)
-    if (host_op1_output) delete[] host_op1_output;
-    if (host_op2_output) delete[] host_op2_output;
-    // if (host_op3_output) delete[] host_op3_output;
-    if (host_op4_output) delete[] host_op4_output;
-    // if (host_op5_output) delete[] host_op5_output;
-    
-    // 释放设备内存 (移除 op3, op5 相关)
-    if (d_op1_input) CUDA_REPORT_IF_ERROR(cuMemFree(d_op1_input));
-    if (d_op1_weight) CUDA_REPORT_IF_ERROR(cuMemFree(d_op1_weight));
-    if (d_op1_bias) CUDA_REPORT_IF_ERROR(cuMemFree(d_op1_bias));
-    if (d_op1_output) CUDA_REPORT_IF_ERROR(cuMemFree(d_op1_output));
-    
-    if (d_op2_input) CUDA_REPORT_IF_ERROR(cuMemFree(d_op2_input));
-    if (d_op2_weight) CUDA_REPORT_IF_ERROR(cuMemFree(d_op2_weight));
-    if (d_op2_bias) CUDA_REPORT_IF_ERROR(cuMemFree(d_op2_bias));
-    if (d_op2_output) CUDA_REPORT_IF_ERROR(cuMemFree(d_op2_output));
-    
-    // if (d_op3_input) CUDA_REPORT_IF_ERROR(cuMemFree(d_op3_input));
-    // if (d_op3_output) CUDA_REPORT_IF_ERROR(cuMemFree(d_op3_output));
-    
-    if (d_op4_inputA) CUDA_REPORT_IF_ERROR(cuMemFree(d_op4_inputA));
-    if (d_op4_inputB) CUDA_REPORT_IF_ERROR(cuMemFree(d_op4_inputB));
-    if (d_op4_output) CUDA_REPORT_IF_ERROR(cuMemFree(d_op4_output));
-    
-    // 注释掉 op5 内存释放
-    // if (d_op5_input) CUDA_REPORT_IF_ERROR(cuMemFree(d_op5_input));
-    // if (d_op5_weight) CUDA_REPORT_IF_ERROR(cuMemFree(d_op5_weight));
-    // if (d_op5_bias) CUDA_REPORT_IF_ERROR(cuMemFree(d_op5_bias));
-    // if (d_op5_output) CUDA_REPORT_IF_ERROR(cuMemFree(d_op5_output));
-    
-    // 销毁图
-    if (group_id > 0) {
-        mgpuDestroyParallelGroupGraph(group_id);
-    }
-    
-    // 销毁CUDA对象
-    if (start) CUDA_REPORT_IF_ERROR(cuEventDestroy(start));
-    if (stop) CUDA_REPORT_IF_ERROR(cuEventDestroy(stop));
-    if (stream) CUDA_REPORT_IF_ERROR(cuStreamDestroy(stream));
-    
-    printf("Resource cleanup completed\n");
-}
-
-// 修复版本的简单测试函数
-extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuCudnnGraphSimpleTest() {
-    printf("=== Starting cuDNN Graph Simple Parallel Test ===\n");
-    
-    // 在函数开始处声明所有变量
-    CUstream stream = nullptr;
-    cudnnHandle_t handle = nullptr;
-    int group_id = 0;
-    bool success = false;
-    bool all_passed = true;
-    
-    // 操作参数结构体
-    struct ConvOp {
-        int n, c_in, h, w, c_out, k, pad, stride;
-        CUdeviceptr d_input, d_weight, d_bias, d_output;
-        void *input_ptr, *weight_ptr, *bias_ptr, *output_ptr;
-    };
-    
-    ConvOp ops[3] = {
-        {1, 1, 4, 4, 1, 3, 0, 1, 0, 0, 0, 0, nullptr, nullptr, nullptr, nullptr},
-        {1, 2, 6, 6, 2, 3, 0, 1, 0, 0, 0, 0, nullptr, nullptr, nullptr, nullptr},
-        {1, 3, 8, 8, 3, 3, 0, 1, 0, 0, 0, 0, nullptr, nullptr, nullptr, nullptr}
-    };
-    
-    mgpuEnsureContext();
-    
-    CUDA_REPORT_IF_ERROR(cuStreamCreate(&stream, CU_STREAM_NON_BLOCKING));
-    
-    // 获取cuDNN句柄并创建图
-    handle = mgpuCudnnGetHandle(stream);
-    group_id = mgpuCreateParallelGroupGraph(handle);
-    
-    printf("Created graph group: %d\n", group_id);
-    
-    printf("Defining 3 independent convolution operations:\n");
-    {
-        int i;
-        for (i = 0; i < 3; i++) {
-            int out_h = (ops[i].h - ops[i].k + 2*ops[i].pad) / ops[i].stride + 1;
-            int out_w = (ops[i].w - ops[i].k + 2*ops[i].pad) / ops[i].stride + 1;
-            printf("  Conv%d: [%d,%d,%d,%d] -> [%d,%d,%d,%d]\n", 
-                   i+1, ops[i].n, ops[i].c_in, ops[i].h, ops[i].w, 
-                   ops[i].n, ops[i].c_out, out_h, out_w);
-        }
-    }
-    
-    // 分配内存并初始化数据
-    {
-        int i;
-        for (i = 0; i < 3; i++) {
-            size_t input_size = ops[i].n * ops[i].c_in * ops[i].h * ops[i].w * sizeof(float);
-            size_t weight_size = ops[i].c_out * ops[i].c_in * ops[i].k * ops[i].k * sizeof(float);
-            size_t bias_size = ops[i].c_out * sizeof(float);
-            int out_h = (ops[i].h - ops[i].k + 2*ops[i].pad) / ops[i].stride + 1;
-            int out_w = (ops[i].w - ops[i].k + 2*ops[i].pad) / ops[i].stride + 1;
-            size_t output_size = ops[i].n * ops[i].c_out * out_h * out_w * sizeof(float);
-            
-            CUDA_REPORT_IF_ERROR(cuMemAlloc(&ops[i].d_input, input_size));
-            CUDA_REPORT_IF_ERROR(cuMemAlloc(&ops[i].d_weight, weight_size));
-            CUDA_REPORT_IF_ERROR(cuMemAlloc(&ops[i].d_bias, bias_size));
-            CUDA_REPORT_IF_ERROR(cuMemAlloc(&ops[i].d_output, output_size));
-            
-            ops[i].input_ptr = reinterpret_cast<void*>(ops[i].d_input);
-            ops[i].weight_ptr = reinterpret_cast<void*>(ops[i].d_weight);
-            ops[i].bias_ptr = reinterpret_cast<void*>(ops[i].d_bias);
-            ops[i].output_ptr = reinterpret_cast<void*>(ops[i].d_output);
-            
-            // 使用不同的初始值以区分操作
-            float input_val = 1.0f + i * 0.5f;   // 1.0, 1.5, 2.0
-            float weight_val = 0.5f + i * 0.25f; // 0.5, 0.75, 1.0
-            float bias_val = 1.0f + i;           // 1.0, 2.0, 3.0
-            
-            CUDA_REPORT_IF_ERROR(cuMemsetD32Async(ops[i].d_input, *(unsigned int*)&input_val, input_size / 4, stream));
-            CUDA_REPORT_IF_ERROR(cuMemsetD32Async(ops[i].d_weight, *(unsigned int*)&weight_val, weight_size / 4, stream));
-            CUDA_REPORT_IF_ERROR(cuMemsetD32Async(ops[i].d_bias, *(unsigned int*)&bias_val, bias_size / 4, stream));
-        }
-    }
-    
-    CUDA_REPORT_IF_ERROR(cuStreamSynchronize(stream));
-    
-    // 添加3个独立的卷积操作到图
-    printf("Adding 3 independent convolution operations to graph...\n");
-    {
-        int i;
-        for (i = 0; i < 3; i++) {
-            int64_t node = mgpuParallelGroupAddConv2d(
-                group_id,
-                ops[i].input_ptr, ops[i].weight_ptr, ops[i].bias_ptr, ops[i].output_ptr,
-                ops[i].n, ops[i].c_in, ops[i].h, ops[i].w,
-                ops[i].c_out, ops[i].k, ops[i].k,
-                ops[i].pad, ops[i].pad, ops[i].stride, ops[i].stride, 1, 1
-            );
-            
-            if (node < 0) {
-                printf("ERROR: Failed to add Conv%d node\n", i+1);
-                goto simple_cleanup;
-            }
-            printf("Added Conv%d node: %ld\n", i+1, node);
-        }
-    }
-    
-    // 编译并执行
-    printf("Compiling and executing parallel graph...\n");
-    success = mgpuParallelGroupCompileAndExecute(group_id, stream);
-    
-    if (success) {
-        CUDA_REPORT_IF_ERROR(cuStreamSynchronize(stream));
-        
-        // 验证3个操作的结果
-        printf("Validating results of 3 parallel operations:\n");
-        
-        {
-            int i;
-            for (i = 0; i < 3; i++) {
-                int out_h = (ops[i].h - ops[i].k + 2*ops[i].pad) / ops[i].stride + 1;
-                int out_w = (ops[i].w - ops[i].k + 2*ops[i].pad) / ops[i].stride + 1;
-                size_t output_size = ops[i].n * ops[i].c_out * out_h * out_w * sizeof(float);
-                
-                float* host_output = new float[ops[i].n * ops[i].c_out * out_h * out_w];
-                CUDA_REPORT_IF_ERROR(cuMemcpyDtoH(host_output, ops[i].d_output, output_size));
-                
-                float input_val = 1.0f + i * 0.5f;
-                float weight_val = 0.5f + i * 0.25f;
-                float bias_val = 1.0f + i;
-                float expected = ops[i].k * ops[i].k * input_val * weight_val + bias_val;
-                
-                bool passed = std::abs(host_output[0] - expected) < 1e-3;
-                printf("  Conv%d: %.3f ≈ %.3f %s\n", 
-                       i+1, host_output[0], expected, passed ? "PASSED" : "FAILED");
-                
-                if (!passed) all_passed = false;
-                delete[] host_output;
-            }
-        }
-        
-        printf("Simple parallel graph test: %s\n", all_passed ? "PASSED" : "FAILED");
-    } else {
-        printf("Graph execution FAILED\n");
-    }
-    
-simple_cleanup:
-    // 清理
-    {
-        int i;
-        for (i = 0; i < 3; i++) {
-            if (ops[i].d_input) CUDA_REPORT_IF_ERROR(cuMemFree(ops[i].d_input));
-            if (ops[i].d_weight) CUDA_REPORT_IF_ERROR(cuMemFree(ops[i].d_weight));
-            if (ops[i].d_bias) CUDA_REPORT_IF_ERROR(cuMemFree(ops[i].d_bias));
-            if (ops[i].d_output) CUDA_REPORT_IF_ERROR(cuMemFree(ops[i].d_output));
-        }
-    }
-    
-    if (group_id > 0) {
-        mgpuDestroyParallelGroupGraph(group_id);
-    }
-    if (stream) CUDA_REPORT_IF_ERROR(cuStreamDestroy(stream));
-    
-    printf("=== cuDNN Graph Simple Parallel Test Completed ===\n");
-}
-
-extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuCudnnBasicTest() {
-    printf("=== cuDNN Basic Test ===\n");
-    
-    // 检查环境
-    size_t cudnn_version = cudnnGetVersion();
-    printf("cuDNN Version: %zu\n", cudnn_version);
-    
-    mgpuEnsureContext();
-    
-    CUstream stream;
-    CUDA_REPORT_IF_ERROR(cuStreamCreate(&stream, CU_STREAM_NON_BLOCKING));
-    
-    cudnnHandle_t handle = mgpuCudnnGetHandle(stream);
-    printf("cuDNN handle obtained\n");
-    
-    // 测试基础张量创建
-    CudnnGraphBuilder* builder = new CudnnGraphBuilder(handle);
-    
-    if (builder) {
-        printf("Graph builder created successfully\n");
-        
-        // 测试最简单的张量
-        std::vector<int> dims = {1, 1, 2, 2};
-        int64_t tensor_id = builder->AddTensor(dims, CUDNN_DATA_FLOAT, false);
-        
-        if (tensor_id >= 0) {
-            printf("Basic tensor creation: SUCCESS (ID: %ld)\n", tensor_id);
-        } else {
-            printf("Basic tensor creation: FAILED\n");
-        }
-        
-        delete builder;
-    } else {
-        printf("Graph builder creation: FAILED\n");
-    }
-    
-    CUDA_REPORT_IF_ERROR(cuStreamDestroy(stream));
-    printf("=== Basic Test Completed ===\n");
 }
 
 // 全局缓存变量
