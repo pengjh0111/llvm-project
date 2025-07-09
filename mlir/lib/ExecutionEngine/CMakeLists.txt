@@ -15,6 +15,7 @@ set(LLVM_OPTIONAL_SOURCES
   OptUtils.cpp
   JitRunner.cpp
   SyclRuntimeWrappers.cpp
+  CudnnGraphBuilder.cpp
   )
 
 # Use a separate library for OptUtils, to avoid pulling in the entire JIT and
@@ -232,6 +233,7 @@ if(LLVM_ENABLE_PIC)
     add_mlir_library(mlir_cuda_runtime
       SHARED
       CudaRuntimeWrappers.cpp
+      CudnnGraphBuilder.cpp
       SNN_kernel.cu  # Your CUDA kernel file
 
       EXCLUDE_FROM_LIBMLIR
@@ -241,6 +243,7 @@ if(LLVM_ENABLE_PIC)
     target_include_directories(mlir_cuda_runtime
       PRIVATE
       ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}
+      ${CMAKE_CURRENT_SOURCE_DIR}
     )
     target_link_libraries(mlir_cuda_runtime
       PRIVATE
@@ -289,6 +292,67 @@ if(LLVM_ENABLE_PIC)
     else()
       message(WARNING "cuBLAS library not found, cuBLAS wrappers will not be available")
     endif()
+
+    # 添加对cuTENSOR的支持
+    # 设置cuTENSOR路径
+    set(CUTENSOR_ROOT_DIR "$ENV{CUTENSOR_ROOT}")
+    if(NOT CUTENSOR_ROOT_DIR)
+      set(CUTENSOR_ROOT_DIR "$ENV{HOME}/local/cutensor")
+    endif()
+
+    # 查找cuTENSOR头文件
+    find_path(CUTENSOR_INCLUDE_DIR 
+      NAMES cutensor.h
+      HINTS 
+      ${CUTENSOR_ROOT_DIR}/include
+      /usr/local/cuda/include
+      ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}
+      REQUIRED)
+
+    # 查找cuTENSOR库文件
+    find_library(CUDA_CUTENSOR_LIBRARY 
+      NAMES cutensor
+      HINTS 
+      ${CUTENSOR_ROOT_DIR}/lib64
+      ${CUTENSOR_ROOT_DIR}/lib64/12  # CUDA 12特定版本
+      ${CMAKE_CUDA_IMPLICIT_LINK_DIRECTORIES}
+      /usr/lib/x86_64-linux-gnu
+      REQUIRED)
+
+    if(CUDA_CUTENSOR_LIBRARY AND CUTENSOR_INCLUDE_DIR)
+      message(STATUS "Found cuTENSOR library: ${CUDA_CUTENSOR_LIBRARY}")
+      message(STATUS "Found cuTENSOR headers: ${CUTENSOR_INCLUDE_DIR}")
+      
+      # 添加头文件路径
+      target_include_directories(mlir_cuda_runtime
+        PRIVATE
+        ${CUTENSOR_INCLUDE_DIR}
+      )
+      
+      # 链接库文件
+      target_link_libraries(mlir_cuda_runtime
+        PRIVATE
+        ${CUDA_CUTENSOR_LIBRARY}
+      )
+      
+      # 添加编译定义
+      target_compile_definitions(mlir_cuda_runtime
+        PRIVATE
+        MLIR_ENABLE_CUDA_CUTENSOR=1
+      )
+    else()
+      message(WARNING "cuTENSOR library not found, cuTENSOR wrappers will not be available")
+      message(STATUS "CUTENSOR_ROOT_DIR: ${CUTENSOR_ROOT_DIR}")
+      message(STATUS "CUTENSOR_INCLUDE_DIR: ${CUTENSOR_INCLUDE_DIR}")
+      message(STATUS "CUDA_CUTENSOR_LIBRARY: ${CUDA_CUTENSOR_LIBRARY}")
+    endif()
+
+    # 添加对cuDNN Graph的编译定义
+    target_compile_definitions(mlir_cuda_runtime
+      PRIVATE
+      MLIR_ENABLE_CUDA_GRAPH=1        # 启用图功能
+      CUDNN_GRAPH_ENABLED=1           # cuDNN Graph特性
+    )
 
     if(MLIR_ENABLE_CUDA_CUSPARSE)
       # Find the libcusparse.so library if CUSPARSE build is requested.

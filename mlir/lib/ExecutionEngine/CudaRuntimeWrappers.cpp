@@ -27,6 +27,7 @@
 
 #include <cudnn.h>
 #include <cublas_v2.h>
+#include <cutensor.h>
 #include "/data/dagongcheng/pjhtest/llvm-latest/llvm-project/mlir/lib/ExecutionEngine/SNN_kernel.h"
 #include "CudnnGraphBuilder.h"
 
@@ -231,6 +232,15 @@ extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuCleanupContext() {
     }                                                                        \
   }
 
+#define CUTENSOR_REPORT_IF_ERROR(expr)                                      \
+  {                                                                          \
+    cutensorStatus_t status = (expr);                                        \
+    if (status != CUTENSOR_STATUS_SUCCESS) {                                 \
+      fprintf(stderr, "cuTENSOR '%s' failed with '%s'\n", #expr,            \
+              cutensorGetErrorString(status));                              \
+    }                                                                        \
+  }
+
 //===----------------------------------------------------------------------===//
 // 优化的Handle管理 - 分离创建与使用
 //===----------------------------------------------------------------------===//
@@ -239,9 +249,10 @@ extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuCleanupContext() {
 struct StreamHandles {
   cudnnHandle_t cudnn_handle;
   cublasHandle_t cublas_handle;
+  cutensorHandle_t cutensor_handle;
   bool valid;
   
-  StreamHandles() : cudnn_handle(nullptr), cublas_handle(nullptr), valid(false) {}
+  StreamHandles() : cudnn_handle(nullptr), cublas_handle(nullptr), cutensor_handle(nullptr), valid(false) {}
 };
 
 // 全局handle映射表 - 使用更具体的名字避免冲突
@@ -278,6 +289,16 @@ extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuCreateHandlesForStream(CUstream st
     // return false;
   }
   
+  // 创建cuTENSOR句柄
+  cutensorStatus_t cutensor_status = cutensorCreate(&handles.cutensor_handle);
+  if (cutensor_status != CUTENSOR_STATUS_SUCCESS) {
+    fprintf(stderr, "[HANDLE] Failed to create cuTENSOR handle: %s\n", 
+            cutensorGetErrorString(cutensor_status));
+    cudnnDestroy(handles.cudnn_handle);
+    cublasDestroy(handles.cublas_handle);
+    return;
+  }
+
   // 绑定到指定的stream
   CUDNN_REPORT_IF_ERROR(cudnnSetStream(handles.cudnn_handle, stream));
   CUBLAS_REPORT_IF_ERROR(cublasSetStream(handles.cublas_handle, stream));
@@ -307,7 +328,10 @@ extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuDestroyHandlesForStream(CUstream s
       if (it->second.cublas_handle != nullptr) {
         CUBLAS_REPORT_IF_ERROR(cublasDestroy(it->second.cublas_handle));
       }
-      
+      if (it->second.cutensor_handle != nullptr) {
+        CUTENSOR_REPORT_IF_ERROR(cutensorDestroy(it->second.cutensor_handle));
+      }
+
       // fprintf(stderr, "[HANDLE] Destroyed handle group for stream %p\n", stream);
     }
     g_mgpu_stream_handle_registry.erase(it);
@@ -458,10 +482,11 @@ extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuCudnnCleanup() {
 struct PooledHandle {
   cudnnHandle_t cudnn_handle;
   cublasHandle_t cublas_handle;
+  cutensorHandle_t cutensor_handle;
   bool in_use;
   int pool_index;
   
-  PooledHandle() : cudnn_handle(nullptr), cublas_handle(nullptr), 
+  PooledHandle() : cudnn_handle(nullptr), cublas_handle(nullptr), cutensor_handle(nullptr),
                   in_use(false), pool_index(-1) {}
 };
 
@@ -549,6 +574,32 @@ extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuInitHandlePool(int pool_size) {
       return;
     }
     
+    // // 创建cuTENSOR handle
+    // cutensorStatus_t cutensor_status = cutensorCreate(&handle.cutensor_handle);
+    // if (cutensor_status != CUTENSOR_STATUS_SUCCESS) {
+    //   fprintf(stderr, "[HANDLE POOL] FATAL: Failed to create cuTENSOR handle %d: %s\n", 
+    //           i, cutensorGetErrorString(cutensor_status));
+      
+    //   // 清理当前handle的cuDNN和cuBLAS部分
+    //   cudnnDestroy(handle.cudnn_handle);
+    //   cublasDestroy(handle.cublas_handle);
+      
+    //   // 清理已创建的handles
+    //   for (int j = 0; j < i; j++) {
+    //     if (g_handle_pool[j].cudnn_handle) {
+    //       cudnnDestroy(g_handle_pool[j].cudnn_handle);
+    //     }
+    //     if (g_handle_pool[j].cublas_handle) {
+    //       cublasDestroy(g_handle_pool[j].cublas_handle);
+    //     }
+    //     if (g_handle_pool[j].cutensor_handle) {
+    //       cutensorDestroy(g_handle_pool[j].cutensor_handle);
+    //     }
+    //   }
+    //   g_handle_pool.clear();
+    //   return;
+    // }
+
     // 将索引加入可用队列
     g_available_handle_indices.push(i);
     
@@ -607,6 +658,15 @@ extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuDestroyHandlePool() {
       handle.cudnn_handle = nullptr;
     }
     
+    // if (handle.cutensor_handle) {
+    //   cutensorStatus_t status = cutensorDestroy(handle.cutensor_handle);
+    //   if (status != CUTENSOR_STATUS_SUCCESS) {
+    //     fprintf(stderr, "[HANDLE POOL] Error destroying cuTENSOR handle %d: %s\n", 
+    //             (int)i, cutensorGetErrorString(status));
+    //   }
+    //   handle.cutensor_handle = nullptr;
+    // }
+
     destroyed_count++;
   }
   
@@ -680,7 +740,7 @@ extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuAcquirePooledHandles(CUstream stre
     g_available_handle_indices.push(handle_index);
     return;
   }
-  
+
   // 更新状态
   handle.in_use = true;
   g_stream_to_handle_index[stream] = handle_index;
@@ -736,7 +796,7 @@ extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuReleasePooledHandles(CUstream stre
     fprintf(stderr, "[HANDLE POOL] WARNING: Failed to reset cuBLAS stream for handle %d: %d\n", 
             handle_index, cublas_status);
   }
-  
+
   // 更新状态
   handle.in_use = false;
   g_available_handle_indices.push(handle_index);
@@ -773,6 +833,7 @@ static bool getPooledHandlesForStream(CUstream stream, StreamHandles& result_han
   // 填充返回结果
   result_handles.cudnn_handle = handle.cudnn_handle;
   result_handles.cublas_handle = handle.cublas_handle;
+  // result_handles.cutensor_handle = handle.cutensor_handle;
   result_handles.valid = true;
   
   return true;
@@ -797,6 +858,22 @@ static bool getHandlesForStream(CUstream stream, StreamHandles& handles) {
   fprintf(stderr, "[HANDLE] ERROR: No handles found for stream %p. "
                   "Use handle pool or call mgpuCreateHandlesForStream() first!\n", stream);
   return false;
+}
+
+static cutensorHandle_t g_global_cutensor_handle = nullptr;
+static std::once_flag g_cutensor_init_flag;
+
+static cutensorHandle_t getGlobalCutensorHandle() {
+    std::call_once(g_cutensor_init_flag, []() {
+        mgpuEnsureContext();
+        cutensorStatus_t status = cutensorCreate(&g_global_cutensor_handle);
+        if (status != CUTENSOR_STATUS_SUCCESS) {
+            fprintf(stderr, "[CUTENSOR] Failed to create global handle: %s\n", 
+                    cutensorGetErrorString(status));
+            g_global_cutensor_handle = nullptr;
+        }
+    });
+    return g_global_cutensor_handle;
 }
 
 //===----------------------------------------------------------------------===//
@@ -2364,6 +2441,818 @@ extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuReturnAllActiveWorkspaces() {
 static cudnnConvolutionFwdAlgo_t g_cached_algo = CUDNN_CONVOLUTION_FWD_ALGO_COUNT; // 无效值表示未初始化
 static bool g_algo_cached = false;
 
+// ============================================================================
+// 简化的cuTENSOR Transpose包装函数（只支持[0,2,1,3]和[0,2,3,1]）
+// ============================================================================
+
+// cuTensor 2.2 版本的完整包装函数 - 修正 API 调用
+
+// 支持 [0,2,1,3] 置换的函数 - FP32版本
+extern "C" MLIR_CUDA_WRAPPERS_EXPORT void
+mgpuCulibsTranspose_0213(
+    void* input_data,           // 输入张量 (batch, dim1, dim2, dim3)
+    void* output_data,          // 输出张量 (batch, dim2, dim1, dim3)
+    int batch_size, int dim1, int dim2, int dim3,
+    CUstream stream
+) {
+    mgpuEnsureContext();
+    
+    cutensorHandle_t handle = getGlobalCutensorHandle();
+    if (!handle) {
+        fprintf(stderr, "[CUTENSOR] Global cuTENSOR handle not available\n");
+        return;
+    }
+
+    // 输入张量维度和步长: [batch_size, dim1, dim2, dim3]
+    int64_t input_dims[4] = {batch_size, dim1, dim2, dim3};
+    int64_t input_strides[4] = {(int64_t)dim1 * dim2 * dim3, (int64_t)dim2 * dim3, dim3, 1};
+    
+    // 输出张量维度和步长: [batch_size, dim2, dim1, dim3] (置换[0,2,1,3])
+    int64_t output_dims[4] = {batch_size, dim2, dim1, dim3};
+    int64_t output_strides[4] = {(int64_t)dim2 * dim1 * dim3, (int64_t)dim1 * dim3, dim3, 1};
+    
+    // 创建输入张量描述符
+    cutensorTensorDescriptor_t descA;
+    cutensorStatus_t status = cutensorCreateTensorDescriptor(
+        handle, &descA, 4, input_dims, input_strides, 
+        CUTENSOR_R_32F, 256
+    );
+    if (status != CUTENSOR_STATUS_SUCCESS) {
+        fprintf(stderr, "[CUTENSOR] Failed to create input descriptor: %s\n", 
+                cutensorGetErrorString(status));
+        return;
+    }
+    
+    // 创建输出张量描述符
+    cutensorTensorDescriptor_t descC;
+    status = cutensorCreateTensorDescriptor(
+        handle, &descC, 4, output_dims, output_strides,
+        CUTENSOR_R_32F, 256
+    );
+    if (status != CUTENSOR_STATUS_SUCCESS) {
+        fprintf(stderr, "[CUTENSOR] Failed to create output descriptor: %s\n", 
+                cutensorGetErrorString(status));
+        cutensorDestroyTensorDescriptor(descA);
+        return;
+    }
+    
+    // 创建置换操作描述符
+    cutensorOperationDescriptor_t desc;
+    int32_t modeA[4] = {0, 1, 2, 3};        // 输入模式
+    int32_t modeC[4] = {0, 2, 1, 3};        // 输出模式 [0,2,1,3]
+    
+    status = cutensorCreatePermutation(
+        handle, &desc,
+        descA, modeA, CUTENSOR_OP_IDENTITY,
+        descC, modeC,
+        CUTENSOR_COMPUTE_DESC_32F
+    );
+    if (status != CUTENSOR_STATUS_SUCCESS) {
+        fprintf(stderr, "[CUTENSOR] Failed to create permutation descriptor: %s\n", 
+                cutensorGetErrorString(status));
+        cutensorDestroyTensorDescriptor(descA);
+        cutensorDestroyTensorDescriptor(descC);
+        return;
+    }
+    
+    // 创建计划偏好设置
+    cutensorPlanPreference_t pref;
+    status = cutensorCreatePlanPreference(handle, &pref, 
+                                        CUTENSOR_ALGO_DEFAULT, 
+                                        CUTENSOR_JIT_MODE_NONE);
+    if (status != CUTENSOR_STATUS_SUCCESS) {
+        fprintf(stderr, "[CUTENSOR] Failed to create plan preference: %s\n", 
+                cutensorGetErrorString(status));
+        cutensorDestroyOperationDescriptor(desc);
+        cutensorDestroyTensorDescriptor(descA);
+        cutensorDestroyTensorDescriptor(descC);
+        return;
+    }
+    
+    // 查询工作空间大小
+    uint64_t workspaceSize = 0;
+    status = cutensorEstimateWorkspaceSize(handle, desc, pref, 
+                                         CUTENSOR_WORKSPACE_DEFAULT, 
+                                         &workspaceSize);
+    if (status != CUTENSOR_STATUS_SUCCESS) {
+        fprintf(stderr, "[CUTENSOR] Failed to estimate workspace size: %s\n", 
+                cutensorGetErrorString(status));
+        cutensorDestroyPlanPreference(pref);
+        cutensorDestroyOperationDescriptor(desc);
+        cutensorDestroyTensorDescriptor(descA);
+        cutensorDestroyTensorDescriptor(descC);
+        return;
+    }
+    
+    // 分配工作空间（如果需要）
+    void* workspace = nullptr;
+    if (workspaceSize > 0) {
+        cudaError_t cudaStatus = cudaMalloc(&workspace, workspaceSize);
+        if (cudaStatus != cudaSuccess) {
+            fprintf(stderr, "[CUTENSOR] Failed to allocate workspace\n");
+            cutensorDestroyPlanPreference(pref);
+            cutensorDestroyOperationDescriptor(desc);
+            cutensorDestroyTensorDescriptor(descA);
+            cutensorDestroyTensorDescriptor(descC);
+            return;
+        }
+    }
+    
+    // 创建计划
+    cutensorPlan_t plan;
+    status = cutensorCreatePlan(handle, &plan, desc, pref, workspaceSize);
+    if (status != CUTENSOR_STATUS_SUCCESS) {
+        fprintf(stderr, "[CUTENSOR] Failed to create plan: %s\n", 
+                cutensorGetErrorString(status));
+        if (workspace) cudaFree(workspace);
+        cutensorDestroyPlanPreference(pref);
+        cutensorDestroyOperationDescriptor(desc);
+        cutensorDestroyTensorDescriptor(descA);
+        cutensorDestroyTensorDescriptor(descC);
+        return;
+    }
+    
+    // 执行置换
+    float alpha = 1.0f;
+    status = cutensorPermute(
+        handle, plan,
+        &alpha, input_data, output_data,
+        stream
+    );
+    
+    if (status != CUTENSOR_STATUS_SUCCESS) {
+        fprintf(stderr, "[CUTENSOR] Transpose [0,2,1,3] failed: %s\n", 
+                cutensorGetErrorString(status));
+    }
+    
+    // 清理资源
+    if (workspace) cudaFree(workspace);
+    cutensorDestroyPlan(plan);
+    cutensorDestroyPlanPreference(pref);
+    cutensorDestroyOperationDescriptor(desc);
+    cutensorDestroyTensorDescriptor(descA);
+    cutensorDestroyTensorDescriptor(descC);
+}
+
+// // 添加详细调试信息的包装函数版本
+
+// extern "C" MLIR_CUDA_WRAPPERS_EXPORT void
+// mgpuCulibsTranspose_0213(
+//     void* input_data,           
+//     void* output_data,          
+//     int batch_size, int dim1, int dim2, int dim3,
+//     CUstream stream
+// ) {
+//     // 参数验证和调试输出
+//     fprintf(stderr, "[DEBUG] Function called: mgpuCulibsTranspose_0213\n");
+//     fprintf(stderr, "[DEBUG] Parameters: batch=%d, dim1=%d, dim2=%d, dim3=%d\n", 
+//             batch_size, dim1, dim2, dim3);
+//     fprintf(stderr, "[DEBUG] Pointers: input=%p, output=%p, stream=%p\n", 
+//             input_data, output_data, stream);
+
+//     // 参数有效性检查
+//     if (!input_data || !output_data) {
+//         fprintf(stderr, "[ERROR] Null pointer detected: input=%p, output=%p\n", 
+//                 input_data, output_data);
+//         return;
+//     }
+    
+//     if (batch_size <= 0 || dim1 <= 0 || dim2 <= 0 || dim3 <= 0) {
+//         fprintf(stderr, "[ERROR] Invalid dimensions: batch=%d, dim1=%d, dim2=%d, dim3=%d\n", 
+//                 batch_size, dim1, dim2, dim3);
+//         return;
+//     }
+
+//     mgpuEnsureContext();
+//     fprintf(stderr, "[DEBUG] Context ensured\n");
+    
+//     cutensorHandle_t handle = getGlobalCutensorHandle();
+//     if (!handle) {
+//         fprintf(stderr, "[CUTENSOR] Global cuTENSOR handle not available\n");
+//         return;
+//     }
+//     fprintf(stderr, "[DEBUG] Handle obtained: %p\n", handle);
+
+//     // 计算总元素数量检查是否过大
+//     int64_t total_elements = (int64_t)batch_size * dim1 * dim2 * dim3;
+//     fprintf(stderr, "[DEBUG] Total elements: %ld\n", total_elements);
+    
+//     if (total_elements > 1e9) {  // 超过10亿个元素可能有问题
+//         fprintf(stderr, "[WARNING] Very large tensor detected: %ld elements\n", total_elements);
+//     }
+
+//     // 输入张量维度和步长
+//     int64_t input_dims[4] = {batch_size, dim1, dim2, dim3};
+//     int64_t input_strides[4] = {(int64_t)dim1 * dim2 * dim3, (int64_t)dim2 * dim3, dim3, 1};
+    
+//     // 输出张量维度和步长
+//     int64_t output_dims[4] = {batch_size, dim2, dim1, dim3};
+//     int64_t output_strides[4] = {(int64_t)dim2 * dim1 * dim3, (int64_t)dim1 * dim3, dim3, 1};
+    
+//     fprintf(stderr, "[DEBUG] Input dims: [%ld, %ld, %ld, %ld]\n", 
+//             input_dims[0], input_dims[1], input_dims[2], input_dims[3]);
+//     fprintf(stderr, "[DEBUG] Input strides: [%ld, %ld, %ld, %ld]\n", 
+//             input_strides[0], input_strides[1], input_strides[2], input_strides[3]);
+//     fprintf(stderr, "[DEBUG] Output dims: [%ld, %ld, %ld, %ld]\n", 
+//             output_dims[0], output_dims[1], output_dims[2], output_dims[3]);
+//     fprintf(stderr, "[DEBUG] Output strides: [%ld, %ld, %ld, %ld]\n", 
+//             output_strides[0], output_strides[1], output_strides[2], output_strides[3]);
+    
+//     // 创建输入张量描述符
+//     fprintf(stderr, "[DEBUG] Creating input tensor descriptor...\n");
+//     cutensorTensorDescriptor_t descA;
+//     cutensorStatus_t status = cutensorCreateTensorDescriptor(
+//         handle, &descA, 4, input_dims, input_strides, 
+//         CUTENSOR_R_32F, 256
+//     );
+//     if (status != CUTENSOR_STATUS_SUCCESS) {
+//         fprintf(stderr, "[CUTENSOR] Failed to create input descriptor: %s\n", 
+//                 cutensorGetErrorString(status));
+//         return;
+//     }
+//     fprintf(stderr, "[DEBUG] Input descriptor created successfully\n");
+    
+//     // 创建输出张量描述符
+//     fprintf(stderr, "[DEBUG] Creating output tensor descriptor...\n");
+//     cutensorTensorDescriptor_t descC;
+//     status = cutensorCreateTensorDescriptor(
+//         handle, &descC, 4, output_dims, output_strides,
+//         CUTENSOR_R_32F, 256
+//     );
+//     if (status != CUTENSOR_STATUS_SUCCESS) {
+//         fprintf(stderr, "[CUTENSOR] Failed to create output descriptor: %s\n", 
+//                 cutensorGetErrorString(status));
+//         cutensorDestroyTensorDescriptor(descA);
+//         return;
+//     }
+//     fprintf(stderr, "[DEBUG] Output descriptor created successfully\n");
+    
+//     // 创建置换操作描述符
+//     fprintf(stderr, "[DEBUG] Creating permutation operation descriptor...\n");
+//     cutensorOperationDescriptor_t desc;
+//     int32_t modeA[4] = {0, 1, 2, 3};        
+//     int32_t modeC[4] = {0, 2, 1, 3};        
+    
+//     status = cutensorCreatePermutation(
+//         handle, &desc,
+//         descA, modeA, CUTENSOR_OP_IDENTITY,
+//         descC, modeC,
+//         CUTENSOR_COMPUTE_32F
+//     );
+//     if (status != CUTENSOR_STATUS_SUCCESS) {
+//         fprintf(stderr, "[CUTENSOR] Failed to create permutation descriptor: %s\n", 
+//                 cutensorGetErrorString(status));
+//         cutensorDestroyTensorDescriptor(descA);
+//         cutensorDestroyTensorDescriptor(descC);
+//         return;
+//     }
+//     fprintf(stderr, "[DEBUG] Permutation descriptor created successfully\n");
+    
+//     // 创建计划偏好设置
+//     fprintf(stderr, "[DEBUG] Creating plan preference...\n");
+//     cutensorPlanPreference_t pref;
+//     status = cutensorCreatePlanPreference(handle, &pref, 
+//                                         CUTENSOR_ALGO_DEFAULT, 
+//                                         CUTENSOR_JIT_MODE_NONE);
+//     if (status != CUTENSOR_STATUS_SUCCESS) {
+//         fprintf(stderr, "[CUTENSOR] Failed to create plan preference: %s\n", 
+//                 cutensorGetErrorString(status));
+//         cutensorDestroyOperationDescriptor(desc);
+//         cutensorDestroyTensorDescriptor(descA);
+//         cutensorDestroyTensorDescriptor(descC);
+//         return;
+//     }
+//     fprintf(stderr, "[DEBUG] Plan preference created successfully\n");
+    
+//     // 查询工作空间大小
+//     fprintf(stderr, "[DEBUG] Estimating workspace size...\n");
+//     uint64_t workspaceSize = 0;
+//     status = cutensorEstimateWorkspaceSize(handle, desc, pref,
+//                                          CUTENSOR_WORKSPACE_DEFAULT, 
+//                                          &workspaceSize);
+//     if (status != CUTENSOR_STATUS_SUCCESS) {
+//         fprintf(stderr, "[CUTENSOR] Failed to estimate workspace size: %s\n", 
+//                 cutensorGetErrorString(status));
+//         cutensorDestroyPlanPreference(pref);
+//         cutensorDestroyOperationDescriptor(desc);
+//         cutensorDestroyTensorDescriptor(descA);
+//         cutensorDestroyTensorDescriptor(descC);
+//         return;
+//     }
+//     fprintf(stderr, "[DEBUG] Workspace size estimated: %lu bytes\n", workspaceSize);
+    
+//     // 分配工作空间（如果需要）
+//     void* workspace = nullptr;
+//     if (workspaceSize > 0) {
+//         fprintf(stderr, "[DEBUG] Allocating workspace...\n");
+//         cudaError_t cudaStatus = cudaMalloc(&workspace, workspaceSize);
+//         if (cudaStatus != cudaSuccess) {
+//             fprintf(stderr, "[CUTENSOR] Failed to allocate workspace: %s\n", 
+//                     cudaGetErrorString(cudaStatus));
+//             cutensorDestroyPlanPreference(pref);
+//             cutensorDestroyOperationDescriptor(desc);
+//             cutensorDestroyTensorDescriptor(descA);
+//             cutensorDestroyTensorDescriptor(descC);
+//             return;
+//         }
+//         fprintf(stderr, "[DEBUG] Workspace allocated: %p\n", workspace);
+//     } else {
+//         fprintf(stderr, "[DEBUG] No workspace needed\n");
+//     }
+    
+//     // 创建计划
+//     fprintf(stderr, "[DEBUG] Creating execution plan...\n");
+//     cutensorPlan_t plan;
+//     status = cutensorCreatePlan(handle, &plan, desc, pref, workspaceSize);
+//     if (status != CUTENSOR_STATUS_SUCCESS) {
+//         fprintf(stderr, "[CUTENSOR] Failed to create plan: %s\n", 
+//                 cutensorGetErrorString(status));
+//         if (workspace) cudaFree(workspace);
+//         cutensorDestroyPlanPreference(pref);
+//         cutensorDestroyOperationDescriptor(desc);
+//         cutensorDestroyTensorDescriptor(descA);
+//         cutensorDestroyTensorDescriptor(descC);
+//         return;
+//     }
+//     fprintf(stderr, "[DEBUG] Plan created successfully\n");
+    
+//     // 执行置换
+//     fprintf(stderr, "[DEBUG] Executing permutation...\n");
+//     float alpha = 1.0f;
+//     status = cutensorPermute(
+//         handle, plan,
+//         &alpha, input_data, output_data,
+//         stream
+//     );
+    
+//     if (status != CUTENSOR_STATUS_SUCCESS) {
+//         fprintf(stderr, "[CUTENSOR] Transpose [0,2,1,3] failed: %s\n", 
+//                 cutensorGetErrorString(status));
+//     } else {
+//         fprintf(stderr, "[DEBUG] Permutation executed successfully\n");
+//     }
+    
+//     // 清理资源
+//     fprintf(stderr, "[DEBUG] Cleaning up resources...\n");
+//     if (workspace) {
+//         cudaFree(workspace);
+//         fprintf(stderr, "[DEBUG] Workspace freed\n");
+//     }
+//     cutensorDestroyPlan(plan);
+//     fprintf(stderr, "[DEBUG] Plan destroyed\n");
+//     cutensorDestroyPlanPreference(pref);
+//     fprintf(stderr, "[DEBUG] Plan preference destroyed\n");
+//     cutensorDestroyOperationDescriptor(desc);
+//     fprintf(stderr, "[DEBUG] Operation descriptor destroyed\n");
+//     cutensorDestroyTensorDescriptor(descA);
+//     fprintf(stderr, "[DEBUG] Input descriptor destroyed\n");
+//     cutensorDestroyTensorDescriptor(descC);
+//     fprintf(stderr, "[DEBUG] Output descriptor destroyed\n");
+    
+//     fprintf(stderr, "[DEBUG] Function completed successfully\n");
+// }
+
+// 支持 [0,2,3,1] 置换的函数 - FP32版本
+extern "C" MLIR_CUDA_WRAPPERS_EXPORT void
+mgpuCulibsTranspose_0231(
+    void* input_data,           // 输入张量 (batch, dim1, dim2, dim3)
+    void* output_data,          // 输出张量 (batch, dim2, dim3, dim1)
+    int batch_size, int dim1, int dim2, int dim3,
+    CUstream stream
+) {
+    mgpuEnsureContext();
+    
+    cutensorHandle_t handle = getGlobalCutensorHandle();
+    if (!handle) {
+        fprintf(stderr, "[CUTENSOR] Global cuTENSOR handle not available\n");
+        return;
+    }
+
+    // 输入张量维度和步长: [batch_size, dim1, dim2, dim3]
+    int64_t input_dims[4] = {batch_size, dim1, dim2, dim3};
+    int64_t input_strides[4] = {(int64_t)dim1 * dim2 * dim3, (int64_t)dim2 * dim3, dim3, 1};
+    
+    // 输出张量维度和步长: [batch_size, dim2, dim3, dim1] (置换[0,2,3,1])
+    int64_t output_dims[4] = {batch_size, dim2, dim3, dim1};
+    int64_t output_strides[4] = {(int64_t)dim2 * dim3 * dim1, (int64_t)dim3 * dim1, dim1, 1};
+    
+    // 创建输入张量描述符
+    cutensorTensorDescriptor_t descA;
+    cutensorStatus_t status = cutensorCreateTensorDescriptor(
+        handle, &descA, 4, input_dims, input_strides, 
+        CUTENSOR_R_32F, 256
+    );
+    if (status != CUTENSOR_STATUS_SUCCESS) {
+        fprintf(stderr, "[CUTENSOR] Failed to create input descriptor: %s\n", 
+                cutensorGetErrorString(status));
+        return;
+    }
+    
+    // 创建输出张量描述符
+    cutensorTensorDescriptor_t descC;
+    status = cutensorCreateTensorDescriptor(
+        handle, &descC, 4, output_dims, output_strides,
+        CUTENSOR_R_32F, 256
+    );
+    if (status != CUTENSOR_STATUS_SUCCESS) {
+        fprintf(stderr, "[CUTENSOR] Failed to create output descriptor: %s\n", 
+                cutensorGetErrorString(status));
+        cutensorDestroyTensorDescriptor(descA);
+        return;
+    }
+    
+    // 创建置换操作描述符
+    cutensorOperationDescriptor_t desc;
+    int32_t modeA[4] = {0, 1, 2, 3};        // 输入模式
+    int32_t modeC[4] = {0, 2, 3, 1};        // 输出模式 [0,2,3,1]
+    
+    status = cutensorCreatePermutation(
+        handle, &desc,
+        descA, modeA, CUTENSOR_OP_IDENTITY,
+        descC, modeC,
+        CUTENSOR_COMPUTE_DESC_32F
+    );
+    if (status != CUTENSOR_STATUS_SUCCESS) {
+        fprintf(stderr, "[CUTENSOR] Failed to create permutation descriptor: %s\n", 
+                cutensorGetErrorString(status));
+        cutensorDestroyTensorDescriptor(descA);
+        cutensorDestroyTensorDescriptor(descC);
+        return;
+    }
+    
+    // 创建计划偏好设置
+    cutensorPlanPreference_t pref;
+    status = cutensorCreatePlanPreference(handle, &pref, 
+                                        CUTENSOR_ALGO_DEFAULT, 
+                                        CUTENSOR_JIT_MODE_NONE);
+    if (status != CUTENSOR_STATUS_SUCCESS) {
+        fprintf(stderr, "[CUTENSOR] Failed to create plan preference: %s\n", 
+                cutensorGetErrorString(status));
+        cutensorDestroyOperationDescriptor(desc);
+        cutensorDestroyTensorDescriptor(descA);
+        cutensorDestroyTensorDescriptor(descC);
+        return;
+    }
+    
+    // 查询工作空间大小
+    uint64_t workspaceSize = 0;
+    status = cutensorEstimateWorkspaceSize(handle, desc, pref,
+                                         CUTENSOR_WORKSPACE_DEFAULT, 
+                                         &workspaceSize);
+    if (status != CUTENSOR_STATUS_SUCCESS) {
+        fprintf(stderr, "[CUTENSOR] Failed to estimate workspace size: %s\n", 
+                cutensorGetErrorString(status));
+        cutensorDestroyPlanPreference(pref);
+        cutensorDestroyOperationDescriptor(desc);
+        cutensorDestroyTensorDescriptor(descA);
+        cutensorDestroyTensorDescriptor(descC);
+        return;
+    }
+    
+    // 分配工作空间（如果需要）
+    void* workspace = nullptr;
+    if (workspaceSize > 0) {
+        cudaError_t cudaStatus = cudaMalloc(&workspace, workspaceSize);
+        if (cudaStatus != cudaSuccess) {
+            fprintf(stderr, "[CUTENSOR] Failed to allocate workspace\n");
+            cutensorDestroyPlanPreference(pref);
+            cutensorDestroyOperationDescriptor(desc);
+            cutensorDestroyTensorDescriptor(descA);
+            cutensorDestroyTensorDescriptor(descC);
+            return;
+        }
+    }
+    
+    // 创建计划
+    cutensorPlan_t plan;
+    status = cutensorCreatePlan(handle, &plan, desc, pref, workspaceSize);
+    if (status != CUTENSOR_STATUS_SUCCESS) {
+        fprintf(stderr, "[CUTENSOR] Failed to create plan: %s\n", 
+                cutensorGetErrorString(status));
+        if (workspace) cudaFree(workspace);
+        cutensorDestroyPlanPreference(pref);
+        cutensorDestroyOperationDescriptor(desc);
+        cutensorDestroyTensorDescriptor(descA);
+        cutensorDestroyTensorDescriptor(descC);
+        return;
+    }
+    
+    // 执行置换
+    float alpha = 1.0f;
+    status = cutensorPermute(
+        handle, plan,
+        &alpha, input_data, output_data,
+        stream
+    );
+    
+    if (status != CUTENSOR_STATUS_SUCCESS) {
+        fprintf(stderr, "[CUTENSOR] Transpose [0,2,3,1] failed: %s\n", 
+                cutensorGetErrorString(status));
+    }
+    
+    // 清理资源
+    if (workspace) cudaFree(workspace);
+    cutensorDestroyPlan(plan);
+    cutensorDestroyPlanPreference(pref);
+    cutensorDestroyOperationDescriptor(desc);
+    cutensorDestroyTensorDescriptor(descA);
+    cutensorDestroyTensorDescriptor(descC);
+}
+
+// FP16版本 - [0,2,1,3]
+extern "C" MLIR_CUDA_WRAPPERS_EXPORT void
+mgpuCulibsTranspose_0213_fp16(
+    void* input_data,
+    void* output_data,
+    int batch_size, int dim1, int dim2, int dim3,
+    CUstream stream
+) {
+    mgpuEnsureContext();
+    
+    cutensorHandle_t handle = getGlobalCutensorHandle();
+    if (!handle) {
+        fprintf(stderr, "[CUTENSOR] Global cuTENSOR handle not available\n");
+        return;
+    }
+
+    // 输入张量维度和步长: [batch_size, dim1, dim2, dim3]
+    int64_t input_dims[4] = {batch_size, dim1, dim2, dim3};
+    int64_t input_strides[4] = {(int64_t)dim1 * dim2 * dim3, (int64_t)dim2 * dim3, dim3, 1};
+    
+    // 输出张量维度和步长: [batch_size, dim2, dim1, dim3] (置换[0,2,1,3])
+    int64_t output_dims[4] = {batch_size, dim2, dim1, dim3};
+    int64_t output_strides[4] = {(int64_t)dim2 * dim1 * dim3, (int64_t)dim1 * dim3, dim3, 1};
+    
+    // 创建输入张量描述符
+    cutensorTensorDescriptor_t descA;
+    cutensorStatus_t status = cutensorCreateTensorDescriptor(
+        handle, &descA, 4, input_dims, input_strides, 
+        CUTENSOR_R_16F, 256
+    );
+    if (status != CUTENSOR_STATUS_SUCCESS) {
+        fprintf(stderr, "[CUTENSOR] Failed to create input descriptor: %s\n", 
+                cutensorGetErrorString(status));
+        return;
+    }
+    
+    // 创建输出张量描述符
+    cutensorTensorDescriptor_t descC;
+    status = cutensorCreateTensorDescriptor(
+        handle, &descC, 4, output_dims, output_strides,
+        CUTENSOR_R_16F, 256
+    );
+    if (status != CUTENSOR_STATUS_SUCCESS) {
+        fprintf(stderr, "[CUTENSOR] Failed to create output descriptor: %s\n", 
+                cutensorGetErrorString(status));
+        cutensorDestroyTensorDescriptor(descA);
+        return;
+    }
+    
+    // 创建置换操作描述符
+    cutensorOperationDescriptor_t desc;
+    int32_t modeA[4] = {0, 1, 2, 3};        // 输入模式
+    int32_t modeC[4] = {0, 2, 1, 3};        // 输出模式 [0,2,1,3]
+    
+    status = cutensorCreatePermutation(
+        handle, &desc,
+        descA, modeA, CUTENSOR_OP_IDENTITY,
+        descC, modeC,
+        CUTENSOR_COMPUTE_DESC_16F
+    );
+    if (status != CUTENSOR_STATUS_SUCCESS) {
+        fprintf(stderr, "[CUTENSOR] Failed to create permutation descriptor: %s\n", 
+                cutensorGetErrorString(status));
+        cutensorDestroyTensorDescriptor(descA);
+        cutensorDestroyTensorDescriptor(descC);
+        return;
+    }
+    
+    // 创建计划偏好设置
+    cutensorPlanPreference_t pref;
+    status = cutensorCreatePlanPreference(handle, &pref, 
+                                        CUTENSOR_ALGO_DEFAULT, 
+                                        CUTENSOR_JIT_MODE_NONE);
+    if (status != CUTENSOR_STATUS_SUCCESS) {
+        fprintf(stderr, "[CUTENSOR] Failed to create plan preference: %s\n", 
+                cutensorGetErrorString(status));
+        cutensorDestroyOperationDescriptor(desc);
+        cutensorDestroyTensorDescriptor(descA);
+        cutensorDestroyTensorDescriptor(descC);
+        return;
+    }
+    
+    // 查询工作空间大小
+    uint64_t workspaceSize = 0;
+    status = cutensorEstimateWorkspaceSize(handle, desc, pref,
+                                         CUTENSOR_WORKSPACE_DEFAULT, 
+                                         &workspaceSize);
+    if (status != CUTENSOR_STATUS_SUCCESS) {
+        fprintf(stderr, "[CUTENSOR] Failed to estimate workspace size: %s\n", 
+                cutensorGetErrorString(status));
+        cutensorDestroyPlanPreference(pref);
+        cutensorDestroyOperationDescriptor(desc);
+        cutensorDestroyTensorDescriptor(descA);
+        cutensorDestroyTensorDescriptor(descC);
+        return;
+    }
+    
+    // 分配工作空间（如果需要）
+    void* workspace = nullptr;
+    if (workspaceSize > 0) {
+        cudaError_t cudaStatus = cudaMalloc(&workspace, workspaceSize);
+        if (cudaStatus != cudaSuccess) {
+            fprintf(stderr, "[CUTENSOR] Failed to allocate workspace\n");
+            cutensorDestroyPlanPreference(pref);
+            cutensorDestroyOperationDescriptor(desc);
+            cutensorDestroyTensorDescriptor(descA);
+            cutensorDestroyTensorDescriptor(descC);
+            return;
+        }
+    }
+    
+    // 创建计划
+    cutensorPlan_t plan;
+    status = cutensorCreatePlan(handle, &plan, desc, pref, workspaceSize);
+    if (status != CUTENSOR_STATUS_SUCCESS) {
+        fprintf(stderr, "[CUTENSOR] Failed to create plan: %s\n", 
+                cutensorGetErrorString(status));
+        if (workspace) cudaFree(workspace);
+        cutensorDestroyPlanPreference(pref);
+        cutensorDestroyOperationDescriptor(desc);
+        cutensorDestroyTensorDescriptor(descA);
+        cutensorDestroyTensorDescriptor(descC);
+        return;
+    }
+    
+    // 执行置换 - 使用float类型的alpha（cuTensor会自动转换）
+    float alpha = 1.0f;
+    status = cutensorPermute(
+        handle, plan,
+        &alpha, input_data, output_data,
+        stream
+    );
+    
+    if (status != CUTENSOR_STATUS_SUCCESS) {
+        fprintf(stderr, "[CUTENSOR] FP16 Transpose [0,2,1,3] failed: %s\n", 
+                cutensorGetErrorString(status));
+    }
+    
+    // 清理资源
+    if (workspace) cudaFree(workspace);
+    cutensorDestroyPlan(plan);
+    cutensorDestroyPlanPreference(pref);
+    cutensorDestroyOperationDescriptor(desc);
+    cutensorDestroyTensorDescriptor(descA);
+    cutensorDestroyTensorDescriptor(descC);
+}
+
+// FP16版本 - [0,2,3,1]
+extern "C" MLIR_CUDA_WRAPPERS_EXPORT void
+mgpuCulibsTranspose_0231_fp16(
+    void* input_data,
+    void* output_data,
+    int batch_size, int dim1, int dim2, int dim3,
+    CUstream stream
+) {
+    mgpuEnsureContext();
+    
+    cutensorHandle_t handle = getGlobalCutensorHandle();
+    if (!handle) {
+        fprintf(stderr, "[CUTENSOR] Global cuTENSOR handle not available\n");
+        return;
+    }
+
+    // 输入张量维度和步长: [batch_size, dim1, dim2, dim3]
+    int64_t input_dims[4] = {batch_size, dim1, dim2, dim3};
+    int64_t input_strides[4] = {(int64_t)dim1 * dim2 * dim3, (int64_t)dim2 * dim3, dim3, 1};
+    
+    // 输出张量维度和步长: [batch_size, dim2, dim3, dim1] (置换[0,2,3,1])
+    int64_t output_dims[4] = {batch_size, dim2, dim3, dim1};
+    int64_t output_strides[4] = {(int64_t)dim2 * dim3 * dim1, (int64_t)dim3 * dim1, dim1, 1};
+    
+    // 创建输入张量描述符
+    cutensorTensorDescriptor_t descA;
+    cutensorStatus_t status = cutensorCreateTensorDescriptor(
+        handle, &descA, 4, input_dims, input_strides, 
+        CUTENSOR_R_16F, 256
+    );
+    if (status != CUTENSOR_STATUS_SUCCESS) {
+        fprintf(stderr, "[CUTENSOR] Failed to create input descriptor: %s\n", 
+                cutensorGetErrorString(status));
+        return;
+    }
+    
+    // 创建输出张量描述符
+    cutensorTensorDescriptor_t descC;
+    status = cutensorCreateTensorDescriptor(
+        handle, &descC, 4, output_dims, output_strides,
+        CUTENSOR_R_16F, 256
+    );
+    if (status != CUTENSOR_STATUS_SUCCESS) {
+        fprintf(stderr, "[CUTENSOR] Failed to create output descriptor: %s\n", 
+                cutensorGetErrorString(status));
+        cutensorDestroyTensorDescriptor(descA);
+        return;
+    }
+    
+    // 创建置换操作描述符
+    cutensorOperationDescriptor_t desc;
+    int32_t modeA[4] = {0, 1, 2, 3};        // 输入模式
+    int32_t modeC[4] = {0, 2, 3, 1};        // 输出模式 [0,2,3,1]
+    
+    status = cutensorCreatePermutation(
+        handle, &desc,
+        descA, modeA, CUTENSOR_OP_IDENTITY,
+        descC, modeC,
+        CUTENSOR_COMPUTE_DESC_16F
+    );
+    if (status != CUTENSOR_STATUS_SUCCESS) {
+        fprintf(stderr, "[CUTENSOR] Failed to create permutation descriptor: %s\n", 
+                cutensorGetErrorString(status));
+        cutensorDestroyTensorDescriptor(descA);
+        cutensorDestroyTensorDescriptor(descC);
+        return;
+    }
+    
+    // 创建计划偏好设置
+    cutensorPlanPreference_t pref;
+    status = cutensorCreatePlanPreference(handle, &pref, 
+                                        CUTENSOR_ALGO_DEFAULT, 
+                                        CUTENSOR_JIT_MODE_NONE);
+    if (status != CUTENSOR_STATUS_SUCCESS) {
+        fprintf(stderr, "[CUTENSOR] Failed to create plan preference: %s\n", 
+                cutensorGetErrorString(status));
+        cutensorDestroyOperationDescriptor(desc);
+        cutensorDestroyTensorDescriptor(descA);
+        cutensorDestroyTensorDescriptor(descC);
+        return;
+    }
+    
+    // 查询工作空间大小
+    uint64_t workspaceSize = 0;
+    status = cutensorEstimateWorkspaceSize(handle, desc, pref,
+                                         CUTENSOR_WORKSPACE_DEFAULT, 
+                                         &workspaceSize);
+    if (status != CUTENSOR_STATUS_SUCCESS) {
+        fprintf(stderr, "[CUTENSOR] Failed to estimate workspace size: %s\n", 
+                cutensorGetErrorString(status));
+        cutensorDestroyPlanPreference(pref);
+        cutensorDestroyOperationDescriptor(desc);
+        cutensorDestroyTensorDescriptor(descA);
+        cutensorDestroyTensorDescriptor(descC);
+        return;
+    }
+    
+    // 分配工作空间（如果需要）
+    void* workspace = nullptr;
+    if (workspaceSize > 0) {
+        cudaError_t cudaStatus = cudaMalloc(&workspace, workspaceSize);
+        if (cudaStatus != cudaSuccess) {
+            fprintf(stderr, "[CUTENSOR] Failed to allocate workspace\n");
+            cutensorDestroyPlanPreference(pref);
+            cutensorDestroyOperationDescriptor(desc);
+            cutensorDestroyTensorDescriptor(descA);
+            cutensorDestroyTensorDescriptor(descC);
+            return;
+        }
+    }
+    
+    // 创建计划
+    cutensorPlan_t plan;
+    status = cutensorCreatePlan(handle, &plan, desc, pref, workspaceSize);
+    if (status != CUTENSOR_STATUS_SUCCESS) {
+        fprintf(stderr, "[CUTENSOR] Failed to create plan: %s\n", 
+                cutensorGetErrorString(status));
+        if (workspace) cudaFree(workspace);
+        cutensorDestroyPlanPreference(pref);
+        cutensorDestroyOperationDescriptor(desc);
+        cutensorDestroyTensorDescriptor(descA);
+        cutensorDestroyTensorDescriptor(descC);
+        return;
+    }
+    
+    // 执行置换 - 使用float类型的alpha（cuTensor会自动转换）
+    float alpha = 1.0f;
+    status = cutensorPermute(
+        handle, plan,
+        &alpha, input_data, output_data,
+        stream
+    );
+    
+    if (status != CUTENSOR_STATUS_SUCCESS) {
+        fprintf(stderr, "[CUTENSOR] FP16 Transpose [0,2,3,1] failed: %s\n", 
+                cutensorGetErrorString(status));
+    }
+    
+    // 清理资源
+    if (workspace) cudaFree(workspace);
+    cutensorDestroyPlan(plan);
+    cutensorDestroyPlanPreference(pref);
+    cutensorDestroyOperationDescriptor(desc);
+    cutensorDestroyTensorDescriptor(descA);
+    cutensorDestroyTensorDescriptor(descC);
+}
+
 // fp32
 // 支持transB的全连接层实现
 extern "C" MLIR_CUDA_WRAPPERS_EXPORT void
@@ -3089,6 +3978,168 @@ mgpuCudnnMaxPoolForward(
   // 执行最大池化
   const float alpha = 1.0f;
   const float beta = 0.0f;
+  CUDNN_REPORT_IF_ERROR(cudnnPoolingForward(
+      handle, poolDesc, &alpha, inputDesc, input_data, &beta, outputDesc, output_data));
+}
+
+extern "C" MLIR_CUDA_WRAPPERS_EXPORT void
+mgpuCudnnAveragePoolForward(
+    int n, int c, int h, int w,           // 输入维度 (NCHW)
+    int kernel_h, int kernel_w,           // 核维度
+    int pad_h_begin, int pad_w_begin,     // 填充 (开始)
+    int pad_h_end, int pad_w_end,         // 填充 (结束)
+    int stride_h, int stride_w,           // 步长
+    int dilation_h, int dilation_w,       // 膨胀 (AveragePool通常不使用，但保持接口一致)
+    int ceil_mode,                        // ceil模式 (0=floor, 1=ceil)
+    int count_include_pad,                // 是否包含填充值 (0=exclude, 1=include)
+    void* input_data,                     // 输入张量
+    void* output_data,                    // 输出张量
+    CUstream stream                       // CUDA流
+) {
+  // 确保使用全局上下文
+  mgpuEnsureContext();
+  
+  StreamHandles handles;
+  if (!getHandlesForStream(stream, handles)) {
+    return; // 错误信息已在getHandlesForStream中打印
+  }
+  cudnnHandle_t handle = handles.cudnn_handle;
+
+  // 从池中获取描述符
+  cudnnTensorDescriptor_t inputDesc = acquireTensorDescriptor();
+  cudnnTensorDescriptor_t outputDesc = acquireTensorDescriptor();
+  cudnnPoolingDescriptor_t poolDesc = acquirePoolingDescriptor();
+
+  // 设置输入描述符
+  CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
+      inputDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, n, c, h, w));
+  
+  // 检查是否为非对称填充
+  bool asymmetricPadding = (pad_h_begin != pad_h_end) || (pad_w_begin != pad_w_end);
+  
+  if (asymmetricPadding) {
+    // 对于非对称填充，使用最大填充值
+    fprintf(stderr, "Warning: Asymmetric padding in AveragePool (%d,%d,%d,%d) may not produce exact results\n",
+            pad_h_begin, pad_w_begin, pad_h_end, pad_w_end);
+  }
+  
+  // cuDNN的pooling API要求对称填充，因此我们使用最大值
+  int pad_h = std::max(pad_h_begin, pad_h_end);
+  int pad_w = std::max(pad_w_begin, pad_w_end);
+  
+  // 根据count_include_pad选择pooling模式
+  cudnnPoolingMode_t poolingMode = count_include_pad ? 
+    CUDNN_POOLING_AVERAGE_COUNT_INCLUDE_PADDING : 
+    CUDNN_POOLING_AVERAGE_COUNT_EXCLUDE_PADDING;
+  
+  // 设置池化描述符
+  CUDNN_REPORT_IF_ERROR(cudnnSetPooling2dDescriptor(
+      poolDesc, poolingMode, CUDNN_NOT_PROPAGATE_NAN,
+      kernel_h, kernel_w, pad_h, pad_w, stride_h, stride_w));
+  
+  // 根据ceil_mode手动计算输出维度
+  int out_n = n;
+  int out_c = c;
+  int out_h, out_w;
+  
+  if (ceil_mode == 1) {
+    // ceil模式：向上取整
+    out_h = static_cast<int>(std::ceil(static_cast<float>(h + pad_h_begin + pad_h_end - kernel_h) / stride_h)) + 1;
+    out_w = static_cast<int>(std::ceil(static_cast<float>(w + pad_w_begin + pad_w_end - kernel_w) / stride_w)) + 1;
+  } else {
+    // floor模式：向下取整（默认）
+    out_h = static_cast<int>(std::floor(static_cast<float>(h + pad_h_begin + pad_h_end - kernel_h) / stride_h)) + 1;
+    out_w = static_cast<int>(std::floor(static_cast<float>(w + pad_w_begin + pad_w_end - kernel_w) / stride_w)) + 1;
+  }
+  
+  // 确保输出维度不为负数
+  out_h = std::max(1, out_h);
+  out_w = std::max(1, out_w);
+  
+  // 设置输出描述符
+  CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
+      outputDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, out_n, out_c, out_h, out_w));
+  
+  // 执行平均池化
+  const float alpha = 1.0f;
+  const float beta = 0.0f;
+  CUDNN_REPORT_IF_ERROR(cudnnPoolingForward(
+      handle, poolDesc, &alpha, inputDesc, input_data, &beta, outputDesc, output_data));
+}
+
+// FP16 版本
+extern "C" MLIR_CUDA_WRAPPERS_EXPORT void
+mgpuCudnnAveragePoolForward_fp16(
+    int n, int c, int h, int w,           // 输入维度 (NCHW)
+    int kernel_h, int kernel_w,           // 核维度
+    int pad_h_begin, int pad_w_begin,     // 填充 (开始)
+    int pad_h_end, int pad_w_end,         // 填充 (结束)
+    int stride_h, int stride_w,           // 步长
+    int dilation_h, int dilation_w,       // 膨胀
+    int ceil_mode,                        // ceil模式 (0=floor, 1=ceil)
+    int count_include_pad,                // 是否包含填充值 (0=exclude, 1=include)
+    void* input_data,                     // 输入张量
+    void* output_data,                    // 输出张量
+    CUstream stream                       // CUDA流
+) {
+  // 确保使用全局上下文
+  mgpuEnsureContext();
+  
+  StreamHandles handles;
+  if (!getHandlesForStream(stream, handles)) {
+    return;
+  }
+  cudnnHandle_t handle = handles.cudnn_handle;
+
+  // 从池中获取描述符
+  cudnnTensorDescriptor_t inputDesc = acquireTensorDescriptor();
+  cudnnTensorDescriptor_t outputDesc = acquireTensorDescriptor();
+  cudnnPoolingDescriptor_t poolDesc = acquirePoolingDescriptor();
+
+  // 设置输入描述符 (使用FP16)
+  CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
+      inputDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_HALF, n, c, h, w));
+  
+  // 检查是否为非对称填充
+  bool asymmetricPadding = (pad_h_begin != pad_h_end) || (pad_w_begin != pad_w_end);
+  
+  if (asymmetricPadding) {
+    fprintf(stderr, "Warning: Asymmetric padding in AveragePool (%d,%d,%d,%d) may not produce exact results\n",
+            pad_h_begin, pad_w_begin, pad_h_end, pad_w_end);
+  }
+  
+  int pad_h = std::max(pad_h_begin, pad_h_end);
+  int pad_w = std::max(pad_w_begin, pad_w_end);
+  
+  cudnnPoolingMode_t poolingMode = count_include_pad ? 
+    CUDNN_POOLING_AVERAGE_COUNT_INCLUDE_PADDING : 
+    CUDNN_POOLING_AVERAGE_COUNT_EXCLUDE_PADDING;
+  
+  CUDNN_REPORT_IF_ERROR(cudnnSetPooling2dDescriptor(
+      poolDesc, poolingMode, CUDNN_NOT_PROPAGATE_NAN,
+      kernel_h, kernel_w, pad_h, pad_w, stride_h, stride_w));
+  
+  // 计算输出维度
+  int out_n = n, out_c = c, out_h, out_w;
+  
+  if (ceil_mode == 1) {
+    out_h = static_cast<int>(std::ceil(static_cast<float>(h + pad_h_begin + pad_h_end - kernel_h) / stride_h)) + 1;
+    out_w = static_cast<int>(std::ceil(static_cast<float>(w + pad_w_begin + pad_w_end - kernel_w) / stride_w)) + 1;
+  } else {
+    out_h = static_cast<int>(std::floor(static_cast<float>(h + pad_h_begin + pad_h_end - kernel_h) / stride_h)) + 1;
+    out_w = static_cast<int>(std::floor(static_cast<float>(w + pad_w_begin + pad_w_end - kernel_w) / stride_w)) + 1;
+  }
+  
+  out_h = std::max(1, out_h);
+  out_w = std::max(1, out_w);
+  
+  // 设置输出描述符 (使用FP16)
+  CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
+      outputDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_HALF, out_n, out_c, out_h, out_w));
+  
+  // 执行平均池化 (使用FP16)
+  const __half alpha = __float2half(1.0f);
+  const __half beta = __float2half(0.0f);
   CUDNN_REPORT_IF_ERROR(cudnnPoolingForward(
       handle, poolDesc, &alpha, inputDesc, input_data, &beta, outputDesc, output_data));
 }
