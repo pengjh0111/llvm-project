@@ -165,6 +165,185 @@ static void getProducerCandidates(unsigned dstId, MemRefDependenceGraph *mdg,
   srcIdCandidates.erase(llvm::unique(srcIdCandidates), srcIdCandidates.end());
 }
 
+// modifiy py p
+
+/// 辅助函数：检查操作是否在给定范围内
+static bool isOpInRange(Operation *op, Operation *rangeStart, Operation *rangeEnd) {
+  // 检查op是否在rangeStart和rangeEnd之间（包括它们的内部）
+  
+  // 首先检查是否在同一个block中
+  if (op->getBlock() != rangeStart->getBlock() || 
+      rangeStart->getBlock() != rangeEnd->getBlock()) {
+    return false;
+  }
+  
+  // 检查是否在操作内部（遍历操作树）
+  // 使用walk来检查是否是子操作
+  bool foundInRangeStart = false, foundInRangeEnd = false;
+  
+  rangeStart->walk([&](Operation *subOp) {
+    if (subOp == op) {
+      foundInRangeStart = true;
+      return WalkResult::interrupt();
+    }
+    return WalkResult::advance();
+  });
+  
+  if (foundInRangeStart)
+    return true;
+    
+  rangeEnd->walk([&](Operation *subOp) {
+    if (subOp == op) {
+      foundInRangeEnd = true;
+      return WalkResult::interrupt();
+    }
+    return WalkResult::advance();
+  });
+  
+  if (foundInRangeEnd)
+    return true;
+  
+  // 检查是否在两个操作之间
+  if (rangeStart->isBeforeInBlock(op) && op->isBeforeInBlock(rangeEnd)) {
+    return true;
+  }
+  
+  return false;
+}
+
+/// 检查reinterpret_cast操作是否会在指定范围内被使用
+/// 如果reinterpret_cast的结果没有在srcOp到dstOp之间被使用，则认为不影响融合
+static bool reinterpretCastUsedInFusionRange(memref::ReinterpretCastOp reinterpretOp,
+                                           Operation *srcOp, Operation *dstOp) {
+  Value result = reinterpretOp.getResult();
+  
+  // 检查reinterpret_cast的结果是否有任何使用
+  if (result.use_empty()) {
+    LLVM_DEBUG(llvm::dbgs() << "ReinterpretCast result is unused, safe for fusion\n");
+    return false;
+  }
+  
+  // 检查所有使用点是否在融合范围内
+  for (auto &use : result.getUses()) {
+    Operation *user = use.getOwner();
+    
+    // 检查使用点是否在srcOp和dstOp之间（包括它们内部）
+    // 如果在这个范围内，则可能影响融合安全性
+    if (isOpInRange(user, srcOp, dstOp)) {
+      LLVM_DEBUG(llvm::dbgs() << "ReinterpretCast result used within fusion range: " 
+                              << *user << "\n");
+      return true;
+    }
+  }
+  
+  LLVM_DEBUG(llvm::dbgs() << "ReinterpretCast result not used within fusion range, safe for fusion\n");
+  return false;
+}
+
+// static bool areMemrefsAliased(Value memref1, Value memref2) {
+//   // 直接相等
+//   if (memref1 == memref2)
+//     return true;
+    
+//   // 检查是否通过reinterpret_cast相关
+//   auto checkReinterpretCastAlias = [](Value src, Value dst) -> bool {
+//     auto reinterpretOp = src.getDefiningOp<memref::ReinterpretCastOp>();
+//     if (!reinterpretOp)
+//       return false;
+      
+//     auto srcType = reinterpretOp.getSource().getType().cast<MemRefType>();
+//     auto dstType = reinterpretOp.getResult().getType().cast<MemRefType>();
+    
+//     // 必须是减少一个维度的reshape（4D -> 3D）
+//     if (srcType.getRank() != dstType.getRank() + 1 || srcType.getRank() < 2)
+//       return false;
+      
+//     // 验证stride是否连续
+//     auto reinterpretStrides = reinterpretOp.getStaticStrides();
+//     if (reinterpretStrides.empty())
+//       return false;
+      
+//     // 检查source memref是否指向正确的目标
+//     if (reinterpretOp.getSource() != dst)
+//       return false;
+    
+//     // 模式1: 前两个维度flatten (如 16x32x28x28 -> 512x28x28)
+//     auto checkFrontFlatten = [&]() -> bool {
+//       if (srcType.getRank() < 2 || dstType.getRank() < 1)
+//         return false;
+        
+//       auto srcDim0 = srcType.getDimSize(0);
+//       auto srcDim1 = srcType.getDimSize(1);
+//       auto dstDim0 = dstType.getDimSize(0);
+      
+//       if (srcDim0 == ShapedType::kDynamic || 
+//           srcDim1 == ShapedType::kDynamic ||
+//           dstDim0 == ShapedType::kDynamic)
+//         return false;
+        
+//       // 验证flatten: srcDim0 * srcDim1 = dstDim0
+//       if (srcDim0 * srcDim1 != dstDim0)
+//         return false;
+        
+//       // 验证剩余维度一致
+//       for (int i = 1; i < dstType.getRank(); i++) {
+//         if (i + 1 >= srcType.getRank() || 
+//             srcType.getDimSize(i + 1) != dstType.getDimSize(i))
+//           return false;
+//       }
+      
+//       return true;
+//     };
+    
+//     // 模式2: 后两个维度flatten (如 16x64x56x56 -> 16x64x3136)
+//     auto checkBackFlatten = [&]() -> bool {
+//       if (srcType.getRank() < 2 || dstType.getRank() < 1)
+//         return false;
+        
+//       int srcRank = srcType.getRank();
+//       int dstRank = dstType.getRank();
+      
+//       // 获取要flatten的后两个维度
+//       auto srcSecondLast = srcType.getDimSize(srcRank - 2);
+//       auto srcLast = srcType.getDimSize(srcRank - 1);
+//       auto dstLast = dstType.getDimSize(dstRank - 1);
+      
+//       if (srcSecondLast == ShapedType::kDynamic || 
+//           srcLast == ShapedType::kDynamic ||
+//           dstLast == ShapedType::kDynamic)
+//         return false;
+        
+//       // 验证flatten: srcSecondLast * srcLast = dstLast
+//       if (srcSecondLast * srcLast != dstLast)
+//         return false;
+        
+//       // 验证前面的维度一致
+//       for (int i = 0; i < dstRank - 1; i++) {
+//         if (i >= srcRank - 2 || 
+//             srcType.getDimSize(i) != dstType.getDimSize(i))
+//           return false;
+//       }
+      
+//       return true;
+//     };
+    
+//     return checkFrontFlatten() || checkBackFlatten();
+//   };
+  
+//   // 双向检查reinterpret_cast关系
+//   return checkReinterpretCastAlias(memref1, memref2) || 
+//          checkReinterpretCastAlias(memref2, memref1);
+// }
+
+// /// 获取memref的根源，穿透reinterpret_cast操作
+// static Value getRootMemRef(Value memref) {
+//   while (auto reinterpretOp = memref.getDefiningOp<memref::ReinterpretCastOp>()) {
+//     memref = reinterpretOp.getSource();
+//   }
+//   return memref;
+// }
+
+
 /// Returns in 'producerConsumerMemrefs' the memrefs involved in a
 /// producer-consumer dependence between 'srcId' and 'dstId'.
 static void
@@ -177,6 +356,37 @@ gatherProducerConsumerMemrefs(unsigned srcId, unsigned dstId,
                                 producerConsumerMemrefs);
 }
 
+// static void gatherProducerConsumerMemrefs(unsigned srcId, unsigned dstId,
+//                                           MemRefDependenceGraph *mdg,
+//                                           DenseSet<Value> &producerConsumerMemrefs) {
+//   auto *dstNode = mdg->getNode(dstId);
+//   auto *srcNode = mdg->getNode(srcId);
+  
+//   // 原有逻辑
+//   gatherProducerConsumerMemrefs(srcNode->stores, dstNode->loads,
+//                                 producerConsumerMemrefs);
+  
+//   // 增强逻辑：检查reinterpret_cast别名
+//   for (Operation *storeOp : srcNode->stores) {
+//     Value storeMemref = cast<AffineWriteOpInterface>(storeOp).getMemRef();
+    
+//     for (Operation *loadOp : dstNode->loads) {
+//       Value loadMemref = cast<AffineReadOpInterface>(loadOp).getMemRef();
+      
+//       if (areMemrefsAliased(storeMemref, loadMemref)) {
+//         // 添加原始memref和别名memref
+//         producerConsumerMemrefs.insert(storeMemref);
+//         producerConsumerMemrefs.insert(loadMemref);
+        
+//         // 也添加根memref以确保完整性
+//         producerConsumerMemrefs.insert(getRootMemRef(storeMemref));
+//         producerConsumerMemrefs.insert(getRootMemRef(loadMemref));
+//       }
+//     }
+//   }
+// }
+
+
 /// A memref escapes in the context of the fusion pass if either:
 ///   1. it (or its alias) is a block argument, or
 ///   2. created by an op not known to guarantee alias freedom,
@@ -184,7 +394,25 @@ gatherProducerConsumerMemrefs(unsigned srcId, unsigned dstId,
 ///   (e.g., by call op, memref load/store ops, alias creating ops, unknown ops,
 ///   terminator ops, etc.); such ops do not deference the memref in an affine
 ///   way.
-static bool isEscapingMemref(Value memref, Block *block) {
+
+/// 检查reinterpret_cast操作是否实际上未被使用
+/// 这种操作不应该阻止loop fusion
+static bool isUnusedReinterpretCast(Operation *op) {
+  auto reinterpretOp = dyn_cast<memref::ReinterpretCastOp>(op);
+  if (!reinterpretOp)
+    return false;
+  
+  // 检查reinterpret_cast的结果是否有任何真实使用
+  Value result = reinterpretOp.getResult();
+  return result.use_empty();
+}
+
+
+// static bool isEscapingMemref(Value memref, Block *block) { // src
+// modified py p
+static bool isEscapingMemref(Value memref, Block *block, 
+                            Operation *srcOp = nullptr, Operation *dstOp = nullptr) {
+
   Operation *defOp = memref.getDefiningOp();
   // Check if 'memref' is a block argument.
   if (!defOp)
@@ -208,6 +436,22 @@ static bool isEscapingMemref(Value memref, Block *block) {
       return true;
     if (ancestorOp->getBlock() != block)
       return false;
+
+    // 新增：特殊处理reinterpret_cast操作
+    if (auto reinterpretOp = dyn_cast<memref::ReinterpretCastOp>(user)) {
+      // 如果提供了srcOp和dstOp，进行精细分析
+      if (srcOp && dstOp) {
+        // 检查reinterpret_cast是否在融合范围内被使用
+        if (!reinterpretCastUsedInFusionRange(reinterpretOp, srcOp, dstOp)) {
+          LLVM_DEBUG(llvm::dbgs() << "Ignoring safe reinterpret_cast: " << *user << "\n");
+          return false;  // 不认为是逃逸使用
+        }
+      }
+      // 如果没有提供范围信息或在范围内被使用，则保持保守策略
+      LLVM_DEBUG(llvm::dbgs() << "ReinterpretCast affects fusion safety: " << *user << "\n");
+      return true;
+    }
+
     return !isa<AffineMapAccessInterface>(*user);
   });
 }
@@ -365,6 +609,19 @@ static bool hasNonAffineUsersOnThePath(unsigned srcId, unsigned dstId,
         // Skip affine ops.
         if (isa<AffineMapAccessInterface>(*user))
           return WalkResult::advance();
+
+        // 新增：智能处理reinterpret_cast操作
+        if (auto reinterpretOp = dyn_cast<memref::ReinterpretCastOp>(user)) {
+          if (llvm::is_contained(users, user)) {
+            // 检查这个reinterpret_cast是否真的会影响融合
+            if (!reinterpretCastUsedInFusionRange(reinterpretOp, srcNode->op, dstNode->op)) {
+              LLVM_DEBUG(llvm::dbgs() << "Skipping safe reinterpret_cast on path: " 
+                                      << *user << "\n");
+              return WalkResult::advance();
+            }
+          }
+        }
+
         // Find a non-affine op that uses the memref.
         if (llvm::is_contained(users, user))
           return WalkResult::interrupt();
@@ -807,6 +1064,62 @@ public:
     return true;
   }
 
+  /// 检查两个affine.for循环嵌套是否具有完全相同的结构
+  /// 包括嵌套深度、每层循环的边界条件等 add py p
+  static bool haveSameIterationCounts(AffineForOp srcLoop, AffineForOp dstLoop) {
+    SmallVector<AffineForOp, 4> srcLoops, dstLoops;
+    getAffineForIVs(*srcLoop.getOperation(), &srcLoops);
+    getAffineForIVs(*dstLoop.getOperation(), &dstLoops);
+    
+    // 检查嵌套深度
+    if (srcLoops.size() != dstLoops.size()) {
+      LLVM_DEBUG(llvm::dbgs() << "Loop nest depths differ: src=" << srcLoops.size() 
+                              << ", dst=" << dstLoops.size() << "\n");
+      return false;
+    }
+    
+    // 检查每层的迭代次数
+    for (size_t i = 0; i < srcLoops.size(); ++i) {
+      AffineForOp srcForOp = srcLoops[i];
+      AffineForOp dstForOp = dstLoops[i];
+      
+      // 方案1：先检查是否有常量边界，然后获取值
+      if (!srcForOp.hasConstantLowerBound() || !srcForOp.hasConstantUpperBound() ||
+          !dstForOp.hasConstantLowerBound() || !dstForOp.hasConstantUpperBound()) {
+        LLVM_DEBUG(llvm::dbgs() << "Non-constant bounds at depth " << i << ", skipping check\n");
+        continue;
+      }
+      
+      // 直接获取常量边界值
+      int64_t srcLower = srcForOp.getConstantLowerBound();
+      int64_t srcUpper = srcForOp.getConstantUpperBound();
+      int64_t dstLower = dstForOp.getConstantLowerBound();
+      int64_t dstUpper = dstForOp.getConstantUpperBound();
+      
+      // 检查步长
+      llvm::APInt srcStep = srcForOp.getStep();
+      llvm::APInt dstStep = dstForOp.getStep();
+      
+      if (srcStep != dstStep) {
+        LLVM_DEBUG(llvm::dbgs() << "Steps differ at depth " << i << "\n");
+        return false;
+      }
+      
+      // 计算迭代次数
+      int64_t srcIterCount = srcUpper - srcLower;
+      int64_t dstIterCount = dstUpper - dstLower;
+      
+      if (srcIterCount != dstIterCount) {
+        LLVM_DEBUG(llvm::dbgs() << "Iteration counts differ at depth " << i 
+                                << ": src=" << srcIterCount << ", dst=" << dstIterCount << "\n");
+        return false;
+      }
+    }
+    
+    LLVM_DEBUG(llvm::dbgs() << "Loop iteration counts match\n");
+    return true;
+  }
+
   /// Perform fusions with node `dstId` as the destination of fusion, with
   /// No fusion is performed when producers with a user count greater than
   /// `maxSrcUserCount` for any of the memrefs involved.
@@ -859,6 +1172,13 @@ public:
         if (isa<AffineForOp>(srcNode->op) && srcNode->op->getNumResults() > 0)
           continue;
 
+        // // 检查两个循环嵌套是否具有相同的结构 add py p
+        // if (!haveSameIterationCounts(srcAffineForOp, dstAffineForOp)) {
+        //   LLVM_DEBUG(llvm::dbgs() << "Skipping fusion: loop structures differ between src " 
+        //                           << srcId << " and dst " << dstId << "\n");
+        //   continue;
+        // }
+
         DenseSet<Value> producerConsumerMemrefs;
         gatherProducerConsumerMemrefs(srcId, dstId, mdg,
                                       producerConsumerMemrefs);
@@ -875,7 +1195,20 @@ public:
         // block (e.g., memref block arguments, returned memrefs,
         // memrefs passed to function calls, etc.).
         DenseSet<Value> srcEscapingMemRefs;
-        gatherEscapingMemrefs(srcNode->id, mdg, srcEscapingMemRefs);
+        // gatherEscapingMemrefs(srcNode->id, mdg, srcEscapingMemRefs); //modified py p
+
+        //modified py p
+        // auto *srcNode = mdg->getNode(srcId);
+        auto *dstNode = mdg->getNode(dstId);
+        
+        for (Operation *storeOp : srcNode->stores) {
+          auto memref = cast<AffineWriteOpInterface>(storeOp).getMemRef();
+          if (srcEscapingMemRefs.count(memref))
+            continue;
+          // 传入srcOp和dstOp进行精细分析
+          if (isEscapingMemref(memref, &mdg->block, srcNode->op, dstNode->op))
+            srcEscapingMemRefs.insert(memref);
+        }
 
         // Skip if there are non-affine operations in between the 'srcNode'
         // and 'dstNode' using their memrefs. If so, we wouldn't be able to
@@ -1424,3 +1757,5 @@ std::unique_ptr<Pass> mlir::affine::createLoopFusionPass(
   return std::make_unique<LoopFusion>(fastMemorySpace, localBufSizeThreshold,
                                       maximalFusion, affineFusionMode);
 }
+
+
