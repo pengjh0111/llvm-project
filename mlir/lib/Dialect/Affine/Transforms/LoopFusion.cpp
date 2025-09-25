@@ -30,6 +30,7 @@
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
+#include "mlir/IR/IRMapping.h"
 #include <iomanip>
 #include <optional>
 #include <sstream>
@@ -1064,6 +1065,847 @@ public:
     return true;
   }
 
+  // 在GreedyFusion类中添加的方法 - 复用现有融合基础设施
+
+  /// 检查两个循环是否具有相同的迭代结构
+  static bool haveSameIterationStructure(AffineForOp loop1, AffineForOp loop2) {
+    SmallVector<AffineForOp, 4> loops1, loops2;
+    
+    // 使用第一个内部操作来获取嵌套结构
+    Operation *innerOp1 = nullptr;
+    Operation *innerOp2 = nullptr;
+    
+    // 找到最内层的操作（非AffineForOp）
+    loop1.walk([&](Operation *op) {
+      if (!isa<AffineForOp, AffineYieldOp>(op) && !innerOp1) {
+        innerOp1 = op;
+        return WalkResult::interrupt();
+      }
+      return WalkResult::advance();
+    });
+    
+    loop2.walk([&](Operation *op) {
+      if (!isa<AffineForOp, AffineYieldOp>(op) && !innerOp2) {
+        innerOp2 = op;
+        return WalkResult::interrupt();
+      }
+      return WalkResult::advance();
+    });
+    
+    if (!innerOp1 || !innerOp2) {
+      LLVM_DEBUG(llvm::dbgs() << "Could not find inner operations in loops\n");
+      return false;
+    }
+    
+    // 使用getAffineForIVs获取正确的嵌套结构
+    getAffineForIVs(*innerOp1, &loops1);
+    getAffineForIVs(*innerOp2, &loops2);
+    
+    LLVM_DEBUG(llvm::dbgs() << "Loop1 nesting depth: " << loops1.size() 
+                            << ", Loop2 nesting depth: " << loops2.size() << "\n");
+    
+    if (loops1.size() != loops2.size()) {
+      LLVM_DEBUG(llvm::dbgs() << "Different nesting depths\n");
+      return false;
+    }
+    
+    // 比较每一层的循环边界和步长
+    for (size_t i = 0; i < loops1.size(); ++i) {
+      AffineForOp forOp1 = loops1[i];
+      AffineForOp forOp2 = loops2[i];
+      
+      if (forOp1.getLowerBoundMap() != forOp2.getLowerBoundMap() ||
+          forOp1.getUpperBoundMap() != forOp2.getUpperBoundMap() ||
+          forOp1.getStep() != forOp2.getStep()) {
+        LLVM_DEBUG(llvm::dbgs() << "Loop bounds/step differ at depth " << i << "\n");
+        return false;
+      }
+    }
+    
+    LLVM_DEBUG(llvm::dbgs() << "Loop structures match\n");
+    return true;
+  }
+
+
+  /// 检查两个循环是否有内存访问冲突
+  static bool hasMemoryAccessConflict(unsigned srcId, unsigned dstId, MemRefDependenceGraph *mdg) {
+    auto *srcNode = mdg->getNode(srcId);
+    auto *dstNode = mdg->getNode(dstId);
+    
+    // 获取各自访问的memref
+    DenseSet<Value> srcMemrefs, dstMemrefs;
+    srcNode->getLoadAndStoreMemrefSet(&srcMemrefs);
+    dstNode->getLoadAndStoreMemrefSet(&dstMemrefs);
+    
+    // 检查共享memref的访问模式
+    for (Value srcMemref : srcMemrefs) {
+      if (dstMemrefs.contains(srcMemref)) {
+        // 如果任一循环对共享memref进行写操作，则存在冲突
+        if (srcNode->getStoreOpCount(srcMemref) > 0 || 
+            dstNode->getStoreOpCount(srcMemref) > 0) {
+          return true;
+        }
+      }
+    }
+    
+    return false;
+  }
+
+  /// 获取独立循环的融合候选 - 类似getProducerCandidates但针对独立循环
+  static void getIndependentCandidates(unsigned dstId, MemRefDependenceGraph *mdg,
+                                      SmallVectorImpl<unsigned> &srcIdCandidates) {
+    auto *dstNode = mdg->getNode(dstId);
+    auto dstLoop = cast<AffineForOp>(dstNode->op);
+    
+    // 遍历所有其他节点寻找独立的循环
+    for (auto &srcNodePair : mdg->nodes) {
+      unsigned srcId = srcNodePair.first;
+      auto *srcNode = &srcNodePair.second;
+      
+      // 跳过自己和非循环节点
+      if (srcId == dstId || !isa<AffineForOp>(srcNode->op))
+        continue;
+      
+      auto srcLoop = cast<AffineForOp>(srcNode->op);
+      
+      // 检查是否在同一个block中
+      if (srcLoop->getBlock() != dstLoop->getBlock())
+        continue;
+      
+      // 检查循环结构是否相同（你之前提到的关键条件）
+      if (!haveSameIterationStructure(srcLoop, dstLoop))
+        continue;
+      
+      // 检查是否真正独立（无依赖关系）
+      if (mdg->hasDependencePath(srcId, dstId) || mdg->hasDependencePath(dstId, srcId))
+        continue;
+      
+      // 检查内存访问是否冲突
+      if (hasMemoryAccessConflict(srcId, dstId, mdg))
+        continue;
+      
+      srcIdCandidates.push_back(srcId);
+    }
+    
+    llvm::sort(srcIdCandidates);
+    srcIdCandidates.erase(llvm::unique(srcIdCandidates), srcIdCandidates.end());
+  }
+
+  // /// 检查循环是否适合独立融合（element-wise操作等）
+  // bool isEligibleForIndependentFusion(AffineForOp loop) {
+  //   // 检查是否包含简单的element-wise操作
+  //   bool isElementWise = true;
+  //   loop.walk([&](Operation *op) {
+  //     if (isa<AffineForOp, AffineYieldOp, AffineLoadOp, AffineStoreOp>(op))
+  //       return WalkResult::advance();
+      
+  //     if (isa<arith::AddFOp, arith::SubFOp, arith::MulFOp, arith::DivFOp,
+  //             math::SqrtOp, math::ExpOp, math::TanhOp>(op))
+  //       return WalkResult::advance();
+      
+  //     if (op->hasTrait<OpTrait::ConstantLike>())
+  //       return WalkResult::advance();
+      
+  //     // 其他复杂操作不适合
+  //     isElementWise = false;
+  //     return WalkResult::interrupt();
+  //   });
+    
+  //   return isElementWise;
+  // }
+
+  // 修复1: 添加相邻性检查函数
+  static bool areLoopsAdjacent(AffineForOp loop1, AffineForOp loop2) {
+    Operation *op1 = loop1.getOperation();
+    Operation *op2 = loop2.getOperation();
+    
+    LLVM_DEBUG(llvm::dbgs() << "Checking adjacency between two loops\n");
+    
+    // 检查是否在同一个block中
+    if (op1->getBlock() != op2->getBlock()) {
+      LLVM_DEBUG(llvm::dbgs() << "Loops are not in the same block\n");
+      return false;
+    }
+    
+    // 检查op1是否在op2之前
+    if (!op1->isBeforeInBlock(op2)) {
+      LLVM_DEBUG(llvm::dbgs() << "Loop1 is not before Loop2\n");
+      return false;
+    }
+    
+    // 检查是否直接相邻（中间只能有alloc等非循环操作）
+    Operation *next = op1->getNextNode();
+    int operationsBetween = 0;
+    
+    while (next && next != op2) {
+      operationsBetween++;
+      LLVM_DEBUG(llvm::dbgs() << "Operation between loops: " << *next << "\n");
+      
+      // 如果中间有其他AffineForOp，则不相邻
+      if (isa<AffineForOp>(next)) {
+        LLVM_DEBUG(llvm::dbgs() << "Found another AffineForOp between the loops\n");
+        return false;
+      }
+      
+      next = next->getNextNode();
+    }
+    
+    bool adjacent = (next == op2);
+    LLVM_DEBUG(llvm::dbgs() << "Operations between loops: " << operationsBetween 
+                            << ", Adjacent: " << adjacent << "\n");
+    
+    return adjacent;
+  }
+
+  // // 修复2: 简化的相邻候选查找函数
+  // static void getAdjacentIndependentCandidates(unsigned dstId, MemRefDependenceGraph *mdg,
+  //                                           SmallVectorImpl<unsigned> &srcIdCandidates) {
+  //   auto *dstNode = mdg->getNode(dstId);
+  //   if (!dstNode) {
+  //     LLVM_DEBUG(llvm::dbgs() << "Destination node not found: " << dstId << "\n");
+  //     return;
+  //   }
+    
+  //   auto dstLoop = dyn_cast<AffineForOp>(dstNode->op);
+  //   if (!dstLoop) {
+  //     LLVM_DEBUG(llvm::dbgs() << "Destination is not an AffineForOp\n");
+  //     return;
+  //   }
+    
+  //   // 只检查前一个操作，寻找相邻的循环
+  //   Operation *prevOp = dstLoop->getPrevNode();
+  //   while (prevOp) {
+  //     // 如果遇到另一个affine.for循环
+  //     if (auto srcLoop = dyn_cast<AffineForOp>(prevOp)) {
+  //       auto *srcNode = mdg->getForOpNode(srcLoop);
+  //       if (!srcNode) {
+  //         LLVM_DEBUG(llvm::dbgs() << "Source node not found in MDG\n");
+  //         break;
+  //       }
+        
+  //       unsigned srcId = srcNode->id;
+        
+  //       // 检查是否真正相邻
+  //       if (!areLoopsAdjacent(srcLoop, dstLoop)) {
+  //         LLVM_DEBUG(llvm::dbgs() << "Loops are not adjacent\n");
+  //         break;
+  //       }
+        
+  //       // 检查循环结构是否相同
+  //       if (!haveSameIterationStructure(srcLoop, dstLoop)) {
+  //         LLVM_DEBUG(llvm::dbgs() << "Loop structures differ\n");
+  //         break;
+  //       }
+        
+  //       // 检查是否真正独立（无依赖关系）
+  //       if (mdg->hasDependencePath(srcId, dstId) || mdg->hasDependencePath(dstId, srcId)) {
+  //         LLVM_DEBUG(llvm::dbgs() << "Loops have dependence path\n");
+  //         break;
+  //       }
+        
+  //       // 简化的内存访问检查：只检查写-写冲突
+  //       if (hasWriteWriteConflict(srcId, dstId, mdg)) {
+  //         LLVM_DEBUG(llvm::dbgs() << "Loops have write-write conflict\n");
+  //         break;
+  //       }
+        
+  //       srcIdCandidates.push_back(srcId);
+  //       LLVM_DEBUG(llvm::dbgs() << "Found adjacent candidate: " << srcId << "\n");
+  //       break;  // 只考虑直接相邻的一个循环
+  //     }
+      
+  //     // 如果遇到其他affine.for循环，停止搜索
+  //     if (isa<AffineForOp>(prevOp))
+  //       break;
+        
+  //     prevOp = prevOp->getPrevNode();
+  //   }
+  // }
+
+  // 修复3: 简化的写-写冲突检查
+  static bool hasWriteWriteConflict(unsigned srcId, unsigned dstId, MemRefDependenceGraph *mdg) {
+    auto *srcNode = mdg->getNode(srcId);
+    auto *dstNode = mdg->getNode(dstId);
+    
+    if (!srcNode || !dstNode)
+      return true;  // 保守策略：如果节点不存在，认为有冲突
+    
+    // 获取写入的memref
+    DenseSet<Value> srcWrites, dstWrites;
+    for (Operation *storeOp : srcNode->stores) {
+      auto writeOp = dyn_cast<AffineWriteOpInterface>(storeOp);
+      if (writeOp)
+        srcWrites.insert(writeOp.getMemRef());
+    }
+    for (Operation *storeOp : dstNode->stores) {
+      auto writeOp = dyn_cast<AffineWriteOpInterface>(storeOp);
+      if (writeOp)
+        dstWrites.insert(writeOp.getMemRef());
+    }
+    
+    // 检查是否有写-写冲突
+    for (Value srcMemref : srcWrites) {
+      if (dstWrites.contains(srcMemref)) {
+        return true;
+      }
+    }
+    
+    return false;
+  }
+
+  bool fuseIndependentLoops(AffineForOp srcLoop, AffineForOp dstLoop) {
+    LLVM_DEBUG(llvm::dbgs() << "Attempting to fuse independent loops\n");
+    
+    // 找到最内层的非循环操作来获取完整的嵌套结构
+    Operation *srcInnerOp = nullptr;
+    Operation *dstInnerOp = nullptr;
+    
+    srcLoop.walk([&](Operation *op) {
+      if (!isa<AffineForOp, AffineYieldOp>(op) && !srcInnerOp) {
+        srcInnerOp = op;
+        return WalkResult::interrupt();
+      }
+      return WalkResult::advance();
+    });
+    
+    dstLoop.walk([&](Operation *op) {
+      if (!isa<AffineForOp, AffineYieldOp>(op) && !dstInnerOp) {
+        dstInnerOp = op;
+        return WalkResult::interrupt();
+      }
+      return WalkResult::advance();
+    });
+    
+    if (!srcInnerOp || !dstInnerOp) {
+      LLVM_DEBUG(llvm::dbgs() << "Could not find inner operations\n");
+      return false;
+    }
+    
+    // 使用getAffineForIVs获取正确的循环嵌套
+    SmallVector<AffineForOp, 4> srcLoops, dstLoops;
+    getAffineForIVs(*srcInnerOp, &srcLoops);
+    getAffineForIVs(*dstInnerOp, &dstLoops);
+    
+    if (srcLoops.size() != dstLoops.size()) {
+      LLVM_DEBUG(llvm::dbgs() << "Nesting depths differ: src=" << srcLoops.size() 
+                              << ", dst=" << dstLoops.size() << "\n");
+      return false;
+    }
+    
+    LLVM_DEBUG(llvm::dbgs() << "Collected " << srcLoops.size() << " nested loops\n");
+    
+    // 创建IRMapping - 只映射归纳变量，让外部值保持原样
+    IRMapping valueMapping;
+    
+    // 映射所有层次的归纳变量
+    for (size_t i = 0; i < srcLoops.size(); ++i) {
+      Value srcIV = srcLoops[i].getInductionVar();
+      Value dstIV = dstLoops[i].getInductionVar();
+      valueMapping.map(srcIV, dstIV);
+      LLVM_DEBUG(llvm::dbgs() << "Mapping IV " << i << ": " << srcIV << " -> " << dstIV << "\n");
+    }
+    
+    // 获取最内层循环进行body合并
+    AffineForOp srcInnerLoop = srcLoops.back();
+    AffineForOp dstInnerLoop = dstLoops.back();
+    
+    // 创建builder
+    OpBuilder builder(dstInnerLoop);
+    builder.setInsertionPoint(dstInnerLoop.getBody()->getTerminator());
+    
+    // 克隆源循环最内层body中的所有操作
+    for (Operation &op : srcInnerLoop.getBody()->without_terminator()) {
+      Operation *clonedOp = builder.clone(op, valueMapping);
+      LLVM_DEBUG(llvm::dbgs() << "Cloned operation: " << op << "\n");
+      (void)clonedOp; // 避免未使用变量警告
+    }
+    
+    LLVM_DEBUG(llvm::dbgs() << "Successfully fused independent loops\n");
+    return true;
+  }
+
+  /// 独立循环融合的主函数 - 复用现有融合逻辑
+  // void runIndependentFusion() {
+  //   LLVM_DEBUG(llvm::dbgs() << "--- Independent Loop Fusion ---\n");
+  //   init();
+    
+  //   while (!worklist.empty()) {
+  //     unsigned dstId = worklist.back();
+  //     worklist.pop_back();
+      
+  //     // 跳过已删除的节点
+  //     if (mdg->nodes.count(dstId) == 0)
+  //       continue;
+      
+  //     auto *dstNode = mdg->getNode(dstId);
+  //     if (!isa<AffineForOp>(dstNode->op))
+  //       continue;
+      
+  //     auto dstAffineForOp = cast<AffineForOp>(dstNode->op);
+      
+  //     // // 检查目标循环是否适合融合
+  //     // if (!isEligibleForIndependentFusion(dstAffineForOp))
+  //     //   continue;
+      
+  //     LLVM_DEBUG(llvm::dbgs() << "Evaluating dst loop " << dstId << " for independent fusion\n");
+      
+  //     // 获取独立循环候选
+  //     SmallVector<unsigned, 16> srcIdCandidates;
+  //     getIndependentCandidates(dstId, mdg, srcIdCandidates);
+      
+  //     for (unsigned srcId : srcIdCandidates) {
+  //       auto *srcNode = mdg->getNode(srcId);
+  //       if (!srcNode) continue;
+        
+  //       auto srcAffineForOp = cast<AffineForOp>(srcNode->op);
+        
+  //       // // 检查源循环是否适合融合
+  //       // if (!isEligibleForIndependentFusion(srcAffineForOp))
+  //       //   continue;
+        
+  //       LLVM_DEBUG(llvm::dbgs() << "Attempting to fuse src loop " << srcId 
+  //                               << " into dst loop " << dstId << "\n");
+        
+  //       // 计算融合点
+  //       Operation *fusedLoopInsPoint =
+  //           mdg->getFusedLoopNestInsertionPoint(srcNode->id, dstNode->id);
+  //       if (fusedLoopInsPoint == nullptr)
+  //         continue;
+        
+  //       // 获取公共循环深度信息
+  //       SmallVector<AffineForOp, 4> surroundingLoops;
+  //       getAffineForIVs(*dstAffineForOp, &surroundingLoops);
+  //       unsigned numSurroundingLoops = surroundingLoops.size();
+        
+  //       // 尝试在不同深度进行融合
+  //       unsigned maxLegalFusionDepth = 0;
+  //       SmallVector<ComputationSliceState, 8> depthSliceUnions;
+  //       depthSliceUnions.resize(surroundingLoops.size());
+        
+  //       // 使用Generic策略进行可行性检查
+  //       FusionStrategy strategy(FusionStrategy::Generic);
+        
+  //       for (unsigned i = 1; i <= surroundingLoops.size(); ++i) {
+  //         FusionResult result =
+  //             affine::canFuseLoops(srcAffineForOp, dstAffineForOp,
+  //                               /*dstLoopDepth=*/i + numSurroundingLoops,
+  //                               &depthSliceUnions[i - 1], strategy);
+
+  //         if (result.value == FusionResult::Success)
+  //           maxLegalFusionDepth = i;
+  //       }
+
+  //       if (maxLegalFusionDepth == 0) {
+  //         LLVM_DEBUG(llvm::dbgs() << "Fusion not legal at any depth\n");
+  //         continue;
+  //       }
+        
+  //       // 选择最深的合法融合深度
+  //       unsigned bestDstLoopDepth = maxLegalFusionDepth;
+  //       ComputationSliceState &bestSlice = depthSliceUnions[bestDstLoopDepth - 1];
+        
+  //       // 使用MLIR内置的融合函数执行融合
+  //       fuseLoops(srcAffineForOp, dstAffineForOp, bestSlice);
+        
+  //       LLVM_DEBUG(llvm::dbgs() << "Successfully fused src loop " << srcId 
+  //                               << " into dst loop " << dstId << " at depth " << bestDstLoopDepth << "\n");
+        
+  //       // 移动融合后的循环到正确位置
+  //       if (fusedLoopInsPoint != dstAffineForOp)
+  //         dstAffineForOp->moveBefore(fusedLoopInsPoint);
+        
+  //       // 更新依赖图 - 复用现有逻辑
+  //       mdg->updateEdges(srcNode->id, dstNode->id, /*privateMemrefs=*/{}, /*removeSrcNode=*/true);
+        
+  //       // 重新收集目标循环状态
+  //       LoopNestStateCollector dstLoopCollector;
+  //       dstLoopCollector.collect(dstAffineForOp);
+        
+  //       mdg->clearNodeLoadAndStores(dstId);
+  //       mdg->addToNode(dstId, dstLoopCollector.loadOpInsts, dstLoopCollector.storeOpInsts);
+        
+  //       // 删除源循环
+  //       srcAffineForOp.erase();
+  //       mdg->removeNode(srcId);
+        
+  //       // 成功融合一个后，重新开始（因为图结构已改变）
+  //       break;
+  //     }
+  //   }
+  // }
+
+  // //这个版本在处理整段IR的时候，存在删除问题
+  // void runIndependentFusion() {
+  //   LLVM_DEBUG(llvm::dbgs() << "--- Independent Loop Fusion ---\n");
+  //   init();
+    
+  //   while (!worklist.empty()) {
+  //     unsigned dstId = worklist.back();
+  //     worklist.pop_back();
+      
+  //     // 跳过已删除的节点
+  //     if (mdg->nodes.count(dstId) == 0) {
+  //       LLVM_DEBUG(llvm::dbgs() << "Skipping removed node: " << dstId << "\n");
+  //       continue;
+  //     }
+      
+  //     auto *dstNode = mdg->getNode(dstId);
+  //     if (!isa<AffineForOp>(dstNode->op)) {
+  //       LLVM_DEBUG(llvm::dbgs() << "Skipping non-AffineForOp node: " << dstId << "\n");
+  //       continue;
+  //     }
+      
+  //     auto dstAffineForOp = cast<AffineForOp>(dstNode->op);
+      
+  //     LLVM_DEBUG(llvm::dbgs() << "Evaluating dst loop " << dstId << " for independent fusion\n");
+      
+  //     // 获取相邻的独立循环候选
+  //     SmallVector<unsigned, 4> srcIdCandidates;
+  //     getAdjacentIndependentCandidates(dstId, mdg, srcIdCandidates);
+      
+  //     if (srcIdCandidates.empty()) {
+  //       LLVM_DEBUG(llvm::dbgs() << "No adjacent candidates found for " << dstId << "\n");
+  //       continue;
+  //     }
+      
+  //     for (unsigned srcId : srcIdCandidates) {
+  //       auto *srcNode = mdg->getNode(srcId);
+  //       if (!srcNode) {
+  //         LLVM_DEBUG(llvm::dbgs() << "Source node not found: " << srcId << "\n");
+  //         continue;
+  //       }
+        
+  //       auto srcAffineForOp = cast<AffineForOp>(srcNode->op);
+        
+  //       LLVM_DEBUG(llvm::dbgs() << "Attempting to fuse adjacent src loop " << srcId 
+  //                               << " into dst loop " << dstId << "\n");
+        
+  //       // 对于独立循环，直接进行简单合并
+  //       if (fuseIndependentLoops(srcAffineForOp, dstAffineForOp)) {
+  //         LLVM_DEBUG(llvm::dbgs() << "Successfully fused adjacent loops " << srcId 
+  //                                 << " and " << dstId << "\n");
+          
+  //         // 更新依赖图
+  //         mdg->updateEdges(srcNode->id, dstNode->id, /*privateMemrefs=*/{}, /*removeSrcNode=*/true);
+          
+  //         // 重新收集目标循环状态
+  //         LoopNestStateCollector dstLoopCollector;
+  //         dstLoopCollector.collect(dstAffineForOp);
+          
+  //         mdg->clearNodeLoadAndStores(dstId);
+  //         mdg->addToNode(dstId, dstLoopCollector.loadOpInsts, dstLoopCollector.storeOpInsts);
+          
+  //         // 删除源循环
+  //         srcAffineForOp.erase();
+  //         mdg->removeNode(srcId);
+          
+  //         // 成功融合后，重新开始
+  //         break;
+  //       } else {
+  //         LLVM_DEBUG(llvm::dbgs() << "Failed to fuse loops " << srcId << " and " << dstId << "\n");
+  //       }
+  //     }
+  //   }
+    
+  //   LLVM_DEBUG(llvm::dbgs() << "Independent fusion completed\n");
+  // }
+
+  // 添加辅助函数：检查Value是否仍有使用者
+  static bool hasActiveUsers(Value value) {
+    return !value.use_empty();
+  }
+
+  // 添加辅助函数：安全删除操作
+  static void safeEraseOperation(Operation *op) {
+    LLVM_DEBUG(llvm::dbgs() << "Attempting to safely erase operation: " << *op << "\n");
+    
+    // 检查操作的所有结果是否还有使用者
+    for (Value result : op->getResults()) {
+      if (hasActiveUsers(result)) {
+        LLVM_DEBUG(llvm::dbgs() << "Warning: Operation still has active users: " << *op << "\n");
+        // 可以选择不删除，或者进一步处理
+        return;
+      }
+    }
+    
+    // 递归检查嵌套操作
+    if (op->getNumRegions() > 0) {
+      op->walk([&](Operation *nestedOp) {
+        if (nestedOp != op) {
+          for (Value result : nestedOp->getResults()) {
+            if (hasActiveUsers(result)) {
+              LLVM_DEBUG(llvm::dbgs() << "Warning: Nested operation still has active users: " << *nestedOp << "\n");
+            }
+          }
+        }
+        return WalkResult::advance();
+      });
+    }
+    
+    // 如果所有检查都通过，安全删除
+    op->erase();
+    LLVM_DEBUG(llvm::dbgs() << "Successfully erased operation\n");
+  }
+
+  // 检查操作是否允许存在于相邻循环之间
+  static bool isAllowedBetweenAdjacentLoops(Operation *op) {
+    // 1. 内存分配操作
+    if (isa<memref::AllocOp>(op) || isa<memref::AllocaOp>(op)) {
+      LLVM_DEBUG(llvm::dbgs() << "  -> Allowed: memory allocation\n");
+      return true;
+    }
+    
+    // 2. 常量操作
+    if (op->hasTrait<OpTrait::ConstantLike>()) {
+      LLVM_DEBUG(llvm::dbgs() << "  -> Allowed: constant operation\n");
+      return true;
+    }
+    
+    // 3. arith常量操作
+    if (isa<arith::ConstantOp>(op)) {
+      LLVM_DEBUG(llvm::dbgs() << "  -> Allowed: arith constant\n");
+      return true;
+    }
+    
+    // 4. memref.reinterpret_cast 操作
+    if (isa<memref::ReinterpretCastOp>(op)) {
+      LLVM_DEBUG(llvm::dbgs() << "  -> Allowed: memref reinterpret_cast\n");
+      return true;
+    }
+    
+    // 不允许的操作
+    LLVM_DEBUG(llvm::dbgs() << "  -> Disallowed: " << op->getName() << "\n");
+    return false;
+  }
+
+  // 允许中间有alloc和constant的相邻性检查
+  static bool areLoopsAdjacentWithAlloc(AffineForOp loop1, AffineForOp loop2) {
+    Operation *op1 = loop1.getOperation();
+    Operation *op2 = loop2.getOperation();
+    
+    LLVM_DEBUG(llvm::dbgs() << "Checking adjacency (with alloc tolerance) between two loops\n");
+    
+    // 检查是否在同一个block中
+    if (op1->getBlock() != op2->getBlock()) {
+      LLVM_DEBUG(llvm::dbgs() << "Loops are not in the same block\n");
+      return false;
+    }
+    
+    // 检查op1是否在op2之前
+    if (!op1->isBeforeInBlock(op2)) {
+      LLVM_DEBUG(llvm::dbgs() << "Loop1 is not before Loop2\n");
+      return false;
+    }
+    
+    // 检查中间的操作是否都是允许的
+    Operation *next = op1->getNextNode();
+    int operationsBetween = 0;
+    int allowedOps = 0;
+    int disallowedOps = 0;
+    
+    while (next && next != op2) {
+      operationsBetween++;
+      LLVM_DEBUG(llvm::dbgs() << "Operation between loops: " << *next << "\n");
+      
+      if (isAllowedBetweenAdjacentLoops(next)) {
+        allowedOps++;
+      } else {
+        disallowedOps++;
+        LLVM_DEBUG(llvm::dbgs() << "Found disallowed operation: " << next->getName() << "\n");
+        return false;
+      }
+      
+      next = next->getNextNode();
+    }
+    
+    bool adjacent = (next == op2);
+    LLVM_DEBUG(llvm::dbgs() << "Operations between loops: " << operationsBetween 
+                            << " (allowed: " << allowedOps << ", disallowed: " << disallowedOps << ")"
+                            << ", Adjacent: " << adjacent << "\n");
+    
+    return adjacent;
+  }
+
+  // 相邻候选查找函数 - 允许中间有alloc和constant
+  static void getAdjacentIndependentCandidates(unsigned dstId, MemRefDependenceGraph *mdg,
+                                            SmallVectorImpl<unsigned> &srcIdCandidates) {
+    auto *dstNode = mdg->getNode(dstId);
+    if (!dstNode) {
+      LLVM_DEBUG(llvm::dbgs() << "Destination node not found: " << dstId << "\n");
+      return;
+    }
+    
+    auto dstLoop = dyn_cast<AffineForOp>(dstNode->op);
+    if (!dstLoop) {
+      LLVM_DEBUG(llvm::dbgs() << "Destination is not an AffineForOp\n");
+      return;
+    }
+    
+    // 向前搜索AffineForOp，跳过允许的中间操作
+    Operation *currentOp = dstLoop->getPrevNode();
+    
+    // 跳过允许的操作直到找到AffineForOp或遇到不允许的操作
+    while (currentOp) {
+      LLVM_DEBUG(llvm::dbgs() << "Examining previous operation: " << *currentOp << "\n");
+      
+      if (auto srcLoop = dyn_cast<AffineForOp>(currentOp)) {
+        // 找到了一个AffineForOp，检查是否可以融合
+        auto *srcNode = mdg->getForOpNode(srcLoop);
+        if (!srcNode) {
+          LLVM_DEBUG(llvm::dbgs() << "Source node not found in MDG\n");
+          break;
+        }
+        
+        unsigned srcId = srcNode->id;
+        
+        // 使用允许alloc的相邻性检查
+        if (!areLoopsAdjacentWithAlloc(srcLoop, dstLoop)) {
+          LLVM_DEBUG(llvm::dbgs() << "Loops are not adjacent (even with alloc tolerance)\n");
+          break;
+        }
+        
+        // 检查循环结构是否相同
+        if (!haveSameIterationStructure(srcLoop, dstLoop)) {
+          LLVM_DEBUG(llvm::dbgs() << "Loop structures differ\n");
+          break;
+        }
+        
+        // 检查是否真正独立（无依赖关系）
+        if (mdg->hasDependencePath(srcId, dstId) || mdg->hasDependencePath(dstId, srcId)) {
+          LLVM_DEBUG(llvm::dbgs() << "Loops have dependence path\n");
+          break;
+        }
+        
+        // 检查写-写冲突
+        if (hasWriteWriteConflict(srcId, dstId, mdg)) {
+          LLVM_DEBUG(llvm::dbgs() << "Loops have write-write conflict\n");
+          break;
+        }
+        
+        srcIdCandidates.push_back(srcId);
+        LLVM_DEBUG(llvm::dbgs() << "Found adjacent candidate (with alloc tolerance): " << srcId << "\n");
+        break; // 只考虑最近的一个候选循环
+        
+      } else if (isAllowedBetweenAdjacentLoops(currentOp)) {
+        // 这是允许的中间操作，继续向前搜索
+        LLVM_DEBUG(llvm::dbgs() << "Skipping allowed intermediate operation\n");
+        currentOp = currentOp->getPrevNode();
+      } else {
+        // 遇到了不允许的操作，停止搜索
+        LLVM_DEBUG(llvm::dbgs() << "Encountered disallowed operation, stopping search\n");
+        break;
+      }
+    }
+  }
+
+  static void safeDeleteLoop(AffineForOp loopToDelete, MemRefDependenceGraph *mdg, unsigned nodeId) {
+    LLVM_DEBUG(llvm::dbgs() << "Safely deleting loop with node ID: " << nodeId << "\n");
+    
+    // 1. 首先检查是否还有未处理的Value使用
+    bool hasUnresolvedUses = false;
+    loopToDelete.walk([&](Operation *op) {
+      for (Value result : op->getResults()) {
+        if (!result.use_empty()) {
+          LLVM_DEBUG(llvm::dbgs() << "Found unresolved use of value: " << result << "\n");
+          for (Operation *user : result.getUsers()) {
+            LLVM_DEBUG(llvm::dbgs() << "  User: " << *user << "\n");
+          }
+          hasUnresolvedUses = true;
+        }
+      }
+      return WalkResult::advance();
+    });
+    
+    if (hasUnresolvedUses) {
+      LLVM_DEBUG(llvm::dbgs() << "Cannot delete loop: has unresolved uses\n");
+      return;
+    }
+    
+    // 2. 从依赖图中清理
+    mdg->clearNodeLoadAndStores(nodeId);
+    mdg->removeNode(nodeId);
+    
+    // 3. 删除循环操作
+    loopToDelete.erase();
+    
+    LLVM_DEBUG(llvm::dbgs() << "Successfully deleted loop\n");
+  }
+
+  //修复相邻性的识别问题
+  void runIndependentFusion() {
+    LLVM_DEBUG(llvm::dbgs() << "--- Independent Loop Fusion (Simplified) ---\n");
+    init();
+    
+    while (!worklist.empty()) {
+      unsigned dstId = worklist.back();
+      worklist.pop_back();
+      
+      if (mdg->nodes.count(dstId) == 0) {
+        LLVM_DEBUG(llvm::dbgs() << "Skipping removed node: " << dstId << "\n");
+        continue;
+      }
+      
+      auto *dstNode = mdg->getNode(dstId);
+      if (!isa<AffineForOp>(dstNode->op)) {
+        LLVM_DEBUG(llvm::dbgs() << "Skipping non-AffineForOp node: " << dstId << "\n");
+        continue;
+      }
+      
+      auto dstAffineForOp = cast<AffineForOp>(dstNode->op);
+      
+      LLVM_DEBUG(llvm::dbgs() << "Evaluating dst loop " << dstId << " for independent fusion\n");
+      
+      SmallVector<unsigned, 4> srcIdCandidates;
+      getAdjacentIndependentCandidates(dstId, mdg, srcIdCandidates);
+      
+      if (srcIdCandidates.empty()) {
+        LLVM_DEBUG(llvm::dbgs() << "No adjacent candidates found for " << dstId << "\n");
+        continue;
+      }
+      
+      for (unsigned srcId : srcIdCandidates) {
+        auto *srcNode = mdg->getNode(srcId);
+        if (!srcNode) {
+          LLVM_DEBUG(llvm::dbgs() << "Source node not found: " << srcId << "\n");
+          continue;
+        }
+        
+        auto srcAffineForOp = cast<AffineForOp>(srcNode->op);
+        
+        LLVM_DEBUG(llvm::dbgs() << "Attempting to fuse adjacent src loop " << srcId 
+                                << " into dst loop " << dstId << "\n");
+        
+        // 执行融合
+        if (fuseIndependentLoops(srcAffineForOp, dstAffineForOp)) {
+          LLVM_DEBUG(llvm::dbgs() << "Successfully fused adjacent loops " << srcId 
+                                  << " and " << dstId << "\n");
+          
+          // 更新目标循环的状态
+          LoopNestStateCollector dstLoopCollector;
+          dstLoopCollector.collect(dstAffineForOp);
+          
+          mdg->clearNodeLoadAndStores(dstId);
+          mdg->addToNode(dstId, dstLoopCollector.loadOpInsts, dstLoopCollector.storeOpInsts);
+          
+          // 更新依赖图
+          mdg->updateEdges(srcNode->id, dstNode->id, /*privateMemrefs=*/{}, /*removeSrcNode=*/false);
+          
+          // 清理源节点并删除源循环
+          mdg->clearNodeLoadAndStores(srcId);
+          mdg->removeNode(srcId);
+          srcAffineForOp.erase();
+          
+          LLVM_DEBUG(llvm::dbgs() << "Completed fusion and cleanup\n");
+          break;
+        } else {
+          LLVM_DEBUG(llvm::dbgs() << "Failed to fuse loops " << srcId << " and " << dstId << "\n");
+        }
+      }
+    }
+    
+    LLVM_DEBUG(llvm::dbgs() << "Independent fusion completed\n");
+  }
+
   /// 检查两个affine.for循环嵌套是否具有完全相同的结构
   /// 包括嵌套深度、每层循环的边界条件等 add py p
   static bool haveSameIterationCounts(AffineForOp srcLoop, AffineForOp dstLoop) {
@@ -1733,6 +2575,8 @@ void LoopFusion::runOnBlock(Block *block) {
     fusion.runProducerConsumerFusionOnly();
   else if (affineFusionMode == FusionMode::Sibling)
     fusion.runSiblingFusionOnly();
+  else if (affineFusionMode == FusionMode::Independent)  // 新增
+    fusion.runIndependentFusion();
   else
     fusion.runGreedyFusion();
 }
