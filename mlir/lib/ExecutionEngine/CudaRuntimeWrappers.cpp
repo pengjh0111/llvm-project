@@ -14,6 +14,7 @@
 
 #include "mlir/ExecutionEngine/CRunnerUtils.h"
 
+#include <map>
 #include <mutex>
 #include <cmath>
 #include <unordered_map>
@@ -28,6 +29,7 @@
 #include <cudnn.h>
 #include <cublas_v2.h>
 #include <cutensor.h>
+#include <cublasLt.h>
 #include "/data/dagongcheng/pjhtest/llvm-latest/llvm-project/mlir/lib/ExecutionEngine/SNN_kernel.h"
 #include "CudnnGraphBuilder.h"
 
@@ -250,9 +252,10 @@ struct StreamHandles {
   cudnnHandle_t cudnn_handle;
   cublasHandle_t cublas_handle;
   cutensorHandle_t cutensor_handle;
+  cublasLtHandle_t cublaslt_handle;
   bool valid;
   
-  StreamHandles() : cudnn_handle(nullptr), cublas_handle(nullptr), cutensor_handle(nullptr), valid(false) {}
+  StreamHandles() : cudnn_handle(nullptr), cublas_handle(nullptr), cutensor_handle(nullptr), cublaslt_handle(nullptr), valid(false) {}
 };
 
 // 全局handle映射表 - 使用更具体的名字避免冲突
@@ -288,7 +291,7 @@ extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuCreateHandlesForStream(CUstream st
     cudnnDestroy(handles.cudnn_handle);
     // return false;
   }
-  
+
   // 创建cuTENSOR句柄
   cutensorStatus_t cutensor_status = cutensorCreate(&handles.cutensor_handle);
   if (cutensor_status != CUTENSOR_STATUS_SUCCESS) {
@@ -296,6 +299,15 @@ extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuCreateHandlesForStream(CUstream st
             cutensorGetErrorString(cutensor_status));
     cudnnDestroy(handles.cudnn_handle);
     cublasDestroy(handles.cublas_handle);
+  }
+
+  // 创建cuBLASLt句柄
+  cublasStatus_t cublaslt_status = cublasLtCreate(&handles.cublaslt_handle);
+  if (cublaslt_status != CUBLAS_STATUS_SUCCESS) {
+    fprintf(stderr, "[HANDLE] Failed to create cuBLASLt handle: %d\n", cublaslt_status);
+    cudnnDestroy(handles.cudnn_handle);
+    cublasDestroy(handles.cublas_handle);
+    cutensorDestroy(handles.cutensor_handle);
     return;
   }
 
@@ -331,7 +343,9 @@ extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuDestroyHandlesForStream(CUstream s
       if (it->second.cutensor_handle != nullptr) {
         CUTENSOR_REPORT_IF_ERROR(cutensorDestroy(it->second.cutensor_handle));
       }
-
+      if (it->second.cublaslt_handle != nullptr) {
+        CUBLAS_REPORT_IF_ERROR(cublasLtDestroy(it->second.cublaslt_handle));
+      }
       // fprintf(stderr, "[HANDLE] Destroyed handle group for stream %p\n", stream);
     }
     g_mgpu_stream_handle_registry.erase(it);
@@ -483,10 +497,11 @@ struct PooledHandle {
   cudnnHandle_t cudnn_handle;
   cublasHandle_t cublas_handle;
   cutensorHandle_t cutensor_handle;
+  cublasLtHandle_t cublaslt_handle;
   bool in_use;
   int pool_index;
   
-  PooledHandle() : cudnn_handle(nullptr), cublas_handle(nullptr), cutensor_handle(nullptr),
+  PooledHandle() : cudnn_handle(nullptr), cublas_handle(nullptr), cutensor_handle(nullptr), cublaslt_handle(nullptr),
                   in_use(false), pool_index(-1) {}
 };
 
@@ -574,6 +589,32 @@ extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuInitHandlePool(int pool_size) {
       return;
     }
     
+    // // 创建cuBLASLt handle
+    // cublasStatus_t cublaslt_status = cublasLtCreate(&handle.cublaslt_handle);
+    // if (cublaslt_status != CUBLAS_STATUS_SUCCESS) {
+    //   fprintf(stderr, "[HANDLE POOL] FATAL: Failed to create cuBLASLt handle %d: status=%d\n", 
+    //           i, cublaslt_status);
+      
+    //   // 清理当前handle的cuDNN部分
+    //   cudnnDestroy(handle.cudnn_handle);
+    //   cublasDestroy(handle.cublas_handle);
+      
+    //   // 清理已创建的handles
+    //   for (int j = 0; j < i; j++) {
+    //     if (g_handle_pool[j].cudnn_handle) {
+    //       cudnnDestroy(g_handle_pool[j].cudnn_handle);
+    //     }
+    //     if (g_handle_pool[j].cublas_handle) {
+    //       cublasDestroy(g_handle_pool[j].cublas_handle);
+    //     }
+    //     if (g_handle_pool[j].cublaslt_handle) {
+    //       cublasLtDestroy(g_handle_pool[j].cublaslt_handle);
+    //     }
+    //   }
+    //   g_handle_pool.clear();
+    //   return;
+    // }
+
     // // 创建cuTENSOR handle
     // cutensorStatus_t cutensor_status = cutensorCreate(&handle.cutensor_handle);
     // if (cutensor_status != CUTENSOR_STATUS_SUCCESS) {
@@ -658,6 +699,15 @@ extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuDestroyHandlePool() {
       handle.cudnn_handle = nullptr;
     }
     
+    // if (handle.cublaslt_handle) {
+    //   cublasStatus_t status = cublasLtDestroy(handle.cublaslt_handle);
+    //   if (status != CUBLAS_STATUS_SUCCESS) {
+    //     fprintf(stderr, "[HANDLE POOL] Error destroying cuBLASLt handle %d: %d\n", 
+    //             (int)i, status);
+    //   }
+    //   handle.cublaslt_handle = nullptr;
+    // }
+
     // if (handle.cutensor_handle) {
     //   cutensorStatus_t status = cutensorDestroy(handle.cutensor_handle);
     //   if (status != CUTENSOR_STATUS_SUCCESS) {
@@ -834,6 +884,7 @@ static bool getPooledHandlesForStream(CUstream stream, StreamHandles& result_han
   result_handles.cudnn_handle = handle.cudnn_handle;
   result_handles.cublas_handle = handle.cublas_handle;
   // result_handles.cutensor_handle = handle.cutensor_handle;
+  // result_handles.cublaslt_handle = handle.cublaslt_handle;
   result_handles.valid = true;
   
   return true;
@@ -2442,6 +2493,873 @@ extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuReturnAllActiveWorkspaces() {
 static cudnnConvolutionFwdAlgo_t g_cached_algo = CUDNN_CONVOLUTION_FWD_ALGO_COUNT; // 无效值表示未初始化
 static bool g_algo_cached = false;
 
+/**
+ * cuDNN Multi-Head Attention Forward推理模式包装函数
+ * 注意：此API在cuDNN 9.0中已被废弃，但仍可在兼容版本中使用
+ * 
+ * 此函数内部处理所有描述符的创建、配置和销毁，简化用户接口
+ * 
+ * @param num_heads 注意力头数
+ * @param embed_dim 嵌入维度
+ * @param max_seq_len_q Q的最大序列长度
+ * @param max_seq_len_kv K,V的最大序列长度
+ * @param batch_size 批次大小
+ * @param curr_idx 当前时间步索引，负值表示处理所有时间步
+ * @param lo_win_idx 注意力窗口起始索引数组（host内存）
+ * @param hi_win_idx 注意力窗口结束索引数组（host内存）
+ * @param dev_seq_lengths_qo 设备端Q,O序列长度数组
+ * @param dev_seq_lengths_kv 设备端K,V序列长度数组
+ * @param queries query数据指针 [batch_size, max_seq_len_q, embed_dim]
+ * @param residuals 残差连接数据指针（可为NULL）
+ * @param keys key数据指针 [batch_size, max_seq_len_kv, embed_dim]
+ * @param values value数据指针 [batch_size, max_seq_len_kv, embed_dim] 
+ * @param output 输出数据指针 [batch_size, max_seq_len_q, embed_dim]
+ * @param weight_size_bytes 权重缓冲区大小（字节）
+ * @param weights 权重数据指针
+ * @param workspace_size_bytes 工作空间大小（字节），0表示使用默认大小
+ * @param stream CUDA流
+ */
+// extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuCudnnMultiHeadAttention(
+//     int num_heads,
+//     int embed_dim,
+//     int max_seq_len_q,
+//     int max_seq_len_kv,
+//     int batch_size,
+//     int curr_idx,
+//     const int* lo_win_idx,
+//     const int* hi_win_idx,
+//     const void* dev_seq_lengths_qo,
+//     const void* dev_seq_lengths_kv,
+//     const void* queries,
+//     const void* residuals,
+//     const void* keys,
+//     const void* values,
+//     void* output,
+//     size_t weight_size_bytes,
+//     const void* weights,
+//     size_t workspace_size_bytes,
+//     CUstream stream
+// ) {
+//     mgpuEnsureContext();
+    
+//     StreamHandles handles;
+//     if (!getHandlesForStream(stream, handles)) {
+//         fprintf(stderr, "[MHA] ERROR: Failed to get handles for stream %p\n", stream);
+//         return;
+//     }
+//     cudnnHandle_t handle = handles.cudnn_handle;
+    
+//     // 验证输入参数
+//     if (num_heads <= 0 || embed_dim <= 0 || max_seq_len_q <= 0 || 
+//         max_seq_len_kv <= 0 || batch_size <= 0) {
+//         fprintf(stderr, "[MHA] ERROR: Invalid dimensions: heads=%d, embed=%d, "
+//                 "seq_q=%d, seq_kv=%d, batch=%d\n", 
+//                 num_heads, embed_dim, max_seq_len_q, max_seq_len_kv, batch_size);
+//         return;
+//     }
+    
+//     if (!queries || !keys || !values || !output) {
+//         fprintf(stderr, "[MHA] ERROR: One or more data pointers are NULL\n");
+//         return;
+//     }
+    
+//     if (embed_dim % num_heads != 0) {
+//         fprintf(stderr, "[MHA] ERROR: embed_dim (%d) must be divisible by num_heads (%d)\n", 
+//                 embed_dim, num_heads);
+//         return;
+//     }
+    
+//     // 创建描述符
+//     cudnnAttnDescriptor_t attn_desc = nullptr;
+//     cudnnSeqDataDescriptor_t q_desc = nullptr, k_desc = nullptr;
+//     cudnnSeqDataDescriptor_t v_desc = nullptr, o_desc = nullptr;
+    
+//     cudnnStatus_t status = cudnnCreateAttnDescriptor(&attn_desc);
+//     if (status != CUDNN_STATUS_SUCCESS) {
+//         fprintf(stderr, "[MHA] ERROR: Failed to create attention descriptor: %s\n", 
+//                 cudnnGetErrorString(status));
+//         return;
+//     }
+    
+//     // 计算参数
+//     int head_dim = embed_dim / num_heads;
+//     double sm_scaler = 1.0 / sqrt((double)head_dim);
+    
+//     unsigned attnMode = 0;
+//     attnMode |= CUDNN_ATTN_DISABLE_PROJ_BIASES;
+//     attnMode |= CUDNN_ATTN_QUERYMAP_ALL_TO_ONE;
+    
+//     // 设置attention描述符
+//     status = cudnnSetAttnDescriptor(
+//         attn_desc,
+//         attnMode,
+//         num_heads,
+//         sm_scaler,
+//         CUDNN_DATA_FLOAT,
+//         CUDNN_DATA_FLOAT,
+//         CUDNN_DEFAULT_MATH,
+//         nullptr,
+//         nullptr,
+//         embed_dim,
+//         embed_dim,
+//         embed_dim,
+//         0,  // qProjSize
+//         0,  // kProjSize
+//         0,  // vProjSize
+//         0,  // oProjSize
+//         max_seq_len_q,
+//         max_seq_len_kv,
+//         batch_size,
+//         1   // beamSize
+//     );
+    
+//     if (status != CUDNN_STATUS_SUCCESS) {
+//         fprintf(stderr, "[MHA] ERROR: Failed to set attention descriptor: %s\n", 
+//                 cudnnGetErrorString(status));
+//         cudnnDestroyAttnDescriptor(attn_desc);
+//         return;
+//     }
+    
+//     // ========== 关键修改：获取cuDNN要求的真实buffer大小 ==========
+//     size_t required_weight_size = 0;
+//     size_t required_workspace_size = 0;
+    
+//     status = cudnnGetMultiHeadAttnBuffers(
+//         handle,
+//         attn_desc,
+//         &required_weight_size,
+//         &required_workspace_size,
+//         nullptr  // 推理模式，不需要reserve space
+//     );
+    
+//     if (status != CUDNN_STATUS_SUCCESS) {
+//         fprintf(stderr, "[MHA] ERROR: cudnnGetMultiHeadAttnBuffers failed: %s\n", 
+//                 cudnnGetErrorString(status));
+//         cudnnDestroyAttnDescriptor(attn_desc);
+//         return;
+//     }
+    
+//     fprintf(stderr, "[MHA] cuDNN required sizes: weights=%.2f MB, workspace=%.2f MB\n",
+//             required_weight_size / (1024.0 * 1024.0),
+//             required_workspace_size / (1024.0 * 1024.0));
+    
+//     // 验证weights参数
+//     if (required_weight_size > 0 && weights == nullptr) {
+//         fprintf(stderr, "[MHA] ERROR: cuDNN requires weights (%.2f MB) but none provided\n",
+//                 required_weight_size / (1024.0 * 1024.0));
+//         cudnnDestroyAttnDescriptor(attn_desc);
+//         return;
+//     }
+    
+//     // 创建序列数据描述符
+//     status = cudnnCreateSeqDataDescriptor(&q_desc);
+//     if (status != CUDNN_STATUS_SUCCESS) {
+//         fprintf(stderr, "[MHA] ERROR: Failed to create Q descriptor: %s\n", 
+//                 cudnnGetErrorString(status));
+//         cudnnDestroyAttnDescriptor(attn_desc);
+//         return;
+//     }
+    
+//     status = cudnnCreateSeqDataDescriptor(&k_desc);
+//     if (status != CUDNN_STATUS_SUCCESS) {
+//         fprintf(stderr, "[MHA] ERROR: Failed to create K descriptor: %s\n", 
+//                 cudnnGetErrorString(status));
+//         cudnnDestroySeqDataDescriptor(q_desc);
+//         cudnnDestroyAttnDescriptor(attn_desc);
+//         return;
+//     }
+    
+//     status = cudnnCreateSeqDataDescriptor(&v_desc);
+//     if (status != CUDNN_STATUS_SUCCESS) {
+//         fprintf(stderr, "[MHA] ERROR: Failed to create V descriptor: %s\n", 
+//                 cudnnGetErrorString(status));
+//         cudnnDestroySeqDataDescriptor(k_desc);
+//         cudnnDestroySeqDataDescriptor(q_desc);
+//         cudnnDestroyAttnDescriptor(attn_desc);
+//         return;
+//     }
+    
+//     status = cudnnCreateSeqDataDescriptor(&o_desc);
+//     if (status != CUDNN_STATUS_SUCCESS) {
+//         fprintf(stderr, "[MHA] ERROR: Failed to create O descriptor: %s\n", 
+//                 cudnnGetErrorString(status));
+//         cudnnDestroySeqDataDescriptor(v_desc);
+//         cudnnDestroySeqDataDescriptor(k_desc);
+//         cudnnDestroySeqDataDescriptor(q_desc);
+//         cudnnDestroyAttnDescriptor(attn_desc);
+//         return;
+//     }
+    
+//     // ========== 修改：使用持久化的序列长度数组 ==========
+//     // 分配host端持久化数组
+//     int* q_seq_lengths_host = new int[batch_size];
+//     int* kv_seq_lengths_host = new int[batch_size];
+    
+//     for (int i = 0; i < batch_size; i++) {
+//         q_seq_lengths_host[i] = max_seq_len_q;
+//         kv_seq_lengths_host[i] = max_seq_len_kv;
+//     }
+    
+//     // 设置Q描述符
+//     int q_dims[CUDNN_SEQDATA_DIM_COUNT];
+//     q_dims[CUDNN_SEQDATA_BEAM_DIM] = 1;
+//     q_dims[CUDNN_SEQDATA_BATCH_DIM] = batch_size;
+//     q_dims[CUDNN_SEQDATA_TIME_DIM] = max_seq_len_q;
+//     q_dims[CUDNN_SEQDATA_VECT_DIM] = embed_dim;
+    
+//     cudnnSeqDataAxis_t q_axes[CUDNN_SEQDATA_DIM_COUNT];
+//     q_axes[0] = CUDNN_SEQDATA_BEAM_DIM;
+//     q_axes[1] = CUDNN_SEQDATA_BATCH_DIM;
+//     q_axes[2] = CUDNN_SEQDATA_TIME_DIM;
+//     q_axes[3] = CUDNN_SEQDATA_VECT_DIM;
+    
+//     status = cudnnSetSeqDataDescriptor(
+//         q_desc, 
+//         CUDNN_DATA_FLOAT, 
+//         CUDNN_SEQDATA_DIM_COUNT,
+//         q_dims, 
+//         q_axes,
+//         batch_size,
+//         q_seq_lengths_host,
+//         nullptr
+//     );
+    
+//     if (status != CUDNN_STATUS_SUCCESS) {
+//         fprintf(stderr, "[MHA] ERROR: Failed to set Q descriptor: %s\n", 
+//                 cudnnGetErrorString(status));
+//         delete[] q_seq_lengths_host;
+//         delete[] kv_seq_lengths_host;
+//         if (o_desc) cudnnDestroySeqDataDescriptor(o_desc);
+//         if (v_desc) cudnnDestroySeqDataDescriptor(v_desc);
+//         if (k_desc) cudnnDestroySeqDataDescriptor(k_desc);
+//         if (q_desc) cudnnDestroySeqDataDescriptor(q_desc);
+//         if (attn_desc) cudnnDestroyAttnDescriptor(attn_desc);
+//     }
+    
+//     // 设置K描述符
+//     int k_dims[CUDNN_SEQDATA_DIM_COUNT];
+//     k_dims[CUDNN_SEQDATA_BEAM_DIM] = 1;
+//     k_dims[CUDNN_SEQDATA_BATCH_DIM] = batch_size;
+//     k_dims[CUDNN_SEQDATA_TIME_DIM] = max_seq_len_kv;
+//     k_dims[CUDNN_SEQDATA_VECT_DIM] = embed_dim;
+    
+//     cudnnSeqDataAxis_t kv_axes[CUDNN_SEQDATA_DIM_COUNT];
+//     kv_axes[0] = CUDNN_SEQDATA_BEAM_DIM;
+//     kv_axes[1] = CUDNN_SEQDATA_BATCH_DIM;
+//     kv_axes[2] = CUDNN_SEQDATA_TIME_DIM;
+//     kv_axes[3] = CUDNN_SEQDATA_VECT_DIM;
+    
+//     status = cudnnSetSeqDataDescriptor(
+//         k_desc, 
+//         CUDNN_DATA_FLOAT, 
+//         CUDNN_SEQDATA_DIM_COUNT,
+//         k_dims, 
+//         kv_axes,
+//         batch_size,
+//         kv_seq_lengths_host,
+//         nullptr
+//     );
+    
+//     if (status != CUDNN_STATUS_SUCCESS) {
+//         fprintf(stderr, "[MHA] ERROR: Failed to set K descriptor: %s\n", 
+//                 cudnnGetErrorString(status));
+//         delete[] q_seq_lengths_host;
+//         delete[] kv_seq_lengths_host;
+//         if (o_desc) cudnnDestroySeqDataDescriptor(o_desc);
+//         if (v_desc) cudnnDestroySeqDataDescriptor(v_desc);
+//         if (k_desc) cudnnDestroySeqDataDescriptor(k_desc);
+//         if (q_desc) cudnnDestroySeqDataDescriptor(q_desc);
+//         if (attn_desc) cudnnDestroyAttnDescriptor(attn_desc);
+//     }
+    
+//     // 设置V描述符（与K相同）
+//     status = cudnnSetSeqDataDescriptor(
+//         v_desc, 
+//         CUDNN_DATA_FLOAT, 
+//         CUDNN_SEQDATA_DIM_COUNT,
+//         k_dims, 
+//         kv_axes,
+//         batch_size,
+//         kv_seq_lengths_host,
+//         nullptr
+//     );
+    
+//     if (status != CUDNN_STATUS_SUCCESS) {
+//         fprintf(stderr, "[MHA] ERROR: Failed to set V descriptor: %s\n", 
+//                 cudnnGetErrorString(status));
+//         delete[] q_seq_lengths_host;
+//         delete[] kv_seq_lengths_host;
+//         if (o_desc) cudnnDestroySeqDataDescriptor(o_desc);
+//         if (v_desc) cudnnDestroySeqDataDescriptor(v_desc);
+//         if (k_desc) cudnnDestroySeqDataDescriptor(k_desc);
+//         if (q_desc) cudnnDestroySeqDataDescriptor(q_desc);
+//         if (attn_desc) cudnnDestroyAttnDescriptor(attn_desc);
+//     }
+    
+//     // 设置O描述符（与Q相同）
+//     status = cudnnSetSeqDataDescriptor(
+//         o_desc, 
+//         CUDNN_DATA_FLOAT, 
+//         CUDNN_SEQDATA_DIM_COUNT,
+//         q_dims, 
+//         q_axes,
+//         batch_size,
+//         q_seq_lengths_host,
+//         nullptr
+//     );
+    
+//     if (status != CUDNN_STATUS_SUCCESS) {
+//         fprintf(stderr, "[MHA] ERROR: Failed to set O descriptor: %s\n", 
+//                 cudnnGetErrorString(status));
+//         delete[] q_seq_lengths_host;
+//         delete[] kv_seq_lengths_host;
+//         if (o_desc) cudnnDestroySeqDataDescriptor(o_desc);
+//         if (v_desc) cudnnDestroySeqDataDescriptor(v_desc);
+//         if (k_desc) cudnnDestroySeqDataDescriptor(k_desc);
+//         if (q_desc) cudnnDestroySeqDataDescriptor(q_desc);
+//         if (attn_desc) cudnnDestroyAttnDescriptor(attn_desc);
+//     }
+    
+//     // ========== 工作空间分配：使用cuDNN要求的大小 ==========
+//     void* workspace = nullptr;
+//     bool workspace_allocated = false;
+//     bool using_workspace_pool = false;
+//     size_t actual_workspace_size = required_workspace_size;
+    
+//     if (actual_workspace_size > 0) {
+//         workspace = acquirePooledWorkspace(actual_workspace_size, stream, TENSOR_CORE_ALIGNMENT);
+        
+//         if (workspace != nullptr) {
+//             using_workspace_pool = true;
+//         } else {
+//             CUdeviceptr workspace_ptr = allocateAlignedMemory(actual_workspace_size, TENSOR_CORE_ALIGNMENT);
+//             if (workspace_ptr != 0) {
+//                 workspace = reinterpret_cast<void*>(workspace_ptr);
+//                 workspace_allocated = true;
+//                 fprintf(stderr, "[MHA] Using dynamic workspace (%.2f MB)\n", 
+//                         actual_workspace_size / (1024.0 * 1024.0));
+//             } else {
+//                 fprintf(stderr, "[MHA] ERROR: Failed to allocate workspace of %.2f MB\n", 
+//                         actual_workspace_size / (1024.0 * 1024.0));
+//                 delete[] q_seq_lengths_host;
+//                 delete[] kv_seq_lengths_host;
+//                 if (o_desc) cudnnDestroySeqDataDescriptor(o_desc);
+//                 if (v_desc) cudnnDestroySeqDataDescriptor(v_desc);
+//                 if (k_desc) cudnnDestroySeqDataDescriptor(k_desc);
+//                 if (q_desc) cudnnDestroySeqDataDescriptor(q_desc);
+//                 if (attn_desc) cudnnDestroyAttnDescriptor(attn_desc);
+//             }
+//         }
+//     }
+    
+//     // 类型转换设备端序列长度数组
+//     const int* dev_seq_qo = static_cast<const int*>(dev_seq_lengths_qo);
+//     const int* dev_seq_kv = static_cast<const int*>(dev_seq_lengths_kv);
+    
+//     // ========== 执行Multi-Head Attention前向传播 ==========
+//     status = cudnnMultiHeadAttnForward(
+//         handle,
+//         attn_desc,
+//         curr_idx,
+//         lo_win_idx,
+//         hi_win_idx,
+//         dev_seq_qo,
+//         dev_seq_kv,
+//         q_desc,
+//         queries,
+//         residuals,  // 可以为NULL
+//         k_desc,
+//         keys,
+//         v_desc,
+//         values,
+//         o_desc,
+//         output,
+//         required_weight_size,                    // 使用cuDNN返回的大小
+//         required_weight_size > 0 ? weights : nullptr,  // 如果size>0则必须提供weights
+//         actual_workspace_size,                   // 使用cuDNN返回的大小
+//         workspace,
+//         0,
+//         nullptr
+//     );
+    
+//     if (status != CUDNN_STATUS_SUCCESS) {
+//         fprintf(stderr, "[MHA] ERROR: cudnnMultiHeadAttnForward failed: %s\n", 
+//                 cudnnGetErrorString(status));
+//     }
+    
+//     // 清理host端序列长度数组
+//     delete[] q_seq_lengths_host;
+//     delete[] kv_seq_lengths_host;
+    
+//     // 清理工作空间
+//     if (workspace_allocated && workspace) {
+//         CUresult result = cuMemFree(reinterpret_cast<CUdeviceptr>(workspace));
+//         if (result != CUDA_SUCCESS) {
+//             fprintf(stderr, "[MHA] WARNING: Failed to free workspace\n");
+//         }
+//     }
+// }
+
+// 窗口数组缓存结构
+struct AttentionWindowCache {
+    int* lo_win_array;
+    int* hi_win_array;
+    int seq_len;
+};
+
+// 全局缓存：key是seq_len，value是对应的窗口数组
+static std::map<int, AttentionWindowCache> g_win_cache;
+static std::mutex g_win_cache_mutex;
+
+// 获取或创建窗口数组
+static bool getOrCreateWindowArrays(int seq_len_q, int seq_len_k, 
+                                     int*& lo_win, int*& hi_win) {
+    std::lock_guard<std::mutex> lock(g_win_cache_mutex);
+    
+    // 检查缓存
+    auto it = g_win_cache.find(seq_len_q);
+    if (it != g_win_cache.end()) {
+        lo_win = it->second.lo_win_array;
+        hi_win = it->second.hi_win_array;
+        return true;
+    }
+    
+    // 创建新的窗口数组
+    int* lo_array = new int[seq_len_q];
+    int* hi_array = new int[seq_len_q];
+    
+    // 初始化为全注意力
+    for (int i = 0; i < seq_len_q; i++) {
+        lo_array[i] = 0;
+        hi_array[i] = seq_len_k;  // 或使用 INT_MAX
+    }
+    
+    // 存入缓存
+    AttentionWindowCache cache;
+    cache.lo_win_array = lo_array;
+    cache.hi_win_array = hi_array;
+    cache.seq_len = seq_len_q;
+    
+    g_win_cache[seq_len_q] = cache;
+    
+    lo_win = lo_array;
+    hi_win = hi_array;
+    return true;
+}
+
+// cuDNN Multi-Head Attention wrapper function (Inference only)
+extern "C" MLIR_CUDA_WRAPPERS_EXPORT void
+mgpuCudnnMultiHeadAttention(
+    // Attention parameters
+    int batch_size,
+    int num_heads,
+    int seq_len_q,
+    int seq_len_k,
+    int q_size,              // Input Q feature size
+    int k_size,              // Input K feature size  
+    int v_size,              // Input V feature size
+    int q_proj_size,         // Q projection size (0 = no projection)
+    int k_proj_size,         // K projection size (0 = no projection)
+    int v_proj_size,         // V projection size (0 = no projection)
+    int o_proj_size,         // O projection size (0 = no projection)
+    double sm_scaler,        // Softmax scaler (typically 1/sqrt(head_size))
+    
+    // Input data pointers
+    void* q_data,            // Query input [batch_size, seq_len_q, q_size]
+    void* k_data,            // Key input [batch_size, seq_len_k, k_size]
+    void* v_data,            // Value input [batch_size, seq_len_k, v_size]
+    
+    // Weight pointer (can be NULL if no projections)
+    void* weights_data,      // Combined weights buffer
+    
+    // Output data pointer
+    void* output_data,       // Output [batch_size, seq_len_q, output_size]
+    
+    // Optional attention window parameters
+    int* lo_win_idx,         // Lower attention window indices (can be NULL for full attention)
+    int* hi_win_idx,         // Upper attention window indices (can be NULL for full attention)
+    
+    CUstream stream          // CUDA stream
+) {
+    // Ensure CUDA context
+    mgpuEnsureContext();
+    
+    // Get handles for this stream
+    StreamHandles handles;
+    if (!getHandlesForStream(stream, handles)) {
+        return; // Error already printed
+    }
+    cudnnHandle_t handle = handles.cudnn_handle;
+    
+    // Create descriptors
+    cudnnAttnDescriptor_t attn_desc;
+    cudnnSeqDataDescriptor_t q_desc;
+    cudnnSeqDataDescriptor_t k_desc;
+    cudnnSeqDataDescriptor_t v_desc;
+    cudnnSeqDataDescriptor_t o_desc;
+    
+    CUDNN_REPORT_IF_ERROR(cudnnCreateAttnDescriptor(&attn_desc));
+    CUDNN_REPORT_IF_ERROR(cudnnCreateSeqDataDescriptor(&q_desc));
+    CUDNN_REPORT_IF_ERROR(cudnnCreateSeqDataDescriptor(&k_desc));
+    CUDNN_REPORT_IF_ERROR(cudnnCreateSeqDataDescriptor(&v_desc));
+    CUDNN_REPORT_IF_ERROR(cudnnCreateSeqDataDescriptor(&o_desc));
+    
+    // Set attention mode flags (no bias, no dropout for inference)
+    unsigned attn_mode = CUDNN_ATTN_DISABLE_PROJ_BIASES | CUDNN_ATTN_QUERYMAP_ALL_TO_ONE;
+    
+    // Calculate output size
+    int o_size = o_proj_size > 0 ? o_proj_size : 
+                 ((v_proj_size > 0 ? v_proj_size : v_size) * num_heads);
+    
+    // Set attention descriptor
+    CUDNN_REPORT_IF_ERROR(cudnnSetAttnDescriptor(
+        attn_desc,
+        attn_mode,
+        num_heads,
+        sm_scaler,
+        CUDNN_DATA_FLOAT,      // dataType
+        CUDNN_DATA_FLOAT,      // compPrec
+        CUDNN_DEFAULT_MATH,    // mathType
+        NULL,                  // dropoutDesc (no dropout for inference)
+        NULL,                  // attnDropoutDesc
+        q_size,
+        k_size,
+        v_size,
+        q_proj_size,
+        k_proj_size,
+        v_proj_size,
+        o_proj_size,
+        seq_len_q,
+        seq_len_k,
+        batch_size,
+        1                      // beamSize = 1
+    ));
+    
+    // Setup sequence arrays
+    int beam_size = 1;
+    int q_batches = batch_size * beam_size;
+    int k_batches = batch_size;
+    
+    std::vector<int> q_seq_array(q_batches, seq_len_q);
+    std::vector<int> k_seq_array(k_batches, seq_len_k);
+    
+    // Allocate device sequence arrays
+    CUdeviceptr dev_q_seq_ptr = 0;
+    CUdeviceptr dev_k_seq_ptr = 0;
+    
+    CUDA_REPORT_IF_ERROR(cuMemAlloc(&dev_q_seq_ptr, q_batches * sizeof(int)));
+    CUDA_REPORT_IF_ERROR(cuMemAlloc(&dev_k_seq_ptr, k_batches * sizeof(int)));
+    CUDA_REPORT_IF_ERROR(cuMemcpyHtoD(dev_q_seq_ptr, q_seq_array.data(), 
+                                      q_batches * sizeof(int)));
+    CUDA_REPORT_IF_ERROR(cuMemcpyHtoD(dev_k_seq_ptr, k_seq_array.data(), 
+                                      k_batches * sizeof(int)));
+    
+    int* dev_q_seq = reinterpret_cast<int*>(dev_q_seq_ptr);
+    int* dev_k_seq = reinterpret_cast<int*>(dev_k_seq_ptr);
+    
+    // Setup sequence data descriptors
+    int dim_a[CUDNN_SEQDATA_DIM_COUNT];
+    cudnnSeqDataAxis_t data_axes[CUDNN_SEQDATA_DIM_COUNT] = {
+        CUDNN_SEQDATA_BEAM_DIM,
+        CUDNN_SEQDATA_BATCH_DIM,
+        CUDNN_SEQDATA_TIME_DIM,
+        CUDNN_SEQDATA_VECT_DIM
+    };
+    
+    // Q descriptor
+    dim_a[CUDNN_SEQDATA_BEAM_DIM] = beam_size;
+    dim_a[CUDNN_SEQDATA_BATCH_DIM] = batch_size;
+    dim_a[CUDNN_SEQDATA_TIME_DIM] = seq_len_q;
+    dim_a[CUDNN_SEQDATA_VECT_DIM] = q_size;
+    CUDNN_REPORT_IF_ERROR(cudnnSetSeqDataDescriptor(
+        q_desc, CUDNN_DATA_FLOAT, CUDNN_SEQDATA_DIM_COUNT, 
+        dim_a, data_axes, q_batches, q_seq_array.data(), NULL
+    ));
+    
+    // K descriptor
+    dim_a[CUDNN_SEQDATA_BEAM_DIM] = 1;
+    dim_a[CUDNN_SEQDATA_BATCH_DIM] = batch_size;
+    dim_a[CUDNN_SEQDATA_TIME_DIM] = seq_len_k;
+    dim_a[CUDNN_SEQDATA_VECT_DIM] = k_size;
+    CUDNN_REPORT_IF_ERROR(cudnnSetSeqDataDescriptor(
+        k_desc, CUDNN_DATA_FLOAT, CUDNN_SEQDATA_DIM_COUNT,
+        dim_a, data_axes, k_batches, k_seq_array.data(), NULL
+    ));
+    
+    // V descriptor
+    dim_a[CUDNN_SEQDATA_VECT_DIM] = v_size;
+    CUDNN_REPORT_IF_ERROR(cudnnSetSeqDataDescriptor(
+        v_desc, CUDNN_DATA_FLOAT, CUDNN_SEQDATA_DIM_COUNT,
+        dim_a, data_axes, k_batches, k_seq_array.data(), NULL
+    ));
+    
+    // O descriptor
+    dim_a[CUDNN_SEQDATA_BEAM_DIM] = beam_size;
+    dim_a[CUDNN_SEQDATA_TIME_DIM] = seq_len_q;
+    dim_a[CUDNN_SEQDATA_VECT_DIM] = o_size;
+    CUDNN_REPORT_IF_ERROR(cudnnSetSeqDataDescriptor(
+        o_desc, CUDNN_DATA_FLOAT, CUDNN_SEQDATA_DIM_COUNT,
+        dim_a, data_axes, q_batches, q_seq_array.data(), NULL
+    ));
+    
+    // Get buffer sizes (inference mode: no reserve space needed)
+    size_t size_weights = 0, size_wkspace = 0;
+    CUDNN_REPORT_IF_ERROR(cudnnGetMultiHeadAttnBuffers(
+        handle, attn_desc, &size_weights, &size_wkspace, NULL
+    ));
+    
+    printf("cuDNN requires %zu bytes for weights\n", size_weights);
+    printf("That's %zu floats\n", size_weights / sizeof(float));
+
+    // Allocate workspace
+    void* workspace = nullptr;
+    bool using_pool = false;
+    
+    if (size_wkspace > 0) {
+        // Try to get workspace from pool
+        workspace = acquirePooledWorkspace(size_wkspace, stream);
+        if (workspace != nullptr) {
+            using_pool = true;
+        } else {
+            // Fallback to dynamic allocation
+            CUdeviceptr ws_ptr = 0;
+            CUresult result = cuMemAlloc(&ws_ptr, size_wkspace);
+            if (result == CUDA_SUCCESS) {
+                workspace = reinterpret_cast<void*>(ws_ptr);
+            } else {
+                fprintf(stderr, "[MHA] ERROR: Failed to allocate workspace of size %zu bytes\n", 
+                        size_wkspace);
+                // Cleanup and return
+                cuMemFree(dev_q_seq_ptr);
+                cuMemFree(dev_k_seq_ptr);
+                cudnnDestroyAttnDescriptor(attn_desc);
+                cudnnDestroySeqDataDescriptor(q_desc);
+                cudnnDestroySeqDataDescriptor(k_desc);
+                cudnnDestroySeqDataDescriptor(v_desc);
+                cudnnDestroySeqDataDescriptor(o_desc);
+                return;
+            }
+        }
+    }
+
+    // ========== 处理注意力窗口 ==========
+    int* lo_win_ptr = lo_win_idx;
+    int* hi_win_ptr = hi_win_idx;
+    
+    // 如果用户传NULL，从缓存获取或创建
+    if (lo_win_idx == nullptr || hi_win_idx == nullptr) {
+        if (!getOrCreateWindowArrays(seq_len_q, seq_len_k, 
+                                     lo_win_ptr, hi_win_ptr)) {
+            fprintf(stderr, "[MHA] ERROR: Failed to get window arrays\n");
+            return;
+        }
+    }
+
+    // Execute forward pass
+    CUDNN_REPORT_IF_ERROR(cudnnMultiHeadAttnForward(
+        handle,
+        attn_desc,
+        -1,                    // currIdx (-1 for full sequence)
+        lo_win_ptr,            // loWinIdx (NULL for full attention)
+        hi_win_ptr,            // hiWinIdx (NULL for full attention)
+        dev_q_seq,
+        dev_k_seq,
+        q_desc,
+        q_data,
+        NULL,                  // residual link (not used)
+        k_desc,
+        k_data,
+        v_desc,
+        v_data,
+        o_desc,
+        output_data,
+        size_weights,
+        size_weights > 0 ? weights_data : NULL,
+        size_wkspace,
+        workspace,
+        0,                     // sizeReserve (0 for inference)
+        NULL                   // reserveSpace (NULL for inference)
+    ));
+    
+    // Cleanup
+    if (workspace != nullptr && !using_pool) {
+        CUDA_REPORT_IF_ERROR(cuMemFree(reinterpret_cast<CUdeviceptr>(workspace)));
+    }
+    
+    CUDA_REPORT_IF_ERROR(cuMemFree(dev_q_seq_ptr));
+    CUDA_REPORT_IF_ERROR(cuMemFree(dev_k_seq_ptr));
+    
+    CUDNN_REPORT_IF_ERROR(cudnnDestroyAttnDescriptor(attn_desc));
+    CUDNN_REPORT_IF_ERROR(cudnnDestroySeqDataDescriptor(q_desc));
+    CUDNN_REPORT_IF_ERROR(cudnnDestroySeqDataDescriptor(k_desc));
+    CUDNN_REPORT_IF_ERROR(cudnnDestroySeqDataDescriptor(v_desc));
+    CUDNN_REPORT_IF_ERROR(cudnnDestroySeqDataDescriptor(o_desc));
+}
+
+extern "C" MLIR_CUDA_WRAPPERS_EXPORT void
+mgpuCudnnLayerNorm(
+    int batch_size, int feature_size, int seq_len,  // 输入维度 (N, C, L)
+    void* input_data,                               // 输入数据指针
+    void* gamma_data,                               // scale参数 (可以为null)
+    void* beta_data,                                // bias参数 (可以为null) 
+    void* output_data,                              // 输出数据指针
+    float epsilon,                                  // epsilon值
+    CUstream stream                                 // CUDA流
+) {
+    // 确保使用全局上下文
+    mgpuEnsureContext();
+    
+    // 获取此流的句柄
+    StreamHandles handles;
+    if (!getHandlesForStream(stream, handles)) {
+        return; // 错误信息已在getHandlesForStream中打印
+    }
+    cudnnHandle_t handle = handles.cudnn_handle;
+    
+    // 从池中获取tensor描述符
+    cudnnTensorDescriptor_t inputDesc = acquireTensorDescriptor();
+    cudnnTensorDescriptor_t outputDesc = acquireTensorDescriptor();
+    cudnnTensorDescriptor_t scaleDesc = acquireTensorDescriptor();
+    cudnnTensorDescriptor_t biasDesc = acquireTensorDescriptor();
+    cudnnTensorDescriptor_t meanVarDesc = acquireTensorDescriptor();
+    
+    // 为了实现LayerNorm，我们需要重新组织维度
+    // LayerNorm在最后一维进行归一化，我们将其转换为BatchNorm可以处理的形式
+    // 原始形状: [batch_size, feature_size, seq_len]
+    // 重新组织为: [batch_size * feature_size, seq_len, 1, 1] 来使用BatchNorm的SPATIAL模式
+    
+    int reshapedN = batch_size * feature_size;  // 合并前两个维度
+    int reshapedC = seq_len;                    // 归一化维度变成channel维度
+    int reshapedH = 1;
+    int reshapedW = 1;
+    
+    // 设置重新形状后的输入描述符
+    CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
+        inputDesc,
+        CUDNN_TENSOR_NCHW,
+        CUDNN_DATA_FLOAT,
+        reshapedN, reshapedC, reshapedH, reshapedW
+    ));
+    
+    // 输出描述符与输入相同
+    CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
+        outputDesc,
+        CUDNN_TENSOR_NCHW,
+        CUDNN_DATA_FLOAT,
+        reshapedN, reshapedC, reshapedH, reshapedW
+    ));
+    
+    // scale和bias描述符 - 对应channel维度
+    CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
+        scaleDesc,
+        CUDNN_TENSOR_NCHW,
+        CUDNN_DATA_FLOAT,
+        1, reshapedC, 1, 1  // [1, seq_len, 1, 1]
+    ));
+    
+    CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
+        biasDesc,
+        CUDNN_TENSOR_NCHW,
+        CUDNN_DATA_FLOAT,
+        1, reshapedC, 1, 1  // [1, seq_len, 1, 1]
+    ));
+    
+    // mean和variance描述符
+    CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
+        meanVarDesc,
+        CUDNN_TENSOR_NCHW,
+        CUDNN_DATA_FLOAT,
+        1, reshapedC, 1, 1  // [1, seq_len, 1, 1]
+    ));
+    
+    // 分配临时的mean和variance缓冲区
+    size_t meanVarSize = reshapedC * sizeof(float);  // seq_len个float
+    
+    CUdeviceptr meanPtr = 0;
+    CUdeviceptr variancePtr = 0;
+    CUresult meanResult = cuMemAlloc(&meanPtr, meanVarSize);
+    CUresult invVarResult = cuMemAlloc(&variancePtr, meanVarSize);
+    
+    if (meanResult != CUDA_SUCCESS || invVarResult != CUDA_SUCCESS) {
+        fprintf(stderr, "[LAYERNORM] ERROR: Failed to allocate mean/variance buffers\n");
+        if (meanResult == CUDA_SUCCESS) cuMemFree(meanPtr);
+        if (invVarResult == CUDA_SUCCESS) cuMemFree(variancePtr);
+        return;
+    }
+    
+    void* meanData = reinterpret_cast<void*>(meanPtr);
+    void* varianceData = reinterpret_cast<void*>(variancePtr);
+    
+    // 初始化mean为0，variance为1（因为我们不使用running statistics）
+    CUDA_REPORT_IF_ERROR(cuMemsetD32(meanPtr, 0, reshapedC));
+    
+    // 设置variance为1 (需要用kernel来设置float值为1.0)
+    // 简化起见，我们使用inference模式，所以这些值不会被使用
+    
+    // 创建默认的scale和bias如果没有提供
+    void* actualGammaData = gamma_data;
+    void* actualBetaData = beta_data;
+    
+    CUdeviceptr defaultGammaPtr = 0;
+    CUdeviceptr defaultBetaPtr = 0;
+    
+    if (!gamma_data) {
+        // 分配并初始化gamma为1.0
+        CUresult gammaResult = cuMemAlloc(&defaultGammaPtr, meanVarSize);
+        if (gammaResult == CUDA_SUCCESS) {
+            actualGammaData = reinterpret_cast<void*>(defaultGammaPtr);
+            // 在host上创建全1数组，然后拷贝到device
+            std::vector<float> ones(reshapedC, 1.0f);
+            CUDA_REPORT_IF_ERROR(cuMemcpyHtoD(defaultGammaPtr, ones.data(), meanVarSize));
+        }
+    }
+    
+    if (!beta_data) {
+        // 分配并初始化beta为0.0 
+        CUresult betaResult = cuMemAlloc(&defaultBetaPtr, meanVarSize);
+        if (betaResult == CUDA_SUCCESS) {
+            actualBetaData = reinterpret_cast<void*>(defaultBetaPtr);
+            // 设置为0
+            CUDA_REPORT_IF_ERROR(cuMemsetD8(defaultBetaPtr, 0, meanVarSize));
+        }
+    }
+    
+    // 执行BatchNormalization来实现LayerNorm
+    // 使用SPATIAL模式，这样归一化在channel维度上进行（即我们的seq_len维度）
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    
+    cudnnStatus_t status = cudnnBatchNormalizationForwardInference(
+        handle,
+        CUDNN_BATCHNORM_SPATIAL,     // mode: 在channel维度上归一化
+        &alpha, &beta,               // alpha, beta
+        inputDesc, input_data,       // input
+        outputDesc, output_data,     // output
+        scaleDesc,                   // scale descriptor
+        actualGammaData,             // gamma (scale)
+        actualBetaData,              // beta (bias)
+        meanData,                    // running mean (设为0)
+        varianceData,                // running variance (会被重新计算)
+        epsilon                      // epsilon
+    );
+    
+    // 报告错误（如果有）
+    CUDNN_REPORT_IF_ERROR(status);
+    
+    // 释放临时缓冲区
+    CUDA_REPORT_IF_ERROR(cuMemFree(meanPtr));
+    CUDA_REPORT_IF_ERROR(cuMemFree(variancePtr));
+    
+    if (defaultGammaPtr != 0) {
+        CUDA_REPORT_IF_ERROR(cuMemFree(defaultGammaPtr));
+    }
+    if (defaultBetaPtr != 0) {
+        CUDA_REPORT_IF_ERROR(cuMemFree(defaultBetaPtr));
+    }
+    
+    // LLVM_DEBUG(llvm::dbgs() << "Successfully completed cuDNN LayerNorm using BatchNorm API\n");
+}
+
 // cuDNN ReduceSum wrapper function
 extern "C" MLIR_CUDA_WRAPPERS_EXPORT void
 mgpuCudnnReduceSum(
@@ -3697,6 +4615,318 @@ mgpuCulibsFullyConnectedForward(
   }
 }
 
+// 辅助函数：获取 cublasLt 数据类型
+static cudaDataType_t getCublasLtDataType(int element_size) {
+    switch (element_size) {
+        case 4: return CUDA_R_32F;  // float32
+        case 2: return CUDA_R_16F;  // float16
+        default: 
+            fprintf(stderr, "[CUBLASLT] Unsupported element size: %d\n", element_size);
+            return CUDA_R_32F;
+    }
+}
+
+// 辅助函数：获取元素大小
+static int getElementSize(cudaDataType_t data_type) {
+    switch (data_type) {
+        case CUDA_R_32F: return 4;  // float32
+        case CUDA_R_16F: return 2;  // float16
+        default: return 4;
+    }
+}
+
+static cublasLtHandle_t g_global_cublaslt_handle = nullptr;
+static std::once_flag g_cublaslt_init_flag;
+
+static cublasLtHandle_t getGlobalCublasLtHandle() {
+    std::call_once(g_cublaslt_init_flag, []() {
+        mgpuEnsureContext();
+        cublasStatus_t status = cublasLtCreate(&g_global_cublaslt_handle);
+        if (status != CUBLAS_STATUS_SUCCESS) {
+            fprintf(stderr, "[CUBLASLT] Failed to create global handle: %d\n", status);
+            g_global_cublaslt_handle = nullptr;
+        } else {
+            fprintf(stderr, "[CUBLASLT] Global handle created successfully\n");
+        }
+    });
+    return g_global_cublaslt_handle;
+}
+
+/**
+ * 使用 cublasLt 实现的高性能批量矩阵乘法
+ * @param batch_size 批量大小
+ * @param m, n, k 矩阵维度 (C[m,n] = A[m,k] @ B[k,n])
+ * @param stride_a, stride_b, stride_c 各矩阵的batch stride
+ * @param input_a, input_b 输入矩阵指针  
+ * @param output_c 输出矩阵指针
+ * @param stream CUDA流
+ * @param element_size 元素大小（4=float32, 2=float16）
+ */
+extern "C" MLIR_CUDA_WRAPPERS_EXPORT void
+mgpuCublasLtBatchedMatMulForward(
+    int batch_size, int m, int n, int k,
+    int stride_a, int stride_b, int stride_c,
+    void* input_a, void* input_b, void* output_c,
+    CUstream stream, int element_size
+) {
+    mgpuEnsureContext();
+    
+    fprintf(stderr, "[CUBLASLT_DEBUG] === Starting cublasLt matmul ===\n");
+    fprintf(stderr, "[CUBLASLT_DEBUG] Parameters: batch=%d, m=%d, n=%d, k=%d\n", 
+            batch_size, m, n, k);
+    fprintf(stderr, "[CUBLASLT_DEBUG] Strides (elements): A=%d, B=%d, C=%d\n", 
+            stride_a, stride_b, stride_c);
+    
+    // // 获取handles
+    // StreamHandles handles;
+    // if (!getHandlesForStream(stream, handles)) {
+    //     fprintf(stderr, "[CUBLASLT_DEBUG] Failed to get handles\n");
+    //     return;
+    // }
+    
+    // cublasLtHandle_t ltHandle = handles.cublaslt_handle;
+    // if (!ltHandle) {
+    //     fprintf(stderr, "[CUBLASLT_DEBUG] cublasLt handle is null\n");
+    //     return;
+    // }
+    
+    cublasLtHandle_t ltHandle = getGlobalCublasLtHandle();
+    if (!ltHandle) {
+        fprintf(stderr, "[CUBLASLT_DEBUG] Failed to get global cublasLt handle\n");
+        return;
+    }
+
+    // 参数验证
+    if (batch_size <= 0 || m <= 0 || n <= 0 || k <= 0) {
+        fprintf(stderr, "[CUBLASLT_DEBUG] Invalid dimensions\n");
+        return;
+    }
+    
+    // 数据类型设置
+    cudaDataType_t data_type = CUDA_R_32F;
+    cublasComputeType_t compute_type = CUBLAS_COMPUTE_32F;
+    
+    // 初始化描述符指针
+    cublasLtMatmulDesc_t matmulDesc = nullptr;
+    cublasLtMatrixLayout_t Adesc = nullptr, Bdesc = nullptr, Cdesc = nullptr;
+    cublasStatus_t status;
+    
+    // === 步骤1：创建matmul描述符 ===
+    fprintf(stderr, "[CUBLASLT_DEBUG] Step 1: Creating matmul descriptor...\n");
+    status = cublasLtMatmulDescCreate(&matmulDesc, compute_type, data_type);
+    if (status != CUBLAS_STATUS_SUCCESS) {
+        fprintf(stderr, "[CUBLASLT_DEBUG] Failed to create matmul desc: %d\n", status);
+        return;
+    }
+    
+    // === 步骤2：创建矩阵布局描述符（基础2D布局）===
+    fprintf(stderr, "[CUBLASLT_DEBUG] Step 2: Creating matrix layouts...\n");
+    
+    // A: [m, k] with leading dimension m
+    status = cublasLtMatrixLayoutCreate(&Adesc, data_type, m, k, m);
+    if (status != CUBLAS_STATUS_SUCCESS) {
+        fprintf(stderr, "[CUBLASLT_DEBUG] Failed to create A layout: %d\n", status);
+      fprintf(stderr, "[CUBLASLT_DEBUG] Cleaning up...\n");
+      if (matmulDesc != nullptr) cublasLtMatmulDescDestroy(matmulDesc);
+      if (Cdesc != nullptr) cublasLtMatrixLayoutDestroy(Cdesc);
+      if (Bdesc != nullptr) cublasLtMatrixLayoutDestroy(Bdesc);
+      if (Adesc != nullptr) cublasLtMatrixLayoutDestroy(Adesc);
+      fprintf(stderr, "[CUBLASLT_DEBUG] Cleanup complete\n");
+    }
+    
+    // B: [k, n] with leading dimension k
+    status = cublasLtMatrixLayoutCreate(&Bdesc, data_type, k, n, k);
+    if (status != CUBLAS_STATUS_SUCCESS) {
+        fprintf(stderr, "[CUBLASLT_DEBUG] Failed to create B layout: %d\n", status);
+      fprintf(stderr, "[CUBLASLT_DEBUG] Cleaning up...\n");
+      if (matmulDesc != nullptr) cublasLtMatmulDescDestroy(matmulDesc);
+      if (Cdesc != nullptr) cublasLtMatrixLayoutDestroy(Cdesc);
+      if (Bdesc != nullptr) cublasLtMatrixLayoutDestroy(Bdesc);
+      if (Adesc != nullptr) cublasLtMatrixLayoutDestroy(Adesc);
+      fprintf(stderr, "[CUBLASLT_DEBUG] Cleanup complete\n");
+    }
+    
+    // C: [m, n] with leading dimension m
+    status = cublasLtMatrixLayoutCreate(&Cdesc, data_type, m, n, m);
+    if (status != CUBLAS_STATUS_SUCCESS) {
+        fprintf(stderr, "[CUBLASLT_DEBUG] Failed to create C layout: %d\n", status);
+      fprintf(stderr, "[CUBLASLT_DEBUG] Cleaning up...\n");
+      if (matmulDesc != nullptr) cublasLtMatmulDescDestroy(matmulDesc);
+      if (Cdesc != nullptr) cublasLtMatrixLayoutDestroy(Cdesc);
+      if (Bdesc != nullptr) cublasLtMatrixLayoutDestroy(Bdesc);
+      if (Adesc != nullptr) cublasLtMatrixLayoutDestroy(Adesc);
+      fprintf(stderr, "[CUBLASLT_DEBUG] Cleanup complete\n");
+    }
+    
+    fprintf(stderr, "[CUBLASLT_DEBUG] Base layouts created successfully\n");
+    
+    // === 步骤3：设置批量参数（关键：使用正确的数据类型）===
+    if (batch_size > 1) {
+        fprintf(stderr, "[CUBLASLT_DEBUG] Step 3: Setting batch parameters...\n");
+        
+        // 重要：根据NVIDIA文档，batch count必须是int类型
+        int batch_count = batch_size;
+        
+        fprintf(stderr, "[CUBLASLT_DEBUG] Setting batch count = %d (int type)\n", batch_count);
+        
+        // 设置A矩阵批量数
+        status = cublasLtMatrixLayoutSetAttribute(
+            Adesc, 
+            CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT,
+            &batch_count, 
+            sizeof(int)  // 明确使用sizeof(int)
+        );
+        if (status != CUBLAS_STATUS_SUCCESS) {
+            fprintf(stderr, "[CUBLASLT_DEBUG] Failed to set A batch count: %d\n", status);
+          fprintf(stderr, "[CUBLASLT_DEBUG] Cleaning up...\n");
+          if (matmulDesc != nullptr) cublasLtMatmulDescDestroy(matmulDesc);
+          if (Cdesc != nullptr) cublasLtMatrixLayoutDestroy(Cdesc);
+          if (Bdesc != nullptr) cublasLtMatrixLayoutDestroy(Bdesc);
+          if (Adesc != nullptr) cublasLtMatrixLayoutDestroy(Adesc);
+          fprintf(stderr, "[CUBLASLT_DEBUG] Cleanup complete\n");
+        }
+        
+        // 设置B矩阵批量数
+        status = cublasLtMatrixLayoutSetAttribute(
+            Bdesc, 
+            CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT,
+            &batch_count, 
+            sizeof(int)
+        );
+        if (status != CUBLAS_STATUS_SUCCESS) {
+            fprintf(stderr, "[CUBLASLT_DEBUG] Failed to set B batch count: %d\n", status);
+          fprintf(stderr, "[CUBLASLT_DEBUG] Cleaning up...\n");
+          if (matmulDesc != nullptr) cublasLtMatmulDescDestroy(matmulDesc);
+          if (Cdesc != nullptr) cublasLtMatrixLayoutDestroy(Cdesc);
+          if (Bdesc != nullptr) cublasLtMatrixLayoutDestroy(Bdesc);
+          if (Adesc != nullptr) cublasLtMatrixLayoutDestroy(Adesc);
+          fprintf(stderr, "[CUBLASLT_DEBUG] Cleanup complete\n");
+        }
+        
+        // 设置C矩阵批量数
+        status = cublasLtMatrixLayoutSetAttribute(
+            Cdesc, 
+            CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT,
+            &batch_count, 
+            sizeof(int)
+        );
+        if (status != CUBLAS_STATUS_SUCCESS) {
+            fprintf(stderr, "[CUBLASLT_DEBUG] Failed to set C batch count: %d\n", status);
+          fprintf(stderr, "[CUBLASLT_DEBUG] Cleaning up...\n");
+          if (matmulDesc != nullptr) cublasLtMatmulDescDestroy(matmulDesc);
+          if (Cdesc != nullptr) cublasLtMatrixLayoutDestroy(Cdesc);
+          if (Bdesc != nullptr) cublasLtMatrixLayoutDestroy(Bdesc);
+          if (Adesc != nullptr) cublasLtMatrixLayoutDestroy(Adesc);
+          fprintf(stderr, "[CUBLASLT_DEBUG] Cleanup complete\n");
+        }
+        
+        fprintf(stderr, "[CUBLASLT_DEBUG] Batch counts set successfully\n");
+        
+        // === 步骤4：设置stride（重要：使用long long类型，单位是字节）===
+        fprintf(stderr, "[CUBLASLT_DEBUG] Step 4: Setting strides...\n");
+        
+        // 根据NVIDIA文档，stride必须是long long类型，单位是字节
+        if (stride_a > 0) {
+            long long strideA_bytes = (long long)stride_a * sizeof(float);
+            fprintf(stderr, "[CUBLASLT_DEBUG] A stride: %lld bytes (%d elements)\n", 
+                    strideA_bytes, stride_a);
+            
+            status = cublasLtMatrixLayoutSetAttribute(
+                Adesc,
+                CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET,
+                &strideA_bytes,
+                sizeof(long long)  // 明确使用sizeof(long long)
+            );
+            if (status != CUBLAS_STATUS_SUCCESS) {
+                fprintf(stderr, "[CUBLASLT_DEBUG] Failed to set A stride: %d\n", status);
+              fprintf(stderr, "[CUBLASLT_DEBUG] Cleaning up...\n");
+              if (matmulDesc != nullptr) cublasLtMatmulDescDestroy(matmulDesc);
+              if (Cdesc != nullptr) cublasLtMatrixLayoutDestroy(Cdesc);
+              if (Bdesc != nullptr) cublasLtMatrixLayoutDestroy(Bdesc);
+              if (Adesc != nullptr) cublasLtMatrixLayoutDestroy(Adesc);
+              fprintf(stderr, "[CUBLASLT_DEBUG] Cleanup complete\n");
+            }
+        }
+        
+        if (stride_b > 0) {
+            long long strideB_bytes = (long long)stride_b * sizeof(float);
+            fprintf(stderr, "[CUBLASLT_DEBUG] B stride: %lld bytes (%d elements)\n", 
+                    strideB_bytes, stride_b);
+            
+            status = cublasLtMatrixLayoutSetAttribute(
+                Bdesc,
+                CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET,
+                &strideB_bytes,
+                sizeof(long long)
+            );
+            if (status != CUBLAS_STATUS_SUCCESS) {
+                fprintf(stderr, "[CUBLASLT_DEBUG] Failed to set B stride: %d\n", status);
+              fprintf(stderr, "[CUBLASLT_DEBUG] Cleaning up...\n");
+              if (matmulDesc != nullptr) cublasLtMatmulDescDestroy(matmulDesc);
+              if (Cdesc != nullptr) cublasLtMatrixLayoutDestroy(Cdesc);
+              if (Bdesc != nullptr) cublasLtMatrixLayoutDestroy(Bdesc);
+              if (Adesc != nullptr) cublasLtMatrixLayoutDestroy(Adesc);
+              fprintf(stderr, "[CUBLASLT_DEBUG] Cleanup complete\n");
+            }
+        }
+        
+        long long strideC_bytes = (long long)stride_c * sizeof(float);
+        fprintf(stderr, "[CUBLASLT_DEBUG] C stride: %lld bytes (%d elements)\n", 
+                strideC_bytes, stride_c);
+        
+        status = cublasLtMatrixLayoutSetAttribute(
+            Cdesc,
+            CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET,
+            &strideC_bytes,
+            sizeof(long long)
+        );
+        if (status != CUBLAS_STATUS_SUCCESS) {
+            fprintf(stderr, "[CUBLASLT_DEBUG] Failed to set C stride: %d\n", status);
+            fprintf(stderr, "[CUBLASLT_DEBUG] Cleaning up...\n");
+            if (matmulDesc != nullptr) cublasLtMatmulDescDestroy(matmulDesc);
+            if (Cdesc != nullptr) cublasLtMatrixLayoutDestroy(Cdesc);
+            if (Bdesc != nullptr) cublasLtMatrixLayoutDestroy(Bdesc);
+            if (Adesc != nullptr) cublasLtMatrixLayoutDestroy(Adesc);
+            fprintf(stderr, "[CUBLASLT_DEBUG] Cleanup complete\n");
+        }
+        
+        fprintf(stderr, "[CUBLASLT_DEBUG] All strides set successfully\n");
+    }
+    
+    // === 步骤5：执行矩阵乘法 ===
+    fprintf(stderr, "[CUBLASLT_DEBUG] Step 5: Executing matmul...\n");
+    
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    
+    status = cublasLtMatmul(
+        ltHandle,
+        matmulDesc,
+        &alpha,              // alpha
+        input_a, Adesc,      // A matrix
+        input_b, Bdesc,      // B matrix
+        &beta,               // beta
+        output_c, Cdesc,     // C matrix (input)
+        output_c, Cdesc,     // D matrix (output, same as C for in-place)
+        nullptr,             // algorithm (auto-select)
+        nullptr, 0,          // workspace
+        stream               // CUDA stream
+    );
+    
+    if (status != CUBLAS_STATUS_SUCCESS) {
+        fprintf(stderr, "[CUBLASLT_DEBUG] Matmul execution failed: %d\n", status);
+        fprintf(stderr, "[CUBLASLT_DEBUG] Cleaning up...\n");
+        if (matmulDesc != nullptr) cublasLtMatmulDescDestroy(matmulDesc);
+        if (Cdesc != nullptr) cublasLtMatrixLayoutDestroy(Cdesc);
+        if (Bdesc != nullptr) cublasLtMatrixLayoutDestroy(Bdesc);
+        if (Adesc != nullptr) cublasLtMatrixLayoutDestroy(Adesc);
+        fprintf(stderr, "[CUBLASLT_DEBUG] Cleanup complete\n");
+    }
+    
+    fprintf(stderr, "[CUBLASLT_DEBUG] === Matmul completed successfully! ===\n");
+}
+
+
 extern "C" MLIR_CUDA_WRAPPERS_EXPORT void
 mgpuCulibsBatchedMatMulForward(
     int batch_size, int m, int n, int k,        // 批量大小和矩阵维度
@@ -3705,6 +4935,12 @@ mgpuCulibsBatchedMatMulForward(
     void* output_c,                             // 输出矩阵指针
     CUstream stream                             // CUDA流
 ) {
+
+
+    // mgpuCublasLtBatchedMatMulForward(batch_size, m, n, k, stride_a, stride_b, stride_c,
+    //                                 input_a, input_b, output_c, stream, 4);
+
+
     mgpuEnsureContext();
     
     StreamHandles handles;

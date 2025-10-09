@@ -240,8 +240,10 @@ if(LLVM_ENABLE_PIC)
     )
     set_property(TARGET mlir_cuda_runtime PROPERTY CXX_STANDARD 14)
 
+    set(CUDNN_INCLUDE_DIR "/home/dagongcheng2/anaconda3/envs/py311_env/lib/python3.11/site-packages/nvidia/cudnn/include")
     target_include_directories(mlir_cuda_runtime
       PRIVATE
+      ${CUDNN_INCLUDE_DIR} 
       ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}
       ${CMAKE_CURRENT_SOURCE_DIR}
     )
@@ -251,14 +253,31 @@ if(LLVM_ENABLE_PIC)
     )
 
 
-    # 添加对cuDNN的支持
-    find_library(CUDA_CUDNN_LIBRARY cudnn 
-      HINTS 
-      ${CMAKE_CUDA_IMPLICIT_LINK_DIRECTORIES}
-      /usr/lib/x86_64-linux-gnu
-      REQUIRED)
+    # # 添加对cuDNN的支持
+    # find_library(CUDA_CUDNN_LIBRARY cudnn 
+    #   HINTS 
+    #   ${CMAKE_CUDA_IMPLICIT_LINK_DIRECTORIES}
+    #   /usr/lib/x86_64-linux-gnu
+    #   REQUIRED)
 
-    if(CUDA_CUDNN_LIBRARY)
+    # if(CUDA_CUDNN_LIBRARY)
+    #   message(STATUS "Found cuDNN library: ${CUDA_CUDNN_LIBRARY}")
+    #   target_link_libraries(mlir_cuda_runtime
+    #     PRIVATE
+    #     ${CUDA_CUDNN_LIBRARY}
+    #   )
+    #   target_compile_definitions(mlir_cuda_runtime
+    #     PRIVATE
+    #     MLIR_ENABLE_CUDA_CUDNN=1
+    #   )
+    # else()
+    #   message(WARNING "cuDNN library not found, cuDNN wrappers will not be available")
+    # endif()
+
+    # 添加对cuDNN的支持
+    set(CUDA_CUDNN_LIBRARY "/home/dagongcheng2/anaconda3/envs/py311_env/lib/python3.11/site-packages/nvidia/cudnn/lib/libcudnn.so.9")
+
+    if(EXISTS ${CUDA_CUDNN_LIBRARY})
       message(STATUS "Found cuDNN library: ${CUDA_CUDNN_LIBRARY}")
       target_link_libraries(mlir_cuda_runtime
         PRIVATE
@@ -269,7 +288,7 @@ if(LLVM_ENABLE_PIC)
         MLIR_ENABLE_CUDA_CUDNN=1
       )
     else()
-      message(WARNING "cuDNN library not found, cuDNN wrappers will not be available")
+      message(WARNING "cuDNN library not found at specified path: ${CUDA_CUDNN_LIBRARY}")
     endif()
 
     # 添加对cuBLAS的支持
@@ -291,6 +310,27 @@ if(LLVM_ENABLE_PIC)
       )
     else()
       message(WARNING "cuBLAS library not found, cuBLAS wrappers will not be available")
+    endif()
+
+    # 添加对cuBLASLt的支持
+    find_library(CUDA_CUBLASLT_LIBRARY cublasLt
+      HINTS
+      ${CMAKE_CUDA_IMPLICIT_LINK_DIRECTORIES}
+      /usr/lib/x86_64-linux-gnu
+      REQUIRED)
+
+    if(CUDA_CUBLASLT_LIBRARY)
+      message(STATUS "Found cuBLASLt library: ${CUDA_CUBLASLT_LIBRARY}")
+      target_link_libraries(mlir_cuda_runtime
+        PRIVATE
+        ${CUDA_CUBLASLT_LIBRARY}
+      )
+      target_compile_definitions(mlir_cuda_runtime
+        PRIVATE
+        MLIR_ENABLE_CUDA_CUBLASLT=1
+      )
+    else()
+      message(WARNING "cuBLASLt library not found, cuBLASLt wrappers will not be available")
     endif()
 
     # 添加对cuTENSOR的支持
