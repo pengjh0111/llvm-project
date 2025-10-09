@@ -28,7 +28,8 @@ class AffineForOp;
 
 /// Fusion mode to attempt. The default mode `Greedy` does both
 /// producer-consumer and sibling fusion.
-enum FusionMode { Greedy, ProducerConsumer, Sibling };
+// enum FusionMode { Greedy, ProducerConsumer, Sibling };
+enum FusionMode { Greedy, ProducerConsumer, Sibling, Independent }; //modified by p
 
 #define GEN_PASS_DECL
 #include "mlir/Dialect/Affine/Passes.h.inc"

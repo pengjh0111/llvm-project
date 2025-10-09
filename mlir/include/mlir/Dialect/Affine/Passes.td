@@ -172,7 +172,9 @@ def AffineLoopFusion : Pass<"affine-loop-fusion"> {
            "clEnumValN( mlir::affine::FusionMode::ProducerConsumer, "
            "\"producer\", \"Perform only producer-consumer fusion\"), "
            "clEnumValN( mlir::affine::FusionMode::Sibling, "
-           "\"sibling\", \"Perform only sibling fusion\"))">,
+           "\"sibling\", \"Perform only sibling fusion\"), "
+           "clEnumValN( mlir::affine::FusionMode::Independent, "
+           "\"independent\", \"Perform independent loop fusion for element-wise operations\"))">,
     ];
   let dependentDialects = ["memref::MemRefDialect"];
 }
