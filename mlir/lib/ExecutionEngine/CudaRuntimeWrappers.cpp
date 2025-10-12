@@ -2947,6 +2947,101 @@ static bool getOrCreateWindowArrays(int seq_len_q, int seq_len_k,
     return true;
 }
 
+// 序列长度数组的缓存key
+struct SeqArrayKey {
+    int batch_size;
+    int seq_len_q;
+    int seq_len_k;
+    
+    bool operator<(const SeqArrayKey& other) const {
+        if (batch_size != other.batch_size) return batch_size < other.batch_size;
+        if (seq_len_q != other.seq_len_q) return seq_len_q < other.seq_len_q;
+        return seq_len_k < other.seq_len_k;
+    }
+};
+
+// 缓存的序列数组
+struct CachedSeqArrays {
+    int* dev_q_seq;
+    int* dev_k_seq;
+    int q_batches;
+    int k_batches;
+};
+
+// 全局缓存
+static std::mutex seq_arrays_mutex;
+static std::map<SeqArrayKey, CachedSeqArrays> seq_arrays_cache;
+
+// 获取或创建序列数组
+bool getOrCreateSeqArrays(int batch_size, int seq_len_q, int seq_len_k,
+                          int*& dev_q_seq, int*& dev_k_seq,
+                          int& q_batches, int& k_batches) {
+    SeqArrayKey key = {batch_size, seq_len_q, seq_len_k};
+    
+    std::lock_guard<std::mutex> lock(seq_arrays_mutex);
+    
+    // 检查缓存
+    auto it = seq_arrays_cache.find(key);
+    if (it != seq_arrays_cache.end()) {
+        dev_q_seq = it->second.dev_q_seq;
+        dev_k_seq = it->second.dev_k_seq;
+        q_batches = it->second.q_batches;
+        k_batches = it->second.k_batches;
+        return true;
+    }
+    
+    // 创建新的
+    int beam_size = 1;
+    q_batches = batch_size * beam_size;
+    k_batches = batch_size;
+    
+    std::vector<int> q_seq_array(q_batches, seq_len_q);
+    std::vector<int> k_seq_array(k_batches, seq_len_k);
+    
+    CUdeviceptr dev_q_seq_ptr = 0;
+    CUdeviceptr dev_k_seq_ptr = 0;
+    
+    CUresult result = cuMemAlloc(&dev_q_seq_ptr, q_batches * sizeof(int));
+    if (result != CUDA_SUCCESS) {
+        fprintf(stderr, "[MHA] ERROR: Failed to allocate dev_q_seq\n");
+        return false;
+    }
+    
+    result = cuMemAlloc(&dev_k_seq_ptr, k_batches * sizeof(int));
+    if (result != CUDA_SUCCESS) {
+        fprintf(stderr, "[MHA] ERROR: Failed to allocate dev_k_seq\n");
+        cuMemFree(dev_q_seq_ptr);
+        return false;
+    }
+    
+    result = cuMemcpyHtoD(dev_q_seq_ptr, q_seq_array.data(), 
+                          q_batches * sizeof(int));
+    if (result != CUDA_SUCCESS) {
+        fprintf(stderr, "[MHA] ERROR: Failed to copy q_seq to device\n");
+        cuMemFree(dev_q_seq_ptr);
+        cuMemFree(dev_k_seq_ptr);
+        return false;
+    }
+    
+    result = cuMemcpyHtoD(dev_k_seq_ptr, k_seq_array.data(), 
+                          k_batches * sizeof(int));
+    if (result != CUDA_SUCCESS) {
+        fprintf(stderr, "[MHA] ERROR: Failed to copy k_seq to device\n");
+        cuMemFree(dev_q_seq_ptr);
+        cuMemFree(dev_k_seq_ptr);
+        return false;
+    }
+    
+    dev_q_seq = reinterpret_cast<int*>(dev_q_seq_ptr);
+    dev_k_seq = reinterpret_cast<int*>(dev_k_seq_ptr);
+    
+    // 缓存
+    CachedSeqArrays cached = {dev_q_seq, dev_k_seq, q_batches, k_batches};
+    seq_arrays_cache[key] = cached;
+    
+    return true;
+}
+
 // cuDNN Multi-Head Attention wrapper function (Inference only)
 extern "C" MLIR_CUDA_WRAPPERS_EXPORT void
 mgpuCudnnMultiHeadAttention(
@@ -3036,27 +3131,51 @@ mgpuCudnnMultiHeadAttention(
     ));
     
     // Setup sequence arrays
-    int beam_size = 1;
-    int q_batches = batch_size * beam_size;
-    int k_batches = batch_size;
+    // int beam_size = 1;
+    // int q_batches = batch_size * beam_size;
+    // int k_batches = batch_size;
     
+    // std::vector<int> q_seq_array(q_batches, seq_len_q);
+    // std::vector<int> k_seq_array(k_batches, seq_len_k);
+    
+    // // Allocate device sequence arrays
+    // CUdeviceptr dev_q_seq_ptr = 0;
+    // CUdeviceptr dev_k_seq_ptr = 0;
+    
+    // CUDA_REPORT_IF_ERROR(cuMemAlloc(&dev_q_seq_ptr, q_batches * sizeof(int)));
+    // CUDA_REPORT_IF_ERROR(cuMemAlloc(&dev_k_seq_ptr, k_batches * sizeof(int)));
+    // CUDA_REPORT_IF_ERROR(cuMemcpyHtoD(dev_q_seq_ptr, q_seq_array.data(), 
+    //                                   q_batches * sizeof(int)));
+    // CUDA_REPORT_IF_ERROR(cuMemcpyHtoD(dev_k_seq_ptr, k_seq_array.data(), 
+    //                                   k_batches * sizeof(int)));
+    
+    // int* dev_q_seq = reinterpret_cast<int*>(dev_q_seq_ptr);
+    // int* dev_k_seq = reinterpret_cast<int*>(dev_k_seq_ptr);
+
+    // 使用缓存的序列数组
+    int* dev_q_seq = nullptr;
+    int* dev_k_seq = nullptr;
+    int beam_size = 1;
+    int q_batches = 0;
+    int k_batches = 0;
+    
+    if (!getOrCreateSeqArrays(batch_size, seq_len_q, seq_len_k,
+                              dev_q_seq, dev_k_seq, 
+                              q_batches, k_batches)) {
+        fprintf(stderr, "[MHA] ERROR: Failed to get sequence arrays\n");
+        // Cleanup and return
+        cudnnDestroyAttnDescriptor(attn_desc);
+        cudnnDestroySeqDataDescriptor(q_desc);
+        cudnnDestroySeqDataDescriptor(k_desc);
+        cudnnDestroySeqDataDescriptor(v_desc);
+        cudnnDestroySeqDataDescriptor(o_desc);
+        return;
+    }
+    
+    // 注意：这里需要用缓存返回的q_batches和k_batches来设置descriptors
     std::vector<int> q_seq_array(q_batches, seq_len_q);
     std::vector<int> k_seq_array(k_batches, seq_len_k);
-    
-    // Allocate device sequence arrays
-    CUdeviceptr dev_q_seq_ptr = 0;
-    CUdeviceptr dev_k_seq_ptr = 0;
-    
-    CUDA_REPORT_IF_ERROR(cuMemAlloc(&dev_q_seq_ptr, q_batches * sizeof(int)));
-    CUDA_REPORT_IF_ERROR(cuMemAlloc(&dev_k_seq_ptr, k_batches * sizeof(int)));
-    CUDA_REPORT_IF_ERROR(cuMemcpyHtoD(dev_q_seq_ptr, q_seq_array.data(), 
-                                      q_batches * sizeof(int)));
-    CUDA_REPORT_IF_ERROR(cuMemcpyHtoD(dev_k_seq_ptr, k_seq_array.data(), 
-                                      k_batches * sizeof(int)));
-    
-    int* dev_q_seq = reinterpret_cast<int*>(dev_q_seq_ptr);
-    int* dev_k_seq = reinterpret_cast<int*>(dev_k_seq_ptr);
-    
+
     // Setup sequence data descriptors
     int dim_a[CUDNN_SEQDATA_DIM_COUNT];
     cudnnSeqDataAxis_t data_axes[CUDNN_SEQDATA_DIM_COUNT] = {
@@ -3130,8 +3249,8 @@ mgpuCudnnMultiHeadAttention(
                 fprintf(stderr, "[MHA] ERROR: Failed to allocate workspace of size %zu bytes\n", 
                         size_wkspace);
                 // Cleanup and return
-                cuMemFree(dev_q_seq_ptr);
-                cuMemFree(dev_k_seq_ptr);
+                // cuMemFree(dev_q_seq_ptr);
+                // cuMemFree(dev_k_seq_ptr);
                 cudnnDestroyAttnDescriptor(attn_desc);
                 cudnnDestroySeqDataDescriptor(q_desc);
                 cudnnDestroySeqDataDescriptor(k_desc);
@@ -3186,8 +3305,8 @@ mgpuCudnnMultiHeadAttention(
         CUDA_REPORT_IF_ERROR(cuMemFree(reinterpret_cast<CUdeviceptr>(workspace)));
     }
     
-    CUDA_REPORT_IF_ERROR(cuMemFree(dev_q_seq_ptr));
-    CUDA_REPORT_IF_ERROR(cuMemFree(dev_k_seq_ptr));
+    // CUDA_REPORT_IF_ERROR(cuMemFree(dev_q_seq_ptr));
+    // CUDA_REPORT_IF_ERROR(cuMemFree(dev_k_seq_ptr));
     
     CUDNN_REPORT_IF_ERROR(cudnnDestroyAttnDescriptor(attn_desc));
     CUDNN_REPORT_IF_ERROR(cudnnDestroySeqDataDescriptor(q_desc));
