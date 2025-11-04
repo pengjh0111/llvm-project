@@ -16,6 +16,7 @@ set(LLVM_OPTIONAL_SOURCES
   JitRunner.cpp
   SyclRuntimeWrappers.cpp
   CudnnGraphBuilder.cpp
+  OneDNNRuntimeWrappers.cpp
   )
 
 # Use a separate library for OptUtils, to avoid pulling in the entire JIT and
@@ -427,6 +428,98 @@ if(LLVM_ENABLE_PIC)
         )
       endif()
     endif()
+  endif()
+
+  if(MLIR_ENABLE_ONEDNN_RUNNER)
+    
+    # 设置oneDNN根目录
+    set(ONEDNN_ROOT_DIR "$ENV{ONEDNN_ROOT}")
+    if(NOT ONEDNN_ROOT_DIR)
+      # 如果使用conda，设置为conda环境路径
+      set(ONEDNN_ROOT_DIR "$ENV{CONDA_PREFIX}")
+      if(NOT ONEDNN_ROOT_DIR)
+        set(ONEDNN_ROOT_DIR "/usr")  # 系统默认路径
+      endif()
+    endif()
+
+    message(STATUS "Looking for oneDNN in: ${ONEDNN_ROOT_DIR}")
+
+    # 查找oneDNN头文件
+    find_path(ONEDNN_INCLUDE_DIR 
+      NAMES dnnl.hpp dnnl.h
+      HINTS 
+      ${ONEDNN_ROOT_DIR}/include
+      /usr/include
+      /usr/local/include
+      REQUIRED)
+
+    # 查找oneDNN库文件
+    find_library(ONEDNN_LIBRARY 
+      NAMES dnnl
+      HINTS 
+      ${ONEDNN_ROOT_DIR}/lib
+      ${ONEDNN_ROOT_DIR}/lib64
+      /usr/lib
+      /usr/lib/x86_64-linux-gnu
+      /usr/local/lib
+      REQUIRED)
+
+    if(ONEDNN_LIBRARY AND ONEDNN_INCLUDE_DIR)
+      message(STATUS "Found oneDNN library: ${ONEDNN_LIBRARY}")
+      message(STATUS "Found oneDNN headers: ${ONEDNN_INCLUDE_DIR}")
+
+      # 创建oneDNN runtime库
+      add_mlir_library(mlir_onednn_runtime
+        SHARED
+        OneDNNRuntimeWrappers.cpp
+        
+        EXCLUDE_FROM_LIBMLIR
+      )
+      
+      # 设置C++标准
+      set_property(TARGET mlir_onednn_runtime PROPERTY CXX_STANDARD 17)
+      
+      # 为 oneDNN 启用异常
+      target_compile_options(mlir_onednn_runtime
+        PRIVATE
+        -fexceptions
+        -frtti
+      )
+
+      # 添加头文件路径
+      target_include_directories(mlir_onednn_runtime
+        PRIVATE
+        ${ONEDNN_INCLUDE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}
+      )
+      
+      # 链接oneDNN库
+      target_link_libraries(mlir_onednn_runtime
+        PRIVATE
+        ${ONEDNN_LIBRARY}
+      )
+      
+      # 添加编译定义
+      target_compile_definitions(mlir_onednn_runtime
+        PRIVATE
+        MLIR_ENABLE_ONEDNN=1
+      )
+      
+      # 添加线程支持（oneDNN可能需要）
+      find_package(Threads REQUIRED)
+      target_link_libraries(mlir_onednn_runtime
+        PRIVATE
+        Threads::Threads
+      )
+      
+      # 设置RPATH以便找到共享库
+      set_property(TARGET mlir_onednn_runtime
+        PROPERTY INSTALL_RPATH_USE_LINK_PATH ON)
+      
+    else()
+      message(FATAL_ERROR "oneDNN library not found. Please install oneDNN or set ONEDNN_ROOT_DIR")
+    endif()
+
   endif()
 
   if(MLIR_ENABLE_ROCM_RUNNER)
