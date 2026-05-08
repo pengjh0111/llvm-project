@@ -438,6 +438,11 @@ static bool isEscapingMemref(Value memref, Block *block,
     if (ancestorOp->getBlock() != block)
       return false;
 
+    if (isa<mlir::UnrealizedConversionCastOp>(user)) {
+      LLVM_DEBUG(llvm::dbgs() << "Ignoring unrealized_conversion_cast: " << *user << "\n");
+      return false;  // 不认为是逃逸使用
+    }
+
     // 新增：特殊处理reinterpret_cast操作
     if (auto reinterpretOp = dyn_cast<memref::ReinterpretCastOp>(user)) {
       // 如果提供了srcOp和dstOp，进行精细分析
@@ -1143,6 +1148,12 @@ public:
         // 如果任一循环对共享memref进行写操作，则存在冲突
         if (srcNode->getStoreOpCount(srcMemref) > 0 || 
             dstNode->getStoreOpCount(srcMemref) > 0) {
+
+        // 尝试检查是否是不重叠的batch维度访问
+        if (!hasBatchDimensionConflict(srcNode, dstNode, srcMemref)) {
+          continue; // 不同batch，无冲突
+        }
+
           return true;
         }
       }
@@ -1151,12 +1162,106 @@ public:
     return false;
   }
 
+  // 辅助函数：检查两个节点对同一memref的batch维度是否有冲突
+  static bool hasBatchDimensionConflict(MemRefDependenceGraph::Node *srcNode, 
+                                        MemRefDependenceGraph::Node *dstNode,
+                                        Value memref) {
+    // 收集两个节点中对该memref的所有store操作
+    SmallVector<Operation*> srcStores, dstStores;
+    
+    for (Operation *op : srcNode->stores) {
+      if (auto storeOp = dyn_cast<AffineStoreOp>(op)) {
+        if (storeOp.getMemRef() == memref) {
+          srcStores.push_back(op);
+        }
+      }
+    }
+    
+    for (Operation *op : dstNode->stores) {
+      if (auto storeOp = dyn_cast<AffineStoreOp>(op)) {
+        if (storeOp.getMemRef() == memref) {
+          dstStores.push_back(op);
+        }
+      }
+    }
+    
+    if (srcStores.empty() || dstStores.empty()) {
+      return true; // 保守处理
+    }
+    // 分析第一个维度的访问范围
+    for (Operation *srcOp : srcStores) {
+      auto srcStore = cast<AffineStoreOp>(srcOp);
+      auto srcIndices = srcStore.getMapOperands();
+      
+      for (Operation *dstOp : dstStores) {
+        auto dstStore = cast<AffineStoreOp>(dstOp);
+        auto dstIndices = dstStore.getMapOperands();
+        
+        // 检查第一个维度的访问模式
+        if (!srcIndices.empty() && !dstIndices.empty()) {
+          Value srcFirstDim = srcIndices[0];
+          Value dstFirstDim = dstIndices[0];
+          
+          // 尝试判断两个访问的第一个维度是否不重叠
+          if (areFirstDimensionDisjoint(srcStore, dstStore, srcFirstDim, dstFirstDim)) {
+            continue; // 这对store不冲突，检查下一对
+          }
+        }
+        
+        // 如果无法证明不重叠，则认为有冲突
+        return true;
+      }
+    }
+    
+    return false; // 所有store对都不冲突
+  }
+
+  // 判断两个store操作的第一个维度访问是否不重叠
+  static bool areFirstDimensionDisjoint(AffineStoreOp srcStore, AffineStoreOp dstStore,
+                                        Value srcFirstDim, Value dstFirstDim) {
+    // 情况1: 直接使用不同的常量或参数
+    if (srcFirstDim != dstFirstDim) {
+      // 检查是否一个是直接使用循环变量，另一个是affine.apply的结果
+      auto srcDefOp = srcFirstDim.getDefiningOp();
+      auto dstDefOp = dstFirstDim.getDefiningOp();
+      
+      // 如果一个是affine.apply，另一个是直接的循环变量
+      auto srcApply = dyn_cast_or_null<AffineApplyOp>(srcDefOp);
+      auto dstApply = dyn_cast_or_null<AffineApplyOp>(dstDefOp);
+      
+      // 情况1a: 一个是循环变量，一个是affine.apply
+      if ((srcApply && !dstApply) || (!srcApply && dstApply)) {
+        return true; // 简单情况：很可能是不同的batch段
+      }
+      
+      // 情况1b: 两个都是affine.apply但map不同
+      if (srcApply && dstApply) {
+        if (srcApply.getAffineMap() != dstApply.getAffineMap()) {
+          // 检查它们的输入是否相同
+          auto srcOperands = srcApply.getMapOperands();
+          auto dstOperands = dstApply.getMapOperands();
+          
+          // 如果使用相同的循环变量但不同的map，通常意味着不同的batch段
+          if (!srcOperands.empty() && !dstOperands.empty() && 
+              srcOperands[0] == dstOperands[0]) {
+            return true;
+          }
+        }
+      }
+    }
+    
+    // 情况2: 使用依赖分析进行更精确的判断（可选）
+    // 可以使用 MLIR 的依赖分析工具来检查访问范围是否重叠
+    // 这里暂时采用保守策略
+    
+    return false; // 无法证明不重叠
+  }
+
   /// 获取独立循环的融合候选 - 类似getProducerCandidates但针对独立循环
   static void getIndependentCandidates(unsigned dstId, MemRefDependenceGraph *mdg,
                                       SmallVectorImpl<unsigned> &srcIdCandidates) {
     auto *dstNode = mdg->getNode(dstId);
     auto dstLoop = cast<AffineForOp>(dstNode->op);
-    
     // 遍历所有其他节点寻找独立的循环
     for (auto &srcNodePair : mdg->nodes) {
       unsigned srcId = srcNodePair.first;
@@ -1175,11 +1280,9 @@ public:
       // 检查循环结构是否相同（你之前提到的关键条件）
       if (!haveSameIterationStructure(srcLoop, dstLoop))
         continue;
-      
       // 检查是否真正独立（无依赖关系）
       if (mdg->hasDependencePath(srcId, dstId) || mdg->hasDependencePath(dstId, srcId))
         continue;
-      
       // 检查内存访问是否冲突
       if (hasMemoryAccessConflict(srcId, dstId, mdg))
         continue;
@@ -1345,6 +1448,11 @@ public:
     
     // 检查是否有写-写冲突
     for (Value srcMemref : srcWrites) {
+      // 尝试检查是否是不重叠的batch维度访问
+      if (!hasBatchDimensionConflict(srcNode, dstNode, srcMemref)) {
+        continue; // 不同batch，无冲突
+      }
+
       if (dstWrites.contains(srcMemref)) {
         return true;
       }
@@ -1728,7 +1836,7 @@ public:
 
   // 相邻候选查找函数 - 允许中间有alloc和constant
   static void getAdjacentIndependentCandidates(unsigned dstId, MemRefDependenceGraph *mdg,
-                                            SmallVectorImpl<unsigned> &srcIdCandidates) {
+                                            SmallVectorImpl<unsigned> &srcIdCandidates) {                                        
     auto *dstNode = mdg->getNode(dstId);
     if (!dstNode) {
       LLVM_DEBUG(llvm::dbgs() << "Destination node not found: " << dstId << "\n");

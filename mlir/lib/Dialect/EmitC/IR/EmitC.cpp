@@ -193,7 +193,7 @@ LogicalResult ApplyOp::verify() {
     return emitOpError("applicable operator must not be empty");
 
   // Only `*` and `&` are supported.
-  if (applicableOperatorStr != "&" && applicableOperatorStr != "*")
+  if (applicableOperatorStr != "&" && applicableOperatorStr != "*" && applicableOperatorStr != "(float*)")
     return emitOpError("applicable operator is illegal");
 
   Operation *op = getOperand().getDefiningOp();

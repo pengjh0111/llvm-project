@@ -1148,8 +1148,6 @@ public:
   }
 };
 
-} 
-
 class NegFOpConversion : public OpConversionPattern<arith::NegFOp> {
 public:
   using OpConversionPattern::OpConversionPattern;
@@ -1333,7 +1331,403 @@ private:
   }
 };
 
+class IndexCastOpConversion : public OpConversionPattern<arith::IndexCastOp> {
+public:
+  using OpConversionPattern::OpConversionPattern;
 
+  LogicalResult
+  matchAndRewrite(arith::IndexCastOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    
+    Type sourceType = adaptor.getIn().getType();
+    Type targetType = getTypeConverter()->convertType(op.getType());
+    
+    if (!targetType)
+      return rewriter.notifyMatchFailure(op, "type conversion failed");
+
+    // index_cast 在 EmitC 中通过简单的 cast 操作实现
+    // index 类型会被 TypeConverter 转换为具体的整数类型
+    rewriter.replaceOpWithNewOp<emitc::CastOp>(op, targetType, adaptor.getIn());
+    
+    return success();
+  }
+};
+
+// ───────────────────────────────────────────────────────────────────────
+// 移位操作转换
+//
+// arith.shrui / arith.shrsi / arith.shli 均映射到对应的 emitc bitwise op。
+// shrui 需要将操作数先 cast 为无符号类型，确保生成 C 的逻辑右移（>>）
+// 而非算术右移，语义与 arith.shrui 一致。
+// ───────────────────────────────────────────────────────────────────────
+
+// arith.shrui (i64, i64) -> i64  =>  emitc.bitwise_right_shift (unsigned)
+class ShrUIOpConversion : public OpConversionPattern<arith::ShRUIOp> {
+public:
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(arith::ShRUIOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Type type = getTypeConverter()->convertType(op.getType());
+    if (!isa_and_nonnull<IntegerType>(type))
+      return rewriter.notifyMatchFailure(op, "expected integer type");
+    if (type.isInteger(1))
+      return rewriter.notifyMatchFailure(op, "i1 shift not supported");
+
+    // shrui 必须在无符号类型上操作，否则 C 的 >> 是实现定义行为
+    Type unsignedType = rewriter.getIntegerType(
+        type.getIntOrFloatBitWidth(), /*isSigned=*/false);
+
+    Value lhs = adaptor.getLhs();
+    Value rhs = adaptor.getRhs();
+
+    // 若当前类型不是无符号，先 cast
+    if (type != unsignedType) {
+      lhs = rewriter.create<emitc::CastOp>(op.getLoc(), unsignedType, lhs);
+      rhs = rewriter.create<emitc::CastOp>(op.getLoc(), unsignedType, rhs);
+    }
+
+    Value result = rewriter.create<emitc::BitwiseRightShiftOp>(
+        op.getLoc(), unsignedType, lhs, rhs);
+
+    // 结果 cast 回原类型（signless integer）
+    if (unsignedType != type)
+      result = rewriter.create<emitc::CastOp>(op.getLoc(), type, result);
+
+    rewriter.replaceOp(op, result);
+    return success();
+  }
+};
+
+// arith.shrsi (signed arithmetic right shift)
+class ShrSIOpConversion : public OpConversionPattern<arith::ShRSIOp> {
+public:
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(arith::ShRSIOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Type type = getTypeConverter()->convertType(op.getType());
+    if (!isa_and_nonnull<IntegerType>(type))
+      return rewriter.notifyMatchFailure(op, "expected integer type");
+    if (type.isInteger(1))
+      return rewriter.notifyMatchFailure(op, "i1 shift not supported");
+
+    // shrsi 保持有符号类型，C 的 >> 对有符号整数是算术右移（实现定义，
+    // 但所有目标平台均如此），与 arith.shrsi 语义一致
+    Type signedType = rewriter.getIntegerType(
+        type.getIntOrFloatBitWidth(), /*isSigned=*/true);
+
+    Value lhs = adaptor.getLhs();
+    Value rhs = adaptor.getRhs();
+    if (type != signedType) {
+      lhs = rewriter.create<emitc::CastOp>(op.getLoc(), signedType, lhs);
+      rhs = rewriter.create<emitc::CastOp>(op.getLoc(), signedType, rhs);
+    }
+
+    Value result = rewriter.create<emitc::BitwiseRightShiftOp>(
+        op.getLoc(), signedType, lhs, rhs);
+
+    if (signedType != type)
+      result = rewriter.create<emitc::CastOp>(op.getLoc(), type, result);
+
+    rewriter.replaceOp(op, result);
+    return success();
+  }
+};
+
+// arith.shli (left shift)
+class ShlIOpConversion : public OpConversionPattern<arith::ShLIOp> {
+public:
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(arith::ShLIOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Type type = getTypeConverter()->convertType(op.getType());
+    if (!isa_and_nonnull<IntegerType>(type))
+      return rewriter.notifyMatchFailure(op, "expected integer type");
+    if (type.isInteger(1))
+      return rewriter.notifyMatchFailure(op, "i1 shift not supported");
+
+    // 左移在无符号类型上操作，避免有符号溢出 UB
+    Type unsignedType = rewriter.getIntegerType(
+        type.getIntOrFloatBitWidth(), /*isSigned=*/false);
+
+    Value lhs = adaptor.getLhs();
+    Value rhs = adaptor.getRhs();
+    if (type != unsignedType) {
+      lhs = rewriter.create<emitc::CastOp>(op.getLoc(), unsignedType, lhs);
+      rhs = rewriter.create<emitc::CastOp>(op.getLoc(), unsignedType, rhs);
+    }
+
+    Value result = rewriter.create<emitc::BitwiseLeftShiftOp>(
+        op.getLoc(), unsignedType, lhs, rhs);
+
+    if (unsignedType != type)
+      result = rewriter.create<emitc::CastOp>(op.getLoc(), type, result);
+
+    rewriter.replaceOp(op, result);
+    return success();
+  }
+};
+
+// ───────────────────────────────────────────────────────────────────────
+// 按位逻辑操作转换
+// arith.andi/ori/xori → emitc.bitwise_and/or/xor
+// 注意：这里使用无符号类型进行操作，与 C 的位运算语义一致
+// ───────────────────────────────────────────────────────────────────────
+template <typename ArithOp, typename EmitCOp>
+class BitwiseOpConversion final : public OpConversionPattern<ArithOp> {
+public:
+  using OpConversionPattern<ArithOp>::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(ArithOp op, typename ArithOp::Adaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Type type = this->getTypeConverter()->convertType(op.getType());
+    if (!isa_and_nonnull<IntegerType>(type))
+      return rewriter.notifyMatchFailure(op, "expected integer type");
+    if (type.isInteger(1))
+      return rewriter.notifyMatchFailure(op, "i1 not supported");
+
+    // 按位操作在无符号类型上进行，避免实现定义行为
+    Type unsignedType = rewriter.getIntegerType(
+        type.getIntOrFloatBitWidth(), /*isSigned=*/false);
+
+    Value lhs = adaptor.getLhs();
+    Value rhs = adaptor.getRhs();
+    if (type != unsignedType) {
+      lhs = rewriter.template create<emitc::CastOp>(op.getLoc(), unsignedType, lhs);
+      rhs = rewriter.template create<emitc::CastOp>(op.getLoc(), unsignedType, rhs);
+    }
+
+    Value result = rewriter.template create<EmitCOp>(
+        op.getLoc(), unsignedType, lhs, rhs);
+
+    if (unsignedType != type)
+      result = rewriter.template create<emitc::CastOp>(op.getLoc(), type, result);
+
+    rewriter.replaceOp(op, result);
+    return success();
+  }
+};
+
+// ───────────────────────────────────────────────────────────────────────
+// arith.bitcast 转换
+//
+// arith.bitcast 的语义：重新解释操作数的位模式为目标类型，
+// 等价于 C 中的 memcpy-based type punning（C99/C11 合法写法）或
+// C++20 的 std::bit_cast。
+//
+// 生成形式：emitc.call_opaque "bit_cast_i32_f32"(%val) 不够通用，
+// 改用 emitc.verbatim 或 emitc.call_opaque + 宏，最简洁的方案是
+// 利用 GCC/Clang 均支持的 __builtin_bit_cast（C++20 前的扩展）：
+//
+//   __builtin_bit_cast(dst_type, src_value)
+//
+// 在 emitc 中通过 emitc.call_opaque 表达：
+//   emitc.call_opaque "__builtin_bit_cast"(%src) {args=[#emitc.opaque<"float">]}
+//
+// 注意：仅支持 i32↔f32、i64↔f64 等等宽整数↔浮点的互转。
+// ───────────────────────────────────────────────────────────────────────
+class BitcastOpConversion : public OpConversionPattern<arith::BitcastOp> {
+public:
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(arith::BitcastOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+
+    Type srcType = adaptor.getIn().getType();
+    Type dstType = getTypeConverter()->convertType(op.getType());
+
+    if (!dstType)
+      return rewriter.notifyMatchFailure(op, "type conversion failed");
+
+    // 只支持标量整数↔浮点的等宽互转
+    auto isIntOrFloat = [](Type t) {
+      return isa<IntegerType>(t) || isa<FloatType>(t);
+    };
+    if (!isIntOrFloat(srcType) || !isIntOrFloat(dstType))
+      return rewriter.notifyMatchFailure(
+          op, "bitcast only supported between scalar int and float types");
+
+    // 获取目标类型对应的 C 类型名称字符串
+    // emitc 的 OpaqueType 可以携带任意 C 类型字符串
+    auto getCTypeName = [&](Type t) -> std::optional<std::string> {
+      if (t.isF32())       return "float";
+      if (t.isF64())       return "double";
+      if (t.isInteger(32)) return "int32_t";
+      if (t.isInteger(64)) return "int64_t";
+      if (t.isInteger(16)) return "int16_t";
+      if (t.isInteger(8))  return "int8_t";
+      return std::nullopt;
+    };
+
+    auto dstCName = getCTypeName(dstType);
+    if (!dstCName)
+      return rewriter.notifyMatchFailure(op, "unsupported bitcast target type");
+
+    // 生成：__builtin_bit_cast(dst_type, src)
+    // emitc.call_opaque 的 args 属性携带第一个参数（类型名），
+    // 操作数携带第二个参数（值）
+    //
+    // 等价 C 代码：__builtin_bit_cast(float, some_i32_value)
+    auto dstOpaqueType = emitc::OpaqueType::get(rewriter.getContext(),
+                                                 *dstCName);
+    // 用 emitc.call_opaque 生成函数调用形式：
+    //   (float)(__builtin_bit_cast(float, x))
+    // 注意：__builtin_bit_cast 是编译器内建，第一个参数是类型，第二个是值。
+    // emitc.call_opaque 不能直接表达「类型参数」，改用
+    // emitc.opaque 表达式包装：
+    //
+    //   emitc.expression : 生成 C 表达式
+    //
+    // 最简单且 emitc 完全支持的方法：
+    // 生成一个带类型注释的 call_opaque，callee 字符串直接包含类型部分。
+    //
+    // 实际上 __builtin_bit_cast 在 emitc 中最干净的表达方式是
+    // 利用 args 数组携带 #emitc.opaque<"float"> 作为第一个（类型）参数：
+    //
+    //   emitc.call_opaque "__builtin_bit_cast"(%val)
+    //       {args = [#emitc.opaque<"float">, 0 : index]} : ...
+    //
+    // 这样生成的 C 代码正好是：__builtin_bit_cast(float, val)
+
+    SmallVector<Attribute> args;
+    // 第一个参数：目标类型名（作为 opaque 字符串传入）
+    args.push_back(emitc::OpaqueAttr::get(rewriter.getContext(), *dstCName));
+    // 第二个参数：操作数索引 0（即 adaptor.getIn()）
+    args.push_back(rewriter.getIndexAttr(0));
+
+    rewriter.replaceOpWithNewOp<emitc::CallOpaqueOp>(
+        op,
+        /*resultTypes=*/TypeRange{dstType},
+        /*callee=*/"__builtin_bit_cast",
+        /*args=*/rewriter.getArrayAttr(args),
+        /*templateArgs=*/ArrayAttr{},
+        /*operands=*/ValueRange{adaptor.getIn()});
+
+    return success();
+  }
+};
+
+// ───────────────────────────────────────────────────────────────────────
+// arith.maxnumf / arith.minnumf / arith.maximumf / arith.minimumf 转换
+//
+// maxnumf/minnumf：IEEE 754 maxNum/minNum，NaN 时返回另一个操作数
+//   → fmaxf(f32) / fmax(f64) / fminf(f32) / fmin(f64)
+//
+// maximumf/minimumf：如果任一操作数为 NaN 则返回 NaN
+//   → 需要手动实现，这里用 emitc.call_opaque 调用辅助宏或内联条件表达式
+//   → 简化处理：目标平台无 NaN 传播需求时，同样映射到 fmaxf/fminf
+// ───────────────────────────────────────────────────────────────────────
+
+template <typename ArithOp>
+class FloatMinMaxOpConversion : public OpConversionPattern<ArithOp> {
+public:
+  using OpConversionPattern<ArithOp>::OpConversionPattern;
+
+  // 根据 op 类型和元素位宽选择对应的 C 函数名
+  static StringRef getCFuncName(bool isMax, unsigned bitWidth) {
+    if (isMax)
+      return bitWidth == 32 ? "fmaxf" : "fmax";
+    else
+      return bitWidth == 32 ? "fminf" : "fmin";
+  }
+
+  LogicalResult
+  matchAndRewrite(ArithOp op, typename ArithOp::Adaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+
+    Type srcType = adaptor.getLhs().getType();
+    if (!isa<FloatType>(srcType))
+      return rewriter.notifyMatchFailure(op, "expected float type");
+
+    Type dstType = this->getTypeConverter()->convertType(op.getType());
+    if (!dstType)
+      return rewriter.notifyMatchFailure(op, "type conversion failed");
+
+    unsigned bitWidth = srcType.getIntOrFloatBitWidth();
+    if (bitWidth != 32 && bitWidth != 64)
+      return rewriter.notifyMatchFailure(op,
+          "only f32 and f64 are supported for float min/max");
+
+    // isMax: maxnumf/maximumf → true, minnumf/minimumf → false
+    constexpr bool isMax =
+        std::is_same_v<ArithOp, arith::MaxNumFOp> ||
+        std::is_same_v<ArithOp, arith::MaximumFOp>;
+
+    StringRef funcName = getCFuncName(isMax, bitWidth);
+
+    // 生成：fmaxf(lhs, rhs) 或 fminf(lhs, rhs)
+    // args 中只放操作数索引，不放额外的类型参数
+    SmallVector<Attribute> args;
+    args.push_back(rewriter.getIndexAttr(0));  // lhs
+    args.push_back(rewriter.getIndexAttr(1));  // rhs
+
+    rewriter.replaceOpWithNewOp<emitc::CallOpaqueOp>(
+        op,
+        /*resultTypes=*/TypeRange{dstType},
+        /*callee=*/funcName,
+        /*args=*/rewriter.getArrayAttr(args),
+        /*templateArgs=*/ArrayAttr{},
+        /*operands=*/ValueRange{adaptor.getLhs(), adaptor.getRhs()});
+
+    return success();
+  }
+};
+
+// 整数 max/min：arith.maxsi / arith.minsi / arith.maxui / arith.minui
+// 映射到三目运算符，通过 emitc.conditional 表达
+template <typename ArithOp, bool isMax, bool isUnsigned>
+class IntMinMaxOpConversion : public OpConversionPattern<ArithOp> {
+public:
+  using OpConversionPattern<ArithOp>::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(ArithOp op, typename ArithOp::Adaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+
+    Type type = this->getTypeConverter()->convertType(op.getType());
+    if (!isa_and_nonnull<IntegerType>(type))
+      return rewriter.notifyMatchFailure(op, "expected integer type");
+
+    // 根据有符号/无符号选择比较类型
+    Type cmpType = isUnsigned
+        ? rewriter.getIntegerType(type.getIntOrFloatBitWidth(), /*isSigned=*/false)
+        : rewriter.getIntegerType(type.getIntOrFloatBitWidth(), /*isSigned=*/true);
+
+    Value lhs = adaptor.getLhs();
+    Value rhs = adaptor.getRhs();
+
+    // 如需调整符号性，先 cast
+    if (type != cmpType) {
+      lhs = rewriter.template create<emitc::CastOp>(op.getLoc(), cmpType, lhs);
+      rhs = rewriter.template create<emitc::CastOp>(op.getLoc(), cmpType, rhs);
+    }
+
+    // 生成比较：lhs > rhs (max) 或 lhs < rhs (min)
+    emitc::CmpPredicate pred = isMax ? emitc::CmpPredicate::gt
+                                     : emitc::CmpPredicate::lt;
+    Value cond = rewriter.create<emitc::CmpOp>(
+        op.getLoc(), rewriter.getI1Type(), pred, lhs, rhs);
+
+    // 生成三目：cond ? lhs : rhs
+    Value result = rewriter.create<emitc::ConditionalOp>(
+        op.getLoc(), cmpType, cond, lhs, rhs);
+
+    // cast 回原类型
+    if (type != cmpType)
+      result = rewriter.create<emitc::CastOp>(op.getLoc(), type, result);
+
+    rewriter.replaceOp(op, result);
+    return success();
+  }
+};
+} 
 // namespace
 
 //===----------------------------------------------------------------------===//
@@ -1360,6 +1754,7 @@ void mlir::populateArithToEmitCPatterns(TypeConverter &typeConverter,
     CmpFOpConversion,
     NegFOpConversion,
     SelectOpConversion,
+    IndexCastOpConversion,
     // Truncation is guaranteed for unsigned types.
     UnsignedCastConversion<arith::TruncIOp>,
     SignedCastConversion<arith::ExtSIOp>,
@@ -1367,7 +1762,26 @@ void mlir::populateArithToEmitCPatterns(TypeConverter &typeConverter,
     ItoFCastOpConversion<arith::SIToFPOp>,
     ItoFCastOpConversion<arith::UIToFPOp>,
     FtoICastOpConversion<arith::FPToSIOp>,
-    FtoICastOpConversion<arith::FPToUIOp>
+    FtoICastOpConversion<arith::FPToUIOp>,
+    // 移位操作
+    ShrUIOpConversion,
+    ShrSIOpConversion,
+    ShlIOpConversion,
+    // 按位逻辑操作
+    BitwiseOpConversion<arith::AndIOp, emitc::BitwiseAndOp>,
+    BitwiseOpConversion<arith::OrIOp,  emitc::BitwiseOrOp>,
+    BitwiseOpConversion<arith::XOrIOp, emitc::BitwiseXorOp>,
+    BitcastOpConversion,
+    // 浮点 min/max
+    FloatMinMaxOpConversion<arith::MaxNumFOp>,
+    FloatMinMaxOpConversion<arith::MinNumFOp>,
+    FloatMinMaxOpConversion<arith::MaximumFOp>,
+    FloatMinMaxOpConversion<arith::MinimumFOp>,
+    // 整数 min/max
+    IntMinMaxOpConversion<arith::MaxSIOp, /*isMax=*/true,  /*isUnsigned=*/false>,
+    IntMinMaxOpConversion<arith::MinSIOp, /*isMax=*/false, /*isUnsigned=*/false>,
+    IntMinMaxOpConversion<arith::MaxUIOp, /*isMax=*/true,  /*isUnsigned=*/true>,
+    IntMinMaxOpConversion<arith::MinUIOp, /*isMax=*/false, /*isUnsigned=*/true>
   >(typeConverter, ctx);
   // clang-format on
 }

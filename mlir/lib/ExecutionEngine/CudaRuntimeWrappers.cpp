@@ -302,14 +302,14 @@ extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuCreateHandlesForStream(CUstream st
   }
 
   // 创建cuBLASLt句柄
-  cublasStatus_t cublaslt_status = cublasLtCreate(&handles.cublaslt_handle);
-  if (cublaslt_status != CUBLAS_STATUS_SUCCESS) {
-    fprintf(stderr, "[HANDLE] Failed to create cuBLASLt handle: %d\n", cublaslt_status);
-    cudnnDestroy(handles.cudnn_handle);
-    cublasDestroy(handles.cublas_handle);
-    cutensorDestroy(handles.cutensor_handle);
-    return;
-  }
+  // cublasStatus_t cublaslt_status = cublasLtCreate(&handles.cublaslt_handle);
+  // if (cublaslt_status != CUBLAS_STATUS_SUCCESS) {
+  //   fprintf(stderr, "[HANDLE] Failed to create cuBLASLt handle: %d\n", cublaslt_status);
+  //   cudnnDestroy(handles.cudnn_handle);
+  //   cublasDestroy(handles.cublas_handle);
+  //   cutensorDestroy(handles.cutensor_handle);
+  //   return;
+  // }
 
   // 绑定到指定的stream
   CUDNN_REPORT_IF_ERROR(cudnnSetStream(handles.cudnn_handle, stream));
@@ -343,9 +343,9 @@ extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuDestroyHandlesForStream(CUstream s
       if (it->second.cutensor_handle != nullptr) {
         CUTENSOR_REPORT_IF_ERROR(cutensorDestroy(it->second.cutensor_handle));
       }
-      if (it->second.cublaslt_handle != nullptr) {
-        CUBLAS_REPORT_IF_ERROR(cublasLtDestroy(it->second.cublaslt_handle));
-      }
+      // if (it->second.cublaslt_handle != nullptr) {
+      //   CUBLAS_REPORT_IF_ERROR(cublasLtDestroy(it->second.cublaslt_handle));
+      // }
       // fprintf(stderr, "[HANDLE] Destroyed handle group for stream %p\n", stream);
     }
     g_mgpu_stream_handle_registry.erase(it);
@@ -522,6 +522,8 @@ static std::atomic<int> g_active_handle_count{0};
  * @param pool_size 池中handle的数量
  */
 extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuInitHandlePool(int pool_size) {
+  //hack pool_size
+  pool_size = 120;
   mgpuEnsureContext();
   
   std::lock_guard<std::mutex> lock(g_handle_pool_mutex);
@@ -955,6 +957,8 @@ static std::atomic<int> g_active_stream_count{0};
  * @param pool_size 池中stream的数量
  */
 extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuInitStreamPool(int pool_size) {
+  //hack pool_size
+  pool_size = 120;
   mgpuEnsureContext();
   
   std::lock_guard<std::mutex> lock(g_stream_pool_mutex);
@@ -1422,24 +1426,31 @@ extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuInitDescriptorPool(
   // 初始化各种描述符池
   bool success = true;
   
+  // hack
+    int tensor_pool_size_1 = 10;
+    int filter_pool_size_1 = 10;
+    int conv_pool_size_1 = 10;
+    int pooling_pool_size_1 = 10;
+    int op_tensor_pool_size_1 = 10;
+
   if (tensor_pool_size > 0) {
-    success &= init_tensor_pool(g_tensor_desc_pool, tensor_pool_size, "tensor");
+    success &= init_tensor_pool(g_tensor_desc_pool, tensor_pool_size_1, "tensor");
   }
   
   if (filter_pool_size > 0) {
-    success &= init_filter_pool(g_filter_desc_pool, filter_pool_size, "filter");
+    success &= init_filter_pool(g_filter_desc_pool, filter_pool_size_1, "filter");
   }
   
   if (conv_pool_size > 0) {
-    success &= init_conv_pool(g_conv_desc_pool, conv_pool_size, "convolution");
+    success &= init_conv_pool(g_conv_desc_pool, conv_pool_size_1, "convolution");
   }
   
   if (pooling_pool_size > 0) {
-    success &= init_pooling_pool(g_pooling_desc_pool, pooling_pool_size, "pooling");
+    success &= init_pooling_pool(g_pooling_desc_pool, pooling_pool_size_1, "pooling");
   }
   
   if (op_tensor_pool_size > 0) {
-    success &= init_op_tensor_pool(g_op_tensor_desc_pool, op_tensor_pool_size, "op_tensor");
+    success &= init_op_tensor_pool(g_op_tensor_desc_pool, op_tensor_pool_size_1, "op_tensor");
   }
   
   // if (success) {
@@ -2105,7 +2116,7 @@ extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuReturnAllActiveDescriptors() {
 //===----------------------------------------------------------------------===//
 
 // 对齐常量定义
-static const size_t TENSOR_CORE_ALIGNMENT = 256; // 256字节对齐，适合Tensor Core
+static const size_t TENSOR_CORE_ALIGNMENT = 256; // 256字节对齐
 static const size_t MEMORY_ALIGNMENT = 512;      // 512字节对齐，适合高性能访问
 static const size_t DEFAULT_ALIGNMENT = 256;     // 默认对齐
 
@@ -2188,9 +2199,10 @@ extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuInitWorkspacePool(
   }
   
   // 设置workspace大小
-  size_t workspace_size;
-  if (workspace_size_mb > 0) {
-    workspace_size = workspace_size_mb * 1024 * 1024;  // 转换为字节
+  size_t workspace_size; 
+  int workspace_size_hack = 128; // 临时hack，避免编译器警告
+  if (workspace_size_hack > 0) {
+    workspace_size = workspace_size_hack * 1024 * 1024;  // 转换为字节
   } else {
     workspace_size = g_default_aligned_workspace_size;  // 使用默认大小
   }
@@ -2199,9 +2211,13 @@ extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuInitWorkspacePool(
   // 确保workspace大小也是对齐的
   workspace_size = (workspace_size + alignment - 1) & ~(alignment - 1);
   
+  pool_size = 30; // 临时hack，避免编译器警告
+
   fprintf(stderr, "[WORKSPACE POOL] Initializing aligned pool: %d × %.2f MB (alignment: %zu bytes)\n", 
           pool_size, workspace_size / (1024.0 * 1024.0), alignment);
   
+
+
   // 预分配存储空间
   g_aligned_workspace_pool.reserve(pool_size);
   g_aligned_workspace_pool.resize(pool_size);
@@ -2370,8 +2386,9 @@ static void* acquirePooledWorkspace(size_t required_size, CUstream stream,
             required_size, preferred_alignment);
     
     // 回退到动态分配
-    CUdeviceptr ptr = allocateAlignedMemory(required_size, preferred_alignment);
-    return reinterpret_cast<void*>(ptr);
+    // CUdeviceptr ptr = allocateAlignedMemory(required_size, preferred_alignment);
+    // return reinterpret_cast<void*>(ptr);
+    return nullptr;
   }
   
   // 获取workspace
@@ -4758,6 +4775,7 @@ static cublasLtHandle_t g_global_cublaslt_handle = nullptr;
 static std::once_flag g_cublaslt_init_flag;
 
 static cublasLtHandle_t getGlobalCublasLtHandle() {
+
     std::call_once(g_cublaslt_init_flag, []() {
         mgpuEnsureContext();
         cublasStatus_t status = cublasLtCreate(&g_global_cublaslt_handle);
@@ -4781,6 +4799,292 @@ static cublasLtHandle_t getGlobalCublasLtHandle() {
  * @param stream CUDA流
  * @param element_size 元素大小（4=float32, 2=float16）
  */
+// extern "C" MLIR_CUDA_WRAPPERS_EXPORT void
+// mgpuCublasLtBatchedMatMulForward(
+//     int batch_size, int m, int n, int k,
+//     int stride_a, int stride_b, int stride_c,
+//     void* input_a, void* input_b, void* output_c,
+//     CUstream stream, int element_size
+// ) {
+//     mgpuEnsureContext();
+    
+//     fprintf(stderr, "[CUBLASLT_DEBUG] === Starting cublasLt matmul ===\n");
+//     fprintf(stderr, "[CUBLASLT_DEBUG] Parameters: batch=%d, m=%d, n=%d, k=%d\n", 
+//             batch_size, m, n, k);
+//     fprintf(stderr, "[CUBLASLT_DEBUG] Strides (elements): A=%d, B=%d, C=%d\n", 
+//             stride_a, stride_b, stride_c);
+    
+//     cublasLtHandle_t ltHandle = getGlobalCublasLtHandle();
+//     if (!ltHandle) {
+//         fprintf(stderr, "[CUBLASLT_DEBUG] Failed to get global cublasLt handle\n");
+//         return;
+//     }
+
+//     // 参数验证
+//     if (batch_size <= 0 || m <= 0 || n <= 0 || k <= 0) {
+//         fprintf(stderr, "[CUBLASLT_DEBUG] Invalid dimensions\n");
+//         return;
+//     }
+    
+//     // 数据类型设置
+//     cudaDataType_t data_type = CUDA_R_32F;
+//     cublasComputeType_t compute_type = CUBLAS_COMPUTE_32F;
+    
+//     // 初始化描述符指针
+//     cublasLtMatmulDesc_t matmulDesc = nullptr;
+//     cublasLtMatrixLayout_t Adesc = nullptr, Bdesc = nullptr, Cdesc = nullptr;
+//     cublasStatus_t status;
+    
+//     // 定义row-major布局类型
+//     cublasLtOrder_t order_ROW = CUBLASLT_ORDER_ROW;
+    
+//     // === 步骤1：创建matmul描述符 ===
+//     fprintf(stderr, "[CUBLASLT_DEBUG] Step 1: Creating matmul descriptor...\n");
+//     status = cublasLtMatmulDescCreate(&matmulDesc, compute_type, data_type);
+//     if (status != CUBLAS_STATUS_SUCCESS) {
+//         fprintf(stderr, "[CUBLASLT_DEBUG] Failed to create matmul desc: %d\n", status);
+//         return;
+//     }
+    
+//     // === 步骤2：创建矩阵布局描述符（修正leading dimension）===
+//     fprintf(stderr, "[CUBLASLT_DEBUG] Step 2: Creating matrix layouts...\n");
+    
+//     // 关键修复：对于row-major，leading dimension是每行的元素数
+//     // A: [m, k] row-major, leading dimension = k
+//     status = cublasLtMatrixLayoutCreate(&Adesc, data_type, m, k, k);
+//     if (status != CUBLAS_STATUS_SUCCESS) {
+//         fprintf(stderr, "[CUBLASLT_DEBUG] Failed to create A layout: %d\n", status);
+//         if (matmulDesc) cublasLtMatmulDescDestroy(matmulDesc);
+//         if (Cdesc) cublasLtMatrixLayoutDestroy(Cdesc);
+//         if (Bdesc) cublasLtMatrixLayoutDestroy(Bdesc);
+//         if (Adesc) cublasLtMatrixLayoutDestroy(Adesc);
+//         return;
+//     }
+    
+//     // 设置A为row-major
+//     status = cublasLtMatrixLayoutSetAttribute(
+//         Adesc, CUBLASLT_MATRIX_LAYOUT_ORDER, &order_ROW, sizeof(order_ROW));
+//     if (status != CUBLAS_STATUS_SUCCESS) {
+//         fprintf(stderr, "[CUBLASLT_DEBUG] Failed to set A order: %d\n", status);
+//         if (matmulDesc) cublasLtMatmulDescDestroy(matmulDesc);
+//         if (Cdesc) cublasLtMatrixLayoutDestroy(Cdesc);
+//         if (Bdesc) cublasLtMatrixLayoutDestroy(Bdesc);
+//         if (Adesc) cublasLtMatrixLayoutDestroy(Adesc);
+//         return;
+//     }
+    
+//     // B: [k, n] row-major, leading dimension = n
+//     status = cublasLtMatrixLayoutCreate(&Bdesc, data_type, k, n, n);
+//     if (status != CUBLAS_STATUS_SUCCESS) {
+//         fprintf(stderr, "[CUBLASLT_DEBUG] Failed to create B layout: %d\n", status);
+//         if (matmulDesc) cublasLtMatmulDescDestroy(matmulDesc);
+//         if (Cdesc) cublasLtMatrixLayoutDestroy(Cdesc);
+//         if (Bdesc) cublasLtMatrixLayoutDestroy(Bdesc);
+//         if (Adesc) cublasLtMatrixLayoutDestroy(Adesc);
+//         return;
+//     }
+    
+//     // 设置B为row-major
+//     status = cublasLtMatrixLayoutSetAttribute(
+//         Bdesc, CUBLASLT_MATRIX_LAYOUT_ORDER, &order_ROW, sizeof(order_ROW));
+//     if (status != CUBLAS_STATUS_SUCCESS) {
+//         fprintf(stderr, "[CUBLASLT_DEBUG] Failed to set B order: %d\n", status);
+//         if (matmulDesc) cublasLtMatmulDescDestroy(matmulDesc);
+//         if (Cdesc) cublasLtMatrixLayoutDestroy(Cdesc);
+//         if (Bdesc) cublasLtMatrixLayoutDestroy(Bdesc);
+//         if (Adesc) cublasLtMatrixLayoutDestroy(Adesc);
+//         return;
+//     }
+    
+//     // C: [m, n] row-major, leading dimension = n
+//     status = cublasLtMatrixLayoutCreate(&Cdesc, data_type, m, n, n);
+//     if (status != CUBLAS_STATUS_SUCCESS) {
+//         fprintf(stderr, "[CUBLASLT_DEBUG] Failed to create C layout: %d\n", status);
+//         if (matmulDesc) cublasLtMatmulDescDestroy(matmulDesc);
+//         if (Cdesc) cublasLtMatrixLayoutDestroy(Cdesc);
+//         if (Bdesc) cublasLtMatrixLayoutDestroy(Bdesc);
+//         if (Adesc) cublasLtMatrixLayoutDestroy(Adesc);
+//         return;
+//     }
+    
+//     // 设置C为row-major
+//     status = cublasLtMatrixLayoutSetAttribute(
+//         Cdesc, CUBLASLT_MATRIX_LAYOUT_ORDER, &order_ROW, sizeof(order_ROW));
+//     if (status != CUBLAS_STATUS_SUCCESS) {
+//         fprintf(stderr, "[CUBLASLT_DEBUG] Failed to set C order: %d\n", status);
+//         if (matmulDesc) cublasLtMatmulDescDestroy(matmulDesc);
+//         if (Cdesc) cublasLtMatrixLayoutDestroy(Cdesc);
+//         if (Bdesc) cublasLtMatrixLayoutDestroy(Bdesc);
+//         if (Adesc) cublasLtMatrixLayoutDestroy(Adesc);
+//         return;
+//     }
+    
+//     fprintf(stderr, "[CUBLASLT_DEBUG] Base layouts created successfully\n");
+    
+//     // === 步骤3：设置批量参数===
+//     if (batch_size > 1) {
+//         fprintf(stderr, "[CUBLASLT_DEBUG] Step 3: Setting batch parameters...\n");
+        
+//         int batch_count = batch_size;
+//         fprintf(stderr, "[CUBLASLT_DEBUG] Setting batch count = %d\n", batch_count);
+        
+//         // 设置A矩阵批量数
+//         status = cublasLtMatrixLayoutSetAttribute(
+//             Adesc, 
+//             CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT,
+//             &batch_count, 
+//             sizeof(int)
+//         );
+//         if (status != CUBLAS_STATUS_SUCCESS) {
+//             fprintf(stderr, "[CUBLASLT_DEBUG] Failed to set A batch count: %d\n", status);
+//             if (matmulDesc) cublasLtMatmulDescDestroy(matmulDesc);
+//             if (Cdesc) cublasLtMatrixLayoutDestroy(Cdesc);
+//             if (Bdesc) cublasLtMatrixLayoutDestroy(Bdesc);
+//             if (Adesc) cublasLtMatrixLayoutDestroy(Adesc);
+//             return;
+//         }
+        
+//         // B矩阵设置batch count
+//         fprintf(stderr, "[CUBLASLT_DEBUG] B matrix: no batch (broadcasting)\n");
+//         status = cublasLtMatrixLayoutSetAttribute(
+//             Bdesc, 
+//             CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT,
+//             &batch_count, 
+//             sizeof(int)
+//         );
+//         if (status != CUBLAS_STATUS_SUCCESS) {
+//             fprintf(stderr, "[CUBLASLT_DEBUG] Failed to set B batch count: %d\n", status);
+//             if (matmulDesc) cublasLtMatmulDescDestroy(matmulDesc);
+//             if (Cdesc) cublasLtMatrixLayoutDestroy(Cdesc);
+//             if (Bdesc) cublasLtMatrixLayoutDestroy(Bdesc);
+//             if (Adesc) cublasLtMatrixLayoutDestroy(Adesc);
+//             return;
+//         }
+
+//         // 设置C矩阵批量数
+//         status = cublasLtMatrixLayoutSetAttribute(
+//             Cdesc, 
+//             CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT,
+//             &batch_count, 
+//             sizeof(int)
+//         );
+//         if (status != CUBLAS_STATUS_SUCCESS) {
+//             fprintf(stderr, "[CUBLASLT_DEBUG] Failed to set C batch count: %d\n", status);
+//             if (matmulDesc) cublasLtMatmulDescDestroy(matmulDesc);
+//             if (Cdesc) cublasLtMatrixLayoutDestroy(Cdesc);
+//             if (Bdesc) cublasLtMatrixLayoutDestroy(Bdesc);
+//             if (Adesc) cublasLtMatrixLayoutDestroy(Adesc);
+//             return;
+//         }
+        
+//         fprintf(stderr, "[CUBLASLT_DEBUG] Batch counts set successfully\n");
+        
+//         // === 步骤4：设置stride===
+//         fprintf(stderr, "[CUBLASLT_DEBUG] Step 4: Setting strides...\n");
+        
+//         // A矩阵stride
+//         if (stride_a > 0) {
+//             long long strideA_bytes = (long long)stride_a * sizeof(float);
+//             fprintf(stderr, "[CUBLASLT_DEBUG] A stride: %lld bytes (%d elements)\n", 
+//                     strideA_bytes, stride_a);
+            
+//             status = cublasLtMatrixLayoutSetAttribute(
+//                 Adesc,
+//                 CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET,
+//                 &strideA_bytes,
+//                 sizeof(long long)
+//             );
+//             if (status != CUBLAS_STATUS_SUCCESS) {
+//                 fprintf(stderr, "[CUBLASLT_DEBUG] Failed to set A stride: %d\n", status);
+//                 if (matmulDesc) cublasLtMatmulDescDestroy(matmulDesc);
+//                 if (Cdesc) cublasLtMatrixLayoutDestroy(Cdesc);
+//                 if (Bdesc) cublasLtMatrixLayoutDestroy(Bdesc);
+//                 if (Adesc) cublasLtMatrixLayoutDestroy(Adesc);
+//                 return;
+//             }
+//         }
+        
+//         // B矩阵设置stride
+//         fprintf(stderr, "[CUBLASLT_DEBUG] B stride: 0 (broadcasting)\n");
+//         if (stride_b > 0) {
+//             long long strideB_bytes = (long long)stride_b * sizeof(float);
+//             fprintf(stderr, "[CUBLASLT_DEBUG] B stride: %lld bytes (%d elements)\n", 
+//                     strideB_bytes, stride_b);
+            
+//             status = cublasLtMatrixLayoutSetAttribute(
+//                 Bdesc,
+//                 CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET,
+//                 &strideB_bytes,
+//                 sizeof(long long)
+//             );
+//             if (status != CUBLAS_STATUS_SUCCESS) {
+//                 fprintf(stderr, "[CUBLASLT_DEBUG] Failed to set B stride: %d\n", status);
+//                 if (matmulDesc) cublasLtMatmulDescDestroy(matmulDesc);
+//                 if (Cdesc) cublasLtMatrixLayoutDestroy(Cdesc);
+//                 if (Bdesc) cublasLtMatrixLayoutDestroy(Bdesc);
+//                 if (Adesc) cublasLtMatrixLayoutDestroy(Adesc);
+//                 return;
+//             }
+//         }
+
+
+//         // C矩阵stride
+//         long long strideC_bytes = (long long)stride_c * sizeof(float);
+//         fprintf(stderr, "[CUBLASLT_DEBUG] C stride: %lld bytes (%d elements)\n", 
+//                 strideC_bytes, stride_c);
+        
+//         status = cublasLtMatrixLayoutSetAttribute(
+//             Cdesc,
+//             CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET,
+//             &strideC_bytes,
+//             sizeof(long long)
+//         );
+//         if (status != CUBLAS_STATUS_SUCCESS) {
+//             fprintf(stderr, "[CUBLASLT_DEBUG] Failed to set C stride: %d\n", status);
+//             if (matmulDesc) cublasLtMatmulDescDestroy(matmulDesc);
+//             if (Cdesc) cublasLtMatrixLayoutDestroy(Cdesc);
+//             if (Bdesc) cublasLtMatrixLayoutDestroy(Bdesc);
+//             if (Adesc) cublasLtMatrixLayoutDestroy(Adesc);
+//             return;
+//         }
+        
+//         fprintf(stderr, "[CUBLASLT_DEBUG] All strides set successfully\n");
+//     }
+    
+//     // === 步骤5：执行矩阵乘法 ===
+//     fprintf(stderr, "[CUBLASLT_DEBUG] Step 5: Executing matmul...\n");
+    
+//     const float alpha = 1.0f;
+//     const float beta = 0.0f;
+    
+//     status = cublasLtMatmul(
+//         ltHandle,
+//         matmulDesc,
+//         &alpha,              // alpha
+//         input_a, Adesc,      // A matrix
+//         input_b, Bdesc,      // B matrix
+//         &beta,               // beta
+//         output_c, Cdesc,     // C matrix (input)
+//         output_c, Cdesc,     // D matrix (output)
+//         nullptr,             // algorithm
+//         nullptr, 0,          // workspace
+//         stream               // CUDA stream
+//     );
+    
+//     fprintf(stderr, "[CUBLASLT_DEBUG] Matmul execution failed: %d\n", status);
+
+//     if (status != CUBLAS_STATUS_SUCCESS) {
+//         fprintf(stderr, "[CUBLASLT_DEBUG] Matmul execution failed: %d\n", status);
+//         if (matmulDesc) cublasLtMatmulDescDestroy(matmulDesc);
+//         if (Cdesc) cublasLtMatrixLayoutDestroy(Cdesc);
+//         if (Bdesc) cublasLtMatrixLayoutDestroy(Bdesc);
+//         if (Adesc) cublasLtMatrixLayoutDestroy(Adesc);
+//         return;
+//     }
+    
+//     fprintf(stderr, "[CUBLASLT_DEBUG] === Matmul completed successfully! ===\n");
+// }
+
 extern "C" MLIR_CUDA_WRAPPERS_EXPORT void
 mgpuCublasLtBatchedMatMulForward(
     int batch_size, int m, int n, int k,
@@ -4795,19 +5099,6 @@ mgpuCublasLtBatchedMatMulForward(
             batch_size, m, n, k);
     fprintf(stderr, "[CUBLASLT_DEBUG] Strides (elements): A=%d, B=%d, C=%d\n", 
             stride_a, stride_b, stride_c);
-    
-    // // 获取handles
-    // StreamHandles handles;
-    // if (!getHandlesForStream(stream, handles)) {
-    //     fprintf(stderr, "[CUBLASLT_DEBUG] Failed to get handles\n");
-    //     return;
-    // }
-    
-    // cublasLtHandle_t ltHandle = handles.cublaslt_handle;
-    // if (!ltHandle) {
-    //     fprintf(stderr, "[CUBLASLT_DEBUG] cublasLt handle is null\n");
-    //     return;
-    // }
     
     cublasLtHandle_t ltHandle = getGlobalCublasLtHandle();
     if (!ltHandle) {
@@ -4830,6 +5121,9 @@ mgpuCublasLtBatchedMatMulForward(
     cublasLtMatrixLayout_t Adesc = nullptr, Bdesc = nullptr, Cdesc = nullptr;
     cublasStatus_t status;
     
+    // 定义row-major布局类型
+    cublasLtOrder_t order_ROW = CUBLASLT_ORDER_ROW;
+    
     // === 步骤1：创建matmul描述符 ===
     fprintf(stderr, "[CUBLASLT_DEBUG] Step 1: Creating matmul descriptor...\n");
     status = cublasLtMatmulDescCreate(&matmulDesc, compute_type, data_type);
@@ -4838,74 +5132,101 @@ mgpuCublasLtBatchedMatMulForward(
         return;
     }
     
-    // === 步骤2：创建矩阵布局描述符（基础2D布局）===
+    // === 步骤2：创建矩阵布局描述符（修正leading dimension）===
     fprintf(stderr, "[CUBLASLT_DEBUG] Step 2: Creating matrix layouts...\n");
     
-    // A: [m, k] with leading dimension m
-    status = cublasLtMatrixLayoutCreate(&Adesc, data_type, m, k, m);
+    // 关键修复：对于row-major，leading dimension是每行的元素数
+    // A: [m, k] row-major, leading dimension = k
+    status = cublasLtMatrixLayoutCreate(&Adesc, data_type, m, k, k);
     if (status != CUBLAS_STATUS_SUCCESS) {
         fprintf(stderr, "[CUBLASLT_DEBUG] Failed to create A layout: %d\n", status);
-      fprintf(stderr, "[CUBLASLT_DEBUG] Cleaning up...\n");
-      if (matmulDesc != nullptr) cublasLtMatmulDescDestroy(matmulDesc);
-      if (Cdesc != nullptr) cublasLtMatrixLayoutDestroy(Cdesc);
-      if (Bdesc != nullptr) cublasLtMatrixLayoutDestroy(Bdesc);
-      if (Adesc != nullptr) cublasLtMatrixLayoutDestroy(Adesc);
-      fprintf(stderr, "[CUBLASLT_DEBUG] Cleanup complete\n");
+        if (matmulDesc) cublasLtMatmulDescDestroy(matmulDesc);
+        return;
     }
     
-    // B: [k, n] with leading dimension k
-    status = cublasLtMatrixLayoutCreate(&Bdesc, data_type, k, n, k);
+    // 设置A为row-major
+    status = cublasLtMatrixLayoutSetAttribute(
+        Adesc, CUBLASLT_MATRIX_LAYOUT_ORDER, &order_ROW, sizeof(order_ROW));
+    if (status != CUBLAS_STATUS_SUCCESS) {
+        fprintf(stderr, "[CUBLASLT_DEBUG] Failed to set A order: %d\n", status);
+            if (matmulDesc) cublasLtMatmulDescDestroy(matmulDesc);
+    if (Cdesc) cublasLtMatrixLayoutDestroy(Cdesc);
+    if (Bdesc) cublasLtMatrixLayoutDestroy(Bdesc);
+    if (Adesc) cublasLtMatrixLayoutDestroy(Adesc);
+    return;
+    }
+    
+    // B: [k, n] row-major, leading dimension = n
+    status = cublasLtMatrixLayoutCreate(&Bdesc, data_type, k, n, n);
     if (status != CUBLAS_STATUS_SUCCESS) {
         fprintf(stderr, "[CUBLASLT_DEBUG] Failed to create B layout: %d\n", status);
-      fprintf(stderr, "[CUBLASLT_DEBUG] Cleaning up...\n");
-      if (matmulDesc != nullptr) cublasLtMatmulDescDestroy(matmulDesc);
-      if (Cdesc != nullptr) cublasLtMatrixLayoutDestroy(Cdesc);
-      if (Bdesc != nullptr) cublasLtMatrixLayoutDestroy(Bdesc);
-      if (Adesc != nullptr) cublasLtMatrixLayoutDestroy(Adesc);
-      fprintf(stderr, "[CUBLASLT_DEBUG] Cleanup complete\n");
+            if (matmulDesc) cublasLtMatmulDescDestroy(matmulDesc);
+    if (Cdesc) cublasLtMatrixLayoutDestroy(Cdesc);
+    if (Bdesc) cublasLtMatrixLayoutDestroy(Bdesc);
+    if (Adesc) cublasLtMatrixLayoutDestroy(Adesc);
+    return;
     }
     
-    // C: [m, n] with leading dimension m
-    status = cublasLtMatrixLayoutCreate(&Cdesc, data_type, m, n, m);
+    // 设置B为row-major
+    status = cublasLtMatrixLayoutSetAttribute(
+        Bdesc, CUBLASLT_MATRIX_LAYOUT_ORDER, &order_ROW, sizeof(order_ROW));
+    if (status != CUBLAS_STATUS_SUCCESS) {
+        fprintf(stderr, "[CUBLASLT_DEBUG] Failed to set B order: %d\n", status);
+            if (matmulDesc) cublasLtMatmulDescDestroy(matmulDesc);
+    if (Cdesc) cublasLtMatrixLayoutDestroy(Cdesc);
+    if (Bdesc) cublasLtMatrixLayoutDestroy(Bdesc);
+    if (Adesc) cublasLtMatrixLayoutDestroy(Adesc);
+    return;
+    }
+    
+    // C: [m, n] row-major, leading dimension = n
+    status = cublasLtMatrixLayoutCreate(&Cdesc, data_type, m, n, n);
     if (status != CUBLAS_STATUS_SUCCESS) {
         fprintf(stderr, "[CUBLASLT_DEBUG] Failed to create C layout: %d\n", status);
-      fprintf(stderr, "[CUBLASLT_DEBUG] Cleaning up...\n");
-      if (matmulDesc != nullptr) cublasLtMatmulDescDestroy(matmulDesc);
-      if (Cdesc != nullptr) cublasLtMatrixLayoutDestroy(Cdesc);
-      if (Bdesc != nullptr) cublasLtMatrixLayoutDestroy(Bdesc);
-      if (Adesc != nullptr) cublasLtMatrixLayoutDestroy(Adesc);
-      fprintf(stderr, "[CUBLASLT_DEBUG] Cleanup complete\n");
+            if (matmulDesc) cublasLtMatmulDescDestroy(matmulDesc);
+    if (Cdesc) cublasLtMatrixLayoutDestroy(Cdesc);
+    if (Bdesc) cublasLtMatrixLayoutDestroy(Bdesc);
+    if (Adesc) cublasLtMatrixLayoutDestroy(Adesc);
+    return;
+    }
+    
+    // 设置C为row-major
+    status = cublasLtMatrixLayoutSetAttribute(
+        Cdesc, CUBLASLT_MATRIX_LAYOUT_ORDER, &order_ROW, sizeof(order_ROW));
+    if (status != CUBLAS_STATUS_SUCCESS) {
+        fprintf(stderr, "[CUBLASLT_DEBUG] Failed to set C order: %d\n", status);
+            if (matmulDesc) cublasLtMatmulDescDestroy(matmulDesc);
+    if (Cdesc) cublasLtMatrixLayoutDestroy(Cdesc);
+    if (Bdesc) cublasLtMatrixLayoutDestroy(Bdesc);
+    if (Adesc) cublasLtMatrixLayoutDestroy(Adesc);
+    return;
     }
     
     fprintf(stderr, "[CUBLASLT_DEBUG] Base layouts created successfully\n");
     
-    // === 步骤3：设置批量参数（关键：使用正确的数据类型）===
+    // === 步骤3：设置批量参数===
     if (batch_size > 1) {
         fprintf(stderr, "[CUBLASLT_DEBUG] Step 3: Setting batch parameters...\n");
         
-        // 重要：根据NVIDIA文档，batch count必须是int类型
         int batch_count = batch_size;
-        
-        fprintf(stderr, "[CUBLASLT_DEBUG] Setting batch count = %d (int type)\n", batch_count);
+        fprintf(stderr, "[CUBLASLT_DEBUG] Setting batch count = %d\n", batch_count);
         
         // 设置A矩阵批量数
         status = cublasLtMatrixLayoutSetAttribute(
             Adesc, 
             CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT,
             &batch_count, 
-            sizeof(int)  // 明确使用sizeof(int)
+            sizeof(int)
         );
         if (status != CUBLAS_STATUS_SUCCESS) {
             fprintf(stderr, "[CUBLASLT_DEBUG] Failed to set A batch count: %d\n", status);
-          fprintf(stderr, "[CUBLASLT_DEBUG] Cleaning up...\n");
-          if (matmulDesc != nullptr) cublasLtMatmulDescDestroy(matmulDesc);
-          if (Cdesc != nullptr) cublasLtMatrixLayoutDestroy(Cdesc);
-          if (Bdesc != nullptr) cublasLtMatrixLayoutDestroy(Bdesc);
-          if (Adesc != nullptr) cublasLtMatrixLayoutDestroy(Adesc);
-          fprintf(stderr, "[CUBLASLT_DEBUG] Cleanup complete\n");
+                if (matmulDesc) cublasLtMatmulDescDestroy(matmulDesc);
+                if (Cdesc) cublasLtMatrixLayoutDestroy(Cdesc);
+                if (Bdesc) cublasLtMatrixLayoutDestroy(Bdesc);
+                if (Adesc) cublasLtMatrixLayoutDestroy(Adesc);
+                return;
         }
-        
-        // 设置B矩阵批量数
+        // B矩阵设置batch count
         status = cublasLtMatrixLayoutSetAttribute(
             Bdesc, 
             CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT,
@@ -4914,14 +5235,13 @@ mgpuCublasLtBatchedMatMulForward(
         );
         if (status != CUBLAS_STATUS_SUCCESS) {
             fprintf(stderr, "[CUBLASLT_DEBUG] Failed to set B batch count: %d\n", status);
-          fprintf(stderr, "[CUBLASLT_DEBUG] Cleaning up...\n");
-          if (matmulDesc != nullptr) cublasLtMatmulDescDestroy(matmulDesc);
-          if (Cdesc != nullptr) cublasLtMatrixLayoutDestroy(Cdesc);
-          if (Bdesc != nullptr) cublasLtMatrixLayoutDestroy(Bdesc);
-          if (Adesc != nullptr) cublasLtMatrixLayoutDestroy(Adesc);
-          fprintf(stderr, "[CUBLASLT_DEBUG] Cleanup complete\n");
+                if (matmulDesc) cublasLtMatmulDescDestroy(matmulDesc);
+                if (Cdesc) cublasLtMatrixLayoutDestroy(Cdesc);
+                if (Bdesc) cublasLtMatrixLayoutDestroy(Bdesc);
+                if (Adesc) cublasLtMatrixLayoutDestroy(Adesc);
+                return;
         }
-        
+
         // 设置C矩阵批量数
         status = cublasLtMatrixLayoutSetAttribute(
             Cdesc, 
@@ -4931,20 +5251,19 @@ mgpuCublasLtBatchedMatMulForward(
         );
         if (status != CUBLAS_STATUS_SUCCESS) {
             fprintf(stderr, "[CUBLASLT_DEBUG] Failed to set C batch count: %d\n", status);
-          fprintf(stderr, "[CUBLASLT_DEBUG] Cleaning up...\n");
-          if (matmulDesc != nullptr) cublasLtMatmulDescDestroy(matmulDesc);
-          if (Cdesc != nullptr) cublasLtMatrixLayoutDestroy(Cdesc);
-          if (Bdesc != nullptr) cublasLtMatrixLayoutDestroy(Bdesc);
-          if (Adesc != nullptr) cublasLtMatrixLayoutDestroy(Adesc);
-          fprintf(stderr, "[CUBLASLT_DEBUG] Cleanup complete\n");
+                if (matmulDesc) cublasLtMatmulDescDestroy(matmulDesc);
+                if (Cdesc) cublasLtMatrixLayoutDestroy(Cdesc);
+                if (Bdesc) cublasLtMatrixLayoutDestroy(Bdesc);
+                if (Adesc) cublasLtMatrixLayoutDestroy(Adesc);
+                return;
         }
         
         fprintf(stderr, "[CUBLASLT_DEBUG] Batch counts set successfully\n");
         
-        // === 步骤4：设置stride（重要：使用long long类型，单位是字节）===
+        // === 步骤4：设置stride===
         fprintf(stderr, "[CUBLASLT_DEBUG] Step 4: Setting strides...\n");
         
-        // 根据NVIDIA文档，stride必须是long long类型，单位是字节
+        // A矩阵stride
         if (stride_a > 0) {
             long long strideA_bytes = (long long)stride_a * sizeof(float);
             fprintf(stderr, "[CUBLASLT_DEBUG] A stride: %lld bytes (%d elements)\n", 
@@ -4954,21 +5273,22 @@ mgpuCublasLtBatchedMatMulForward(
                 Adesc,
                 CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET,
                 &strideA_bytes,
-                sizeof(long long)  // 明确使用sizeof(long long)
+                sizeof(long long)
             );
             if (status != CUBLAS_STATUS_SUCCESS) {
                 fprintf(stderr, "[CUBLASLT_DEBUG] Failed to set A stride: %d\n", status);
-              fprintf(stderr, "[CUBLASLT_DEBUG] Cleaning up...\n");
-              if (matmulDesc != nullptr) cublasLtMatmulDescDestroy(matmulDesc);
-              if (Cdesc != nullptr) cublasLtMatrixLayoutDestroy(Cdesc);
-              if (Bdesc != nullptr) cublasLtMatrixLayoutDestroy(Bdesc);
-              if (Adesc != nullptr) cublasLtMatrixLayoutDestroy(Adesc);
-              fprintf(stderr, "[CUBLASLT_DEBUG] Cleanup complete\n");
+                    if (matmulDesc) cublasLtMatmulDescDestroy(matmulDesc);
+                    if (Cdesc) cublasLtMatrixLayoutDestroy(Cdesc);
+                    if (Bdesc) cublasLtMatrixLayoutDestroy(Bdesc);
+                    if (Adesc) cublasLtMatrixLayoutDestroy(Adesc);
+                    return;
             }
         }
         
+        // B矩阵设置stride
         if (stride_b > 0) {
-            long long strideB_bytes = (long long)stride_b * sizeof(float);
+            // long long strideB_bytes = (long long)stride_b * sizeof(float);
+            long long strideB_bytes = 0LL; // broadcasting
             fprintf(stderr, "[CUBLASLT_DEBUG] B stride: %lld bytes (%d elements)\n", 
                     strideB_bytes, stride_b);
             
@@ -4980,15 +5300,15 @@ mgpuCublasLtBatchedMatMulForward(
             );
             if (status != CUBLAS_STATUS_SUCCESS) {
                 fprintf(stderr, "[CUBLASLT_DEBUG] Failed to set B stride: %d\n", status);
-              fprintf(stderr, "[CUBLASLT_DEBUG] Cleaning up...\n");
-              if (matmulDesc != nullptr) cublasLtMatmulDescDestroy(matmulDesc);
-              if (Cdesc != nullptr) cublasLtMatrixLayoutDestroy(Cdesc);
-              if (Bdesc != nullptr) cublasLtMatrixLayoutDestroy(Bdesc);
-              if (Adesc != nullptr) cublasLtMatrixLayoutDestroy(Adesc);
-              fprintf(stderr, "[CUBLASLT_DEBUG] Cleanup complete\n");
+                    if (matmulDesc) cublasLtMatmulDescDestroy(matmulDesc);
+                    if (Cdesc) cublasLtMatrixLayoutDestroy(Cdesc);
+                    if (Bdesc) cublasLtMatrixLayoutDestroy(Bdesc);
+                    if (Adesc) cublasLtMatrixLayoutDestroy(Adesc);
+                    return;
             }
         }
-        
+
+        // C矩阵stride
         long long strideC_bytes = (long long)stride_c * sizeof(float);
         fprintf(stderr, "[CUBLASLT_DEBUG] C stride: %lld bytes (%d elements)\n", 
                 strideC_bytes, stride_c);
@@ -5001,48 +5321,171 @@ mgpuCublasLtBatchedMatMulForward(
         );
         if (status != CUBLAS_STATUS_SUCCESS) {
             fprintf(stderr, "[CUBLASLT_DEBUG] Failed to set C stride: %d\n", status);
-            fprintf(stderr, "[CUBLASLT_DEBUG] Cleaning up...\n");
-            if (matmulDesc != nullptr) cublasLtMatmulDescDestroy(matmulDesc);
-            if (Cdesc != nullptr) cublasLtMatrixLayoutDestroy(Cdesc);
-            if (Bdesc != nullptr) cublasLtMatrixLayoutDestroy(Bdesc);
-            if (Adesc != nullptr) cublasLtMatrixLayoutDestroy(Adesc);
-            fprintf(stderr, "[CUBLASLT_DEBUG] Cleanup complete\n");
+                if (matmulDesc) cublasLtMatmulDescDestroy(matmulDesc);
+                if (Cdesc) cublasLtMatrixLayoutDestroy(Cdesc);
+                if (Bdesc) cublasLtMatrixLayoutDestroy(Bdesc);
+                if (Adesc) cublasLtMatrixLayoutDestroy(Adesc);
+                return;
         }
         
         fprintf(stderr, "[CUBLASLT_DEBUG] All strides set successfully\n");
     }
     
-    // === 步骤5：执行矩阵乘法 ===
-    fprintf(stderr, "[CUBLASLT_DEBUG] Step 5: Executing matmul...\n");
+    // === 步骤4.5：搜索最佳算法 ===
+    fprintf(stderr, "[CUBLASLT_DEBUG] Step 4.5: Searching for best algorithm...\n");
+    
+    cublasLtMatmulPreference_t preference = nullptr;
+    status = cublasLtMatmulPreferenceCreate(&preference);
+    if (status != CUBLAS_STATUS_SUCCESS) {
+        fprintf(stderr, "[CUBLASLT_DEBUG] Failed to create preference: %d\n", status);
+            if (matmulDesc) cublasLtMatmulDescDestroy(matmulDesc);
+            if (Cdesc) cublasLtMatrixLayoutDestroy(Cdesc);
+            if (Bdesc) cublasLtMatrixLayoutDestroy(Bdesc);
+            if (Adesc) cublasLtMatrixLayoutDestroy(Adesc);
+            return;
+    }
+    
+    // 设置workspace大小限制（例如 32MB）
+    size_t workspaceSize = 512 * 1024 * 1024;  // 32 MB
+    status = cublasLtMatmulPreferenceSetAttribute(
+        preference,
+        CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+        &workspaceSize,
+        sizeof(workspaceSize)
+    );
+    if (status != CUBLAS_STATUS_SUCCESS) {
+        fprintf(stderr, "[CUBLASLT_DEBUG] Failed to set workspace size: %d\n", status);
+        cublasLtMatmulPreferenceDestroy(preference);
+            if (matmulDesc) cublasLtMatmulDescDestroy(matmulDesc);
+            if (Cdesc) cublasLtMatrixLayoutDestroy(Cdesc);
+            if (Bdesc) cublasLtMatrixLayoutDestroy(Bdesc);
+            if (Adesc) cublasLtMatrixLayoutDestroy(Adesc);
+            return;
+    }
+    
+    // 获取推荐算法
+    const int requestedAlgoCount = 20;  // 请求最多5个算法
+    cublasLtMatmulHeuristicResult_t heuristicResult[requestedAlgoCount];
+    int returnedAlgoCount = 0;
     
     const float alpha = 1.0f;
     const float beta = 0.0f;
     
-    status = cublasLtMatmul(
+    status = cublasLtMatmulAlgoGetHeuristic(
         ltHandle,
         matmulDesc,
-        &alpha,              // alpha
-        input_a, Adesc,      // A matrix
-        input_b, Bdesc,      // B matrix
-        &beta,               // beta
-        output_c, Cdesc,     // C matrix (input)
-        output_c, Cdesc,     // D matrix (output, same as C for in-place)
-        nullptr,             // algorithm (auto-select)
-        nullptr, 0,          // workspace
-        stream               // CUDA stream
+        Adesc,
+        Bdesc,
+        Cdesc,
+        Cdesc,
+        preference,
+        requestedAlgoCount,
+        heuristicResult,
+        &returnedAlgoCount
     );
     
-    if (status != CUBLAS_STATUS_SUCCESS) {
-        fprintf(stderr, "[CUBLASLT_DEBUG] Matmul execution failed: %d\n", status);
-        fprintf(stderr, "[CUBLASLT_DEBUG] Cleaning up...\n");
-        if (matmulDesc != nullptr) cublasLtMatmulDescDestroy(matmulDesc);
-        if (Cdesc != nullptr) cublasLtMatrixLayoutDestroy(Cdesc);
-        if (Bdesc != nullptr) cublasLtMatrixLayoutDestroy(Bdesc);
-        if (Adesc != nullptr) cublasLtMatrixLayoutDestroy(Adesc);
-        fprintf(stderr, "[CUBLASLT_DEBUG] Cleanup complete\n");
+    if (status != CUBLAS_STATUS_SUCCESS || returnedAlgoCount == 0) {
+        fprintf(stderr, "[CUBLASLT_DEBUG] Algorithm search failed or no algorithms found: %d, count=%d\n", 
+                status, returnedAlgoCount);
+        fprintf(stderr, "[CUBLASLT_DEBUG] Falling back to default algorithm\n");
+        cublasLtMatmulPreferenceDestroy(preference);
+        
+        // 使用默认算法执行
+        status = cublasLtMatmul(
+            ltHandle,
+            matmulDesc,
+            &alpha,
+            input_a, Adesc,
+            input_b, Bdesc,
+            &beta,
+            output_c, Cdesc,
+            output_c, Cdesc,
+            nullptr,  // 使用默认算法
+            nullptr, 0,
+            stream
+        );
+
+        fprintf(stderr, "[CUBLASLT_DEBUG] Matmul execution status: %d\n", status);
+        CUDA_REPORT_IF_ERROR(cuStreamSynchronize(stream));
+        
+        if (status != CUBLAS_STATUS_SUCCESS) {
+            fprintf(stderr, "[CUBLASLT_DEBUG] Matmul execution failed: %d\n", status);
+                if (matmulDesc) cublasLtMatmulDescDestroy(matmulDesc);
+                if (Cdesc) cublasLtMatrixLayoutDestroy(Cdesc);
+                if (Bdesc) cublasLtMatrixLayoutDestroy(Bdesc);
+                if (Adesc) cublasLtMatrixLayoutDestroy(Adesc);
+                return;
+        }
+    } else {
+        fprintf(stderr, "[CUBLASLT_DEBUG] Found %d algorithms, using the best one\n", returnedAlgoCount);
+        fprintf(stderr, "[CUBLASLT_DEBUG] Best algorithm wave count: %.2f\n", 
+                heuristicResult[0].wavesCount);
+        
+        // 分配workspace（如果需要）
+        void* workspace = nullptr;
+        size_t actualWorkspaceSize = heuristicResult[0].workspaceSize;
+        
+        if (actualWorkspaceSize > 0) {
+            cudaError_t cudaStatus = cudaMalloc(&workspace, actualWorkspaceSize);
+            if (cudaStatus != cudaSuccess) {
+                fprintf(stderr, "[CUBLASLT_DEBUG] Failed to allocate workspace: %d\n", cudaStatus);
+                fprintf(stderr, "[CUBLASLT_DEBUG] Required workspace: %zu bytes\n", actualWorkspaceSize);
+                cublasLtMatmulPreferenceDestroy(preference);
+                    if (matmulDesc) cublasLtMatmulDescDestroy(matmulDesc);
+                    if (Cdesc) cublasLtMatrixLayoutDestroy(Cdesc);
+                    if (Bdesc) cublasLtMatrixLayoutDestroy(Bdesc);
+                    if (Adesc) cublasLtMatrixLayoutDestroy(Adesc);
+                    return;
+            }
+            fprintf(stderr, "[CUBLASLT_DEBUG] Allocated workspace: %zu bytes\n", actualWorkspaceSize);
+        }
+        
+        // === 步骤5：使用选定的算法执行矩阵乘法 ===
+        fprintf(stderr, "[CUBLASLT_DEBUG] Step 5: Executing matmul with selected algorithm...\n");
+        
+        status = cublasLtMatmul(
+            ltHandle,
+            matmulDesc,
+            &alpha,
+            input_a, Adesc,
+            input_b, Bdesc,
+            &beta,
+            output_c, Cdesc,
+            output_c, Cdesc,
+            &heuristicResult[2].algo,  // 使用搜索到的最佳算法
+            workspace, actualWorkspaceSize,
+            stream
+        );
+        
+        fprintf(stderr, "[CUBLASLT_DEBUG] Matmul execution status: %d\n", status);
+        CUDA_REPORT_IF_ERROR(cuStreamSynchronize(stream));
+
+        // 释放workspace
+        if (workspace) {
+            cudaFree(workspace);
+        }
+        
+        if (status != CUBLAS_STATUS_SUCCESS) {
+            fprintf(stderr, "[CUBLASLT_DEBUG] Matmul execution failed: %d\n", status);
+            cublasLtMatmulPreferenceDestroy(preference);
+                if (matmulDesc) cublasLtMatmulDescDestroy(matmulDesc);
+                if (Cdesc) cublasLtMatrixLayoutDestroy(Cdesc);
+                if (Bdesc) cublasLtMatrixLayoutDestroy(Bdesc);
+                if (Adesc) cublasLtMatrixLayoutDestroy(Adesc);
+                return;
+        }
+
+        fprintf(stderr, "[CUBLASLT_DEBUG] === Matmul completed successfully with optimized algorithm! ===\n");
     }
     
-    fprintf(stderr, "[CUBLASLT_DEBUG] === Matmul completed successfully! ===\n");
+    // 清理preference
+    
+        if (matmulDesc) cublasLtMatmulDescDestroy(matmulDesc);
+        if (Cdesc) cublasLtMatrixLayoutDestroy(Cdesc);
+        if (Bdesc) cublasLtMatrixLayoutDestroy(Bdesc);
+        if (Adesc) cublasLtMatrixLayoutDestroy(Adesc);
+        if (preference) cublasLtMatmulPreferenceDestroy(preference);
+  
 }
 
 
@@ -5360,6 +5803,7 @@ extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuCudnnConv2dForward(
   if (!need_search) {
     algo = g_cached_algo;
   }
+  // bool need_search = true;
   
   // // 创建描述符
   // cudnnTensorDescriptor_t xDesc, yDesc, biasDesc;
@@ -5411,12 +5855,50 @@ extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuCudnnConv2dForward(
   CUDNN_REPORT_IF_ERROR(cudnnSetTensor4dDescriptor(
       biasDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, 1, k, 1, 1));
   
+// 可选算法
+// CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_GEMM           // 隐式GEMM，通用性好
+// CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM   // 预计算GEMM
+// CUDNN_CONVOLUTION_FWD_ALGO_GEMM                    // 显式GEMM
+// CUDNN_CONVOLUTION_FWD_ALGO_DIRECT                  // 直接卷积
+// CUDNN_CONVOLUTION_FWD_ALGO_FFT                     // 基于FFT
+// CUDNN_CONVOLUTION_FWD_ALGO_FFT_TILING              // FFT平铺
+// CUDNN_CONVOLUTION_FWD_ALGO_WINOGRAD                // Winograd算法（3x3高效）
+// CUDNN_CONVOLUTION_FWD_ALGO_WINOGRAD_NONFUSED       // 非融合Winograd
+
+    // // 第一步：根据卷积核选择算法
+    // if (r == 3 && s == 3 && stride_h == 1 && stride_w == 1 && 
+    //     dilation_h == 1 && dilation_w == 1) {
+    //     algo = CUDNN_CONVOLUTION_FWD_ALGO_WINOGRAD_NONFUSED;
+    // } 
+    // // else if (r == 3 && s == 3 && stride_h == 1 && stride_w == 1 && 
+    // //     dilation_h == 1 && dilation_w == 1 && n >= 64) {
+    // //     algo = CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM;
+    // // } 
+    // // else if (r >= 5 || s >= 5) {
+    // //     algo = CUDNN_CONVOLUTION_FWD_ALGO_DIRECT;
+    // // } 
+    // // else if (r == 1 && s == 1) {
+    // //     algo = CUDNN_CONVOLUTION_FWD_ALGO_GEMM;
+    // // }
+    // else {
+    //     int requestedAlgoCount = 1;
+    //     int returnedAlgoCount;
+    //     cudnnConvolutionFwdAlgoPerf_t perfResults[1];
+    //     CUDNN_REPORT_IF_ERROR(cudnnGetConvolutionForwardAlgorithm_v7(
+    //         handle, xDesc, wDesc, convDesc, yDesc,
+    //         requestedAlgoCount, &returnedAlgoCount, perfResults));
+        
+    //     // 选择最快的且可用的算法
+    //     algo = perfResults[0].algo;
+    //     // algo = CUDNN_CONVOLUTION_FWD_ALGO_GEMM;
+    // }
+
     // 如果需要搜索算法
     if (need_search) {
         // 自动选择最佳算法
-        int requestedAlgoCount = 10;
+        int requestedAlgoCount = 1;
         int returnedAlgoCount;
-        cudnnConvolutionFwdAlgoPerf_t perfResults[10];
+        cudnnConvolutionFwdAlgoPerf_t perfResults[1];
         CUDNN_REPORT_IF_ERROR(cudnnGetConvolutionForwardAlgorithm_v7(
             handle, xDesc, wDesc, convDesc, yDesc,
             requestedAlgoCount, &returnedAlgoCount, perfResults));
@@ -5505,6 +5987,11 @@ extern "C" MLIR_CUDA_WRAPPERS_EXPORT void mgpuCudnnConv2dForward(
   // }
 
 
+  // if ((workspace != nullptr) && !using_pool) {
+  //   // 如果是动态分配的，直接释放
+  //   fprintf(stderr, "未使用workspace pool");
+  //   CUDA_REPORT_IF_ERROR(cuMemFree(reinterpret_cast<CUdeviceptr>(workspace)));
+  // }
   if ((workspace != nullptr) && !using_pool) {
     // 如果是动态分配的，直接释放
     fprintf(stderr, "未使用workspace pool");

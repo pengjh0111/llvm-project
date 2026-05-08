@@ -55,127 +55,212 @@ public:
   }
 };
 
+// class FuncOpConversion final : public OpConversionPattern<func::FuncOp> {
+// public:
+//   using OpConversionPattern<func::FuncOp>::OpConversionPattern;
+
+//   LogicalResult
+//   matchAndRewrite(func::FuncOp funcOp, OpAdaptor adaptor,
+//                   ConversionPatternRewriter &rewriter) const override {
+
+//     if (funcOp.getFunctionType().getNumResults() > 1)
+//       return rewriter.notifyMatchFailure(
+//           funcOp, "only functions with zero or one result can be converted");
+
+//   //获取输出参数以及返回参数
+//   auto funcType = funcOp.getFunctionType();
+//   auto inputTypes = funcType.getInputs();
+//   auto resultTypes = funcType.getResults();
+//       //创建TypeConverter对象
+//     //	TypeConverter typeConverter;
+//     //	//调用populateMemRefToEmitCTypeConversion,将memref转emitc array的逻辑添加到转换器中
+//     //	mlir::populateMemRefToEmitCTypeConversion(typeConverter);
+//     SmallVector<Type, 4> convertedInputTypes;//用于存储转换后的InputType
+//     SmallVector<Type, 4> convertedResultTypes;
+//     //对input进行类型转换
+//     //Type convertedinputType;
+
+//     bool isconvert = false;
+//     for (Type inputType : inputTypes){
+//       if(auto memrefType = inputType.dyn_cast<MemRefType>()){//判断是否是memref类型
+//         //convertedinputType = typeConverter.convertType(inputType);
+//         auto convertedinputType = getTypeConverter()->convertType(inputType);
+//         //llvm::outs() << "convertedinputType: " << convertedinputType << "\n";
+//         if(!convertedinputType)
+//           return funcOp.emitError("failed to convert inputType");
+//         convertedInputTypes.push_back(convertedinputType);
+//         isconvert = true;
+//       }
+//         //convertedinputType = inputType;
+//       else
+//         convertedInputTypes.push_back(inputType);
+//     }
+//     //对resultType进行转换
+//     //Type convertedresultType;
+//     for(Type resultType : resultTypes)
+//     {
+//       if(auto memrefType = resultType.dyn_cast<MemRefType>()){
+//         //convertedresultType = typeConverter.convertType(resultType);
+//         auto convertedresultType = getTypeConverter()->convertType(resultType);
+//         //llvm::outs() << "convertedresultType: " << convertedresultType << "\n";
+//         if(!convertedresultType)
+//           return funcOp.emitError("failed to convert resultType");
+//         convertedResultTypes.push_back(convertedresultType);
+//       }
+//         //convertedresultType = resultType;	
+//       else
+//         convertedResultTypes.push_back(resultType);		
+//     }
+//     //如果输入参数发生了转换，则同样的将入口块参数类型进行转换
+//     if(isconvert){
+//       //修改入口块参数类型
+//       //获取入口块
+//       Block &entryBlock = funcOp.getBody().front(); 
+//       // entryBlock.getArgument(0).getType() 获取入口块第一个参数类型
+//       auto args = entryBlock.getArguments();
+//       // 遍历每个参数并进行类型转换
+//       for (unsigned i = 0, e = args.size(); i < e; ++i) {
+//           // 获取当前参数
+//           Value arg = args[i];
+//           // 获取参数的类型
+//           Type BodyType = arg.getType();
+//           // 使用类型转换器进行类型转换
+//           auto convertedBodyType = getTypeConverter()->convertType(BodyType);
+//           // 如果转换成功且类型不一样，则修改参数类型
+//           if (convertedBodyType && convertedBodyType != BodyType) {
+//               // 这里可以使用 rewriter 替换参数类型
+//               arg.setType(convertedBodyType); //类似于指针，对args进行修改会反馈到funcOp
+//           }
+//       }
+
+//     }
+//     //创建新的函数类型，使用转换后的inputType和resultType
+//     //FunctionType newFuncType = FunctionType::get(funcOp.getContext(),specificInputType,specificResultType);
+//     //FunctionType newFuncType = FunctionType::get(specificResultType,convertedInputTypes,false); //源码中FunctionType *FunctionType::get(Type *ReturnType, ArrayRef<Type*> Params, bool isVarArg)
+//     FunctionType newFuncType = FunctionType::get(funcOp.getContext(),convertedInputTypes,convertedResultTypes);
+//     //llvm::outs() << "New Function Type: " << newFuncType << "\n";
+//     //使用转换后的参数，创建emitc.func
+//     emitc::FuncOp newFuncOp = rewriter.create<emitc::FuncOp>(
+//           funcOp.getLoc(), funcOp.getName(), newFuncType);	
+
+
+
+//     // // Create the converted `emitc.func` op.
+//     // emitc::FuncOp newFuncOp = rewriter.create<emitc::FuncOp>(
+//     //     funcOp.getLoc(), funcOp.getName(), funcOp.getFunctionType());
+
+//     // Copy over all attributes other than the function name and type.
+//     for (const auto &namedAttr : funcOp->getAttrs()) {
+//       if (namedAttr.getName() != funcOp.getFunctionTypeAttrName() &&
+//           namedAttr.getName() != SymbolTable::getSymbolAttrName())
+//         newFuncOp->setAttr(namedAttr.getName(), namedAttr.getValue());
+//     }
+
+//     // Add `extern` to specifiers if `func.func` is declaration only.
+//     if (funcOp.isDeclaration()) {
+//       ArrayAttr specifiers = rewriter.getStrArrayAttr({"extern"});
+//       newFuncOp.setSpecifiersAttr(specifiers);
+//     }
+
+//     // Add `static` to specifiers if `func.func` is private but not a
+//     // declaration.
+//     if (funcOp.isPrivate() && !funcOp.isDeclaration()) {
+//       ArrayAttr specifiers = rewriter.getStrArrayAttr({"static"});
+//       newFuncOp.setSpecifiersAttr(specifiers);
+//     }
+
+//     if (!funcOp.isDeclaration())
+//       rewriter.inlineRegionBefore(funcOp.getBody(), newFuncOp.getBody(),
+//                                   newFuncOp.end());
+//     rewriter.eraseOp(funcOp);
+
+//     return success();
+//   }
+// };
+
 class FuncOpConversion final : public OpConversionPattern<func::FuncOp> {
 public:
-  using OpConversionPattern<func::FuncOp>::OpConversionPattern;
+    using OpConversionPattern<func::FuncOp>::OpConversionPattern;
 
-  LogicalResult
-  matchAndRewrite(func::FuncOp funcOp, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
+    LogicalResult
+    matchAndRewrite(func::FuncOp funcOp, OpAdaptor adaptor,
+                    ConversionPatternRewriter &rewriter) const override {
 
-    if (funcOp.getFunctionType().getNumResults() > 1)
-      return rewriter.notifyMatchFailure(
-          funcOp, "only functions with zero or one result can be converted");
+        // 1. 基础限制检查：EmitC 目前通常只支持 0 或 1 个返回值
+        if (funcOp.getFunctionType().getNumResults() > 1)
+            return rewriter.notifyMatchFailure(
+                funcOp, "only functions with zero or one result can be converted");
 
-  //获取输出参数以及返回参数
-  auto funcType = funcOp.getFunctionType();
-  auto inputTypes = funcType.getInputs();
-  auto resultTypes = funcType.getResults();
-      //创建TypeConverter对象
-    //	TypeConverter typeConverter;
-    //	//调用populateMemRefToEmitCTypeConversion,将memref转emitc array的逻辑添加到转换器中
-    //	mlir::populateMemRefToEmitCTypeConversion(typeConverter);
-    SmallVector<Type, 4> convertedInputTypes;//用于存储转换后的InputType
-    SmallVector<Type, 4> convertedResultTypes;
-    //对input进行类型转换
-    //Type convertedinputType;
+        auto funcType = funcOp.getFunctionType();
+        const TypeConverter *typeConverter = getTypeConverter();
+        if (!typeConverter)
+            return funcOp.emitError("TypeConverter not found in FuncOpConversion");
 
-    bool isconvert = false;
-    for (Type inputType : inputTypes){
-      if(auto memrefType = inputType.dyn_cast<MemRefType>()){//判断是否是memref类型
-        //convertedinputType = typeConverter.convertType(inputType);
-        auto convertedinputType = getTypeConverter()->convertType(inputType);
-        //llvm::outs() << "convertedinputType: " << convertedinputType << "\n";
-        if(!convertedinputType)
-          return funcOp.emitError("failed to convert inputType");
-        convertedInputTypes.push_back(convertedinputType);
-        isconvert = true;
-      }
-        //convertedinputType = inputType;
-      else
-        convertedInputTypes.push_back(inputType);
+        // 2. 转换输入参数类型
+        SmallVector<Type, 4> convertedInputTypes;
+        for (Type inputType : funcType.getInputs()) {
+            auto converted = typeConverter->convertType(inputType);
+            if (!converted)
+                return funcOp.emitError("failed to convert input type: ") << inputType;
+            convertedInputTypes.push_back(converted);
+        }
+
+        // 3. 转换结果类型
+        SmallVector<Type, 4> convertedResultTypes;
+        for (Type resultType : funcType.getResults()) {
+            auto converted = typeConverter->convertType(resultType);
+            if (!converted)
+                return funcOp.emitError("failed to convert result type: ") << resultType;
+            convertedResultTypes.push_back(converted);
+        }
+
+        // 4. 处理函数体内部的块参数 (Block Arguments)
+        // 关键修复：只有非声明函数才有 Body 和 Block
+        if (!funcOp.isDeclaration()) {
+            Block &entryBlock = funcOp.getBody().front();
+            
+            // 遍历入口块参数，手动同步类型
+            // 注意：在更复杂的场景建议使用 rewriter.applySignatureConversion
+            for (auto [arg, newType] : llvm::zip(entryBlock.getArguments(), convertedInputTypes)) {
+                if (arg.getType() != newType) {
+                    arg.setType(newType);
+                }
+            }
+        }
+
+        // 5. 创建新的 emitc.func 算子
+        FunctionType newFuncType = rewriter.getFunctionType(convertedInputTypes, convertedResultTypes);
+        
+        auto newFuncOp = rewriter.create<emitc::FuncOp>(
+            funcOp.getLoc(), funcOp.getName(), newFuncType);
+
+        // 6. 拷贝原始属性（排除掉类型和符号名）
+        for (const auto &namedAttr : funcOp->getAttrs()) {
+            if (namedAttr.getName() != funcOp.getFunctionTypeAttrName() &&
+                namedAttr.getName() != SymbolTable::getSymbolAttrName()) {
+                newFuncOp->setAttr(namedAttr.getName(), namedAttr.getValue());
+            }
+        }
+
+        // 7. 处理 C 语言特有的修饰符 (extern / static)
+        if (funcOp.isDeclaration()) {
+            // 如果是声明，映射为 extern
+            newFuncOp.setSpecifiersAttr(rewriter.getStrArrayAttr({"extern"}));
+        } else if (funcOp.isPrivate()) {
+            // 如果是私有定义，映射为 static
+            newFuncOp.setSpecifiersAttr(rewriter.getStrArrayAttr({"static"}));
+        }
+
+        // 8. 转移函数体 Region
+        if (!funcOp.isDeclaration()) {
+            rewriter.inlineRegionBefore(funcOp.getBody(), newFuncOp.getBody(),
+                                        newFuncOp.end());
+        }
+
+        // 9. 擦除旧算子
+        rewriter.eraseOp(funcOp);
+        return success();
     }
-    //对resultType进行转换
-    //Type convertedresultType;
-    for(Type resultType : resultTypes)
-    {
-      if(auto memrefType = resultType.dyn_cast<MemRefType>()){
-        //convertedresultType = typeConverter.convertType(resultType);
-        auto convertedresultType = getTypeConverter()->convertType(resultType);
-        //llvm::outs() << "convertedresultType: " << convertedresultType << "\n";
-        if(!convertedresultType)
-          return funcOp.emitError("failed to convert resultType");
-        convertedResultTypes.push_back(convertedresultType);
-      }
-        //convertedresultType = resultType;	
-      else
-        convertedResultTypes.push_back(resultType);		
-    }
-    //如果输入参数发生了转换，则同样的将入口块参数类型进行转换
-    if(isconvert){
-      //修改入口块参数类型
-      //获取入口块
-      Block &entryBlock = funcOp.getBody().front(); 
-      // entryBlock.getArgument(0).getType() 获取入口块第一个参数类型
-      auto args = entryBlock.getArguments();
-      // 遍历每个参数并进行类型转换
-      for (unsigned i = 0, e = args.size(); i < e; ++i) {
-          // 获取当前参数
-          Value arg = args[i];
-          // 获取参数的类型
-          Type BodyType = arg.getType();
-          // 使用类型转换器进行类型转换
-          auto convertedBodyType = getTypeConverter()->convertType(BodyType);
-          // 如果转换成功且类型不一样，则修改参数类型
-          if (convertedBodyType && convertedBodyType != BodyType) {
-              // 这里可以使用 rewriter 替换参数类型
-              arg.setType(convertedBodyType); //类似于指针，对args进行修改会反馈到funcOp
-          }
-      }
-
-    }
-    //创建新的函数类型，使用转换后的inputType和resultType
-    //FunctionType newFuncType = FunctionType::get(funcOp.getContext(),specificInputType,specificResultType);
-    //FunctionType newFuncType = FunctionType::get(specificResultType,convertedInputTypes,false); //源码中FunctionType *FunctionType::get(Type *ReturnType, ArrayRef<Type*> Params, bool isVarArg)
-    FunctionType newFuncType = FunctionType::get(funcOp.getContext(),convertedInputTypes,convertedResultTypes);
-    //llvm::outs() << "New Function Type: " << newFuncType << "\n";
-    //使用转换后的参数，创建emitc.func
-    emitc::FuncOp newFuncOp = rewriter.create<emitc::FuncOp>(
-          funcOp.getLoc(), funcOp.getName(), newFuncType);	
-
-
-
-    // // Create the converted `emitc.func` op.
-    // emitc::FuncOp newFuncOp = rewriter.create<emitc::FuncOp>(
-    //     funcOp.getLoc(), funcOp.getName(), funcOp.getFunctionType());
-
-    // Copy over all attributes other than the function name and type.
-    for (const auto &namedAttr : funcOp->getAttrs()) {
-      if (namedAttr.getName() != funcOp.getFunctionTypeAttrName() &&
-          namedAttr.getName() != SymbolTable::getSymbolAttrName())
-        newFuncOp->setAttr(namedAttr.getName(), namedAttr.getValue());
-    }
-
-    // Add `extern` to specifiers if `func.func` is declaration only.
-    if (funcOp.isDeclaration()) {
-      ArrayAttr specifiers = rewriter.getStrArrayAttr({"extern"});
-      newFuncOp.setSpecifiersAttr(specifiers);
-    }
-
-    // Add `static` to specifiers if `func.func` is private but not a
-    // declaration.
-    if (funcOp.isPrivate() && !funcOp.isDeclaration()) {
-      ArrayAttr specifiers = rewriter.getStrArrayAttr({"static"});
-      newFuncOp.setSpecifiersAttr(specifiers);
-    }
-
-    if (!funcOp.isDeclaration())
-      rewriter.inlineRegionBefore(funcOp.getBody(), newFuncOp.getBody(),
-                                  newFuncOp.end());
-    rewriter.eraseOp(funcOp);
-
-    return success();
-  }
 };
 
 class ReturnOpConversion final : public OpConversionPattern<func::ReturnOp> {

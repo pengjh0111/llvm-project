@@ -999,8 +999,12 @@ LogicalResult ConvertMemcpyOpToGpuRuntimeCallPattern::matchAndRewrite(
     ConversionPatternRewriter &rewriter) const {
   auto memRefType = cast<MemRefType>(memcpyOp.getSrc().getType());
 
-  if (failed(areAllLLVMTypes(memcpyOp, adaptor.getOperands(), rewriter)) ||
-      !isConvertibleAndHasIdentityMaps(memRefType) ||
+  // if (failed(areAllLLVMTypes(memcpyOp, adaptor.getOperands(), rewriter)) ||
+  //     !isConvertibleAndHasIdentityMaps(memRefType) ||
+  //     failed(isAsyncWithOneDependency(rewriter, memcpyOp)))
+  //   return failure();
+
+  if (failed(areAllLLVMTypes(memcpyOp, adaptor.getOperands(), rewriter)) || //modified by p
       failed(isAsyncWithOneDependency(rewriter, memcpyOp)))
     return failure();
 

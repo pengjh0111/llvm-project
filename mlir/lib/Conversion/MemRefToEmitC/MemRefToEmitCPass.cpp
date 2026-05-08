@@ -88,6 +88,7 @@ struct ConvertMemRefToEmitCPass
 
     ConversionTarget target(getContext());
     target.addIllegalDialect<memref::MemRefDialect>();
+    // target.addLegalOp<memref::ExtractAlignedPointerAsIndexOp>();
     target.addLegalDialect<emitc::EmitCDialect>();
 
     if (failed(applyPartialConversion(getOperation(), target,
